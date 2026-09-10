@@ -56,9 +56,30 @@ Backlight（后台浏览器）：对标 ego-lite 的 AI 友好浏览器监督器
 
 ## 状态段（每完成一项更新）
 
-- P1 ✅ 完成（02:55）：capture keep-alive 集成。关键修复：① controller 页 getDisplayMedia 需 awaitPromise；② 隐藏标签发起捕获会 InvalidStateError → engage 时先把 controller 标签激活（贴角窗口内不可见）、捕获后切回目标；③ `--blink-settings=displayCaptureRequiresUserGesture=false` 绕过手势要求；④ 候选需连续 2 次 hidden 采样 + 仅 http(s)（防止对 about:blank/chrome://newtab 幻影捕获）；⑤ 捕获建立后保持整个会话（ping-pong 修复）。supervisor 断言：最小化后 native ≥45 + captureEngaged。全套测试 11 PASS / 0 FAIL。
-- 已知遗留（白天处理）：捕获生效后 DOM visibilityState 仍可能读 hidden（不影响 rAF/截图）；页面内冻结代码未生效，原因待查；capture 10fps 编码有 CPU 成本，可试降 fps。
-- P2-P5 未开始
+- P1 ✅ 完成（02:55）：capture keep-alive 集成（详见上轮 commit）。全套测试 11 PASS / 0 FAIL。
+- P3 ✅ 完成（03:25）：`bl import` 从本机 Chrome profile 文件级导入 Cookies/Login Data/Web Data。**实测：导入"您的 Chrome"后 x.com 后台启动即登录态（loggedIn:true）**。测试：tests/import.ts（fixture）。已知限制：仅同二进制可解密（README 已注明）。
+- P2 ✅ 大部分（03:30）：x.com 后台启动验证 ✅（零弹窗、登录态、健康度 visible）。
+- P4 ✅ 完成（03:35）：Swift 菜单栏托盘（packages/tray，swiftc 编译通过，进程稳定）。`bl tray` 启动。已实测：AI 指令经 CDP 代理正常进入活动流（托盘闪烁的视觉确认需人工）。待人工验收：菜单栏图标闪烁观感、菜单项点击。
+- P5 进行中：doctor/README/晨报
+- 已知遗留（白天处理）：① 捕获后 DOM visibilityState 冻结未生效（不影响 rAF/截图，待查）；② capture 10fps 编码 CPU 成本可优化（试降 fps）；③ supervisor 测试依赖显示器未睡眠（已用 caffeinate 包裹）。
+
+## ego-lite 功能对照（docs 调研结论）
+
+| ego-lite 功能 | Backlight 状态 |
+|---|---|
+| 数据迁移（cookie/登录态/扩展/profile 一键导入） | ✅ bl import（文件级，同二进制解密） |
+| Space 隔离（每任务独立上下文+登录态共享） | ✅ 受管 profile per space（CLI: space，UI 未做） |
+| snapshot 内核级 DOM 快照 | 部分：CDP 代理 + 任何 agent 工具可连；无内置 snapshot 命令 |
+| ego-browser CLI | ✅ backlight CLI + 标准 CDP（Playwright 直连） |
+| Skills（站点技能包） | ❌ 未做（v0.2 候选） |
+| Agent harness 自动安装 skill | ❌ 未做（README 文档化） |
+| 后台满速运行 | ✅✅ capture 豁免 + 贴角 + 垫片（ego-lite 没有，反超点） |
+| 插件热重载/直达测试 | ✅✅（ego-lite 没有，反超点） |
+| AI 指令可视化 | ✅ 光环 + 活动流 + dashboard + 托盘（反超点） |
+
+## 晨报（8:00 收尾时填写）
+
+（待填）
 
 ## 晨报（8:00 收尾时填写）
 

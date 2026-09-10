@@ -295,11 +295,54 @@ async function main() {
       return
     }
 
+    case 'tray': {
+      const cliDir = path.dirname(fileURLToPath(import.meta.url))
+      const appPath = path.join(cliDir, '..', '..', 'tray', 'build', 'Backlight Tray.app')
+      if (!fs.existsSync(appPath)) {
+        console.log('building tray app…')
+        const build = path.join(cliDir, '..', '..', 'tray', 'build.sh')
+        const { execFileSync } = require('node:child_process')
+        execFileSync('bash', [build], { stdio: 'inherit' })
+      }
+      spawn('open', ['-a', appPath], { detached: true, stdio: 'ignore' }).unref()
+      console.log('tray launched — menu bar icon appears (bolt = AI activity, menu: 收起/恢复/控制台)')
+      return
+    }
+
     case 'doctor': {
-      console.log('doctor: expanded checks land in v0.1 (see README)')
-      const info = await ensureDaemon()
-      const s = await api(info, '/api/status', {}, 5000)
-      console.log(`daemon ok (port ${s.daemon.port})`)
+      console.log('Backlight doctor')
+      const [major] = process.versions.node.split('.').map(Number)
+      console.log(`${major >= 22 ? '✓' : '✗'} node ${process.versions.node}（需要 ≥22 原生 TS 运行）`)
+      const candidates = [
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium',
+        '/Applications/Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+      ]
+      const found = candidates.filter(c => fs.existsSync(c))
+      console.log(`${found.length ? '✓' : '✗'} 浏览器: ${found.length ? found.join(', ') : '未找到 Chromium 系浏览器'}`)
+      const info = readDaemonInfo()
+      if (info) {
+        try {
+          const s = await api(info, '/api/status', {}, 5000)
+          console.log(`✓ daemon v${s.daemon.version} port=${s.daemon.port}`)
+          if (s.browser?.running) console.log(`✓ 浏览器运行中: ${s.browser.version}`)
+          else console.log('ℹ 浏览器未运行 (bl launch)')
+        } catch (e) {
+          console.log(`✗ daemon 无响应: ${(e as Error).message}`)
+        }
+      } else {
+        console.log('ℹ daemon 未运行（任意命令会自动启动）')
+      }
+      const cacheDir = path.join(home, "browsers")
+      const hasCft = fs.existsSync(cacheDir) && fs.readdirSync(cacheDir).length > 0
+      console.log(`${hasCft ? '✓' : 'ℹ'} 扩展用浏览器缓存: ${hasCft ? cacheDir : '未下载（插件开发时自动下载 Chrome for Testing）'}`)
+      try {
+        const r = await fetch('https://registry.npmjs.org/-/ping', { signal: AbortSignal.timeout(5000) })
+        console.log(`${r.ok ? '✓' : '⚠'} npm registry ${r.ok ? '可达' : '异常 ' + r.status}（异常时可设 BACKLIGHT_DOWNLOAD_BASE_URL=https://cdn.npmmirror.com/binaries/chrome-for-testing）`)
+      } catch { console.log('⚠ npm registry 不可达（将影响 Chromium 自动下载）') }
+      console.log(`ℹ 数据目录: ${home}`)
       return
     }
 
