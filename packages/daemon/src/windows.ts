@@ -48,7 +48,8 @@ export async function readWorkArea(cdp: Cdp): Promise<WorkArea> {
  */
 export class FramePumpSupervisor {
   private timer: NodeJS.Timeout | null = null
-  private pumps = new Map<string, { cdp: Cdp; sessionId: string; running: boolean }>()
+  private pumps = new Map<string, { cdp: Cdp; sessionId: string; running: boolean; strikes: number }>()
+  private pumpCooldown = new Map<string, number>()
   private ticking = false
   private collapsed = new Map<number, { left: number; top: number; wasMinimized: boolean }>()
   private getContext: () => { cdp: Cdp } | null
@@ -89,6 +90,8 @@ export class FramePumpSupervisor {
         if (!wanted.has(targetId) || pump.cdp !== cdp) this.stopPump(targetId)
       }
       for (const targetId of wanted) {
+        const cooldown = this.pumpCooldown.get(targetId) ?? 0
+        if (Date.now() < cooldown) continue
         if (!this.pumps.has(targetId)) this.startPump(targetId)
       }
     } catch (err) {
@@ -102,7 +105,7 @@ export class FramePumpSupervisor {
     const ctx = this.getContext()
     if (!ctx) return
     const fps = Math.max(1, Math.min(30, this.settings().pumpFps))
-    const entry = { cdp: ctx.cdp, sessionId: '', running: true }
+    const entry = { cdp: ctx.cdp, sessionId: '', running: true, strikes: 0 }
     this.pumps.set(targetId, entry)
     void (async () => {
       try {
@@ -116,9 +119,16 @@ export class FramePumpSupervisor {
           await Promise.race([
             entry.cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 10, fromSurface: false }, entry.sessionId),
             new Promise<never>((_, rej) => setTimeout(() => rej(new Error('capture timeout')), 8000)),
-          ]).catch((err) => {
-            debug(`pump capture failed: ${(err as Error).message}`)
-            this.stopPump(targetId)
+          ]).then(() => { entry.strikes = 0 }).catch((err) => {
+            entry.strikes++
+            debug(`pump capture failed (${entry.strikes} strikes): ${(err as Error).message}`)
+            // after 3 consecutive failures give the target a 30s cooldown —
+            // some minimized pages simply refuse captures
+            if (entry.strikes >= 3) {
+              this.stopPump(targetId)
+              this.pumpCooldown.set(targetId, Date.now() + 30_000)
+              return
+            }
           })
           if (!entry.running) break
           const spent = Date.now() - t0

@@ -90,7 +90,7 @@ export class CaptureKeepAlive {
         if (t.url.includes(CONTROLLER_PATH)) return false
         if (t.url.startsWith('about:blank') || t.title === '' || t.title === CAPTURE_TITLE) return false
         // only real web pages: never waste the (single) capture on internal pages
-        if (!/^https?:\/\//i.test(t.url)) return false
+        if (/^(chrome|devtools|about|view-source|bl-controller):/i.test(t.url)) return false
         return (this.hiddenStreak.get(t.targetId) ?? 0) >= 2
       })
       if (candidates.length === 0) return

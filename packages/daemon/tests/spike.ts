@@ -53,7 +53,7 @@ async function waitApi(timeoutMs: number): Promise<void> {
 
 async function runSpike() {
   // no pump interference; we measure shim + corner behaviour directly
-  await post('/api/settings', { backgroundMode: false })
+  await post('/api/settings', { backgroundMode: false, captureKeepAlive: false })
   const launched = await post('/api/launch', { url: PAGE_HTML, keepVisible: true })
   if (!launched.ok) throw new Error(`launch failed: ${JSON.stringify(launched)}`)
   console.log(`browser pid=${launched.pid} (window visible ~2s baseline, then collapsed/minimized)`)
