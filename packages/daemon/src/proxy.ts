@@ -6,6 +6,7 @@ import type { CaptureKeepAlive } from './capture.ts'
 import type { ExtensionManager } from './extensions.ts'
 import type { HealthMonitor } from './inject.ts'
 import { loadSettings, saveSettings, type Settings } from './store.ts'
+import { listChromeProfiles, importProfile } from './import.ts'
 import type { FramePumpSupervisor } from './windows.ts'
 import { TapState, tapFrame } from './tap.ts'
 import { log, debug } from './log.ts'
@@ -291,6 +292,29 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     case 'POST /api/show': {
       const n = deps.manager.running ? await deps.supervisor.restoreAll() : 0
       json(res, 200, { ok: true, restored: n })
+      return
+    }
+    case 'GET /api/import/sources': {
+      json(res, 200, { sources: listChromeProfiles() })
+      return
+    }
+    case 'POST /api/import': {
+      const settings = loadSettings()
+      const space = payload.space ?? settings.space
+      const sources = listChromeProfiles()
+      const src = payload.source
+        ? sources.find(s => s.dir === payload.source || s.name === payload.source || `${s.browser}/${s.dir}` === payload.source)
+        : sources[0]
+      if (!src) return json(res, 400, { error: payload.source ? `source profile not found: ${payload.source}` : 'no Chrome profiles found on this machine' })
+      const wasRunning = deps.manager.running
+      if (wasRunning) await deps.manager.stop()
+      let copied: string[]
+      try {
+        copied = importProfile(src.baseDir, src.dir, space)
+      } catch (err) {
+        return json(res, 400, { error: (err as Error).message })
+      }
+      json(res, 200, { ok: true, space, source: `${src.browser} / ${src.dir} (${src.name})`, copied })
       return
     }
     case 'POST /api/settings': {

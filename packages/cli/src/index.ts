@@ -99,6 +99,7 @@ function usage(): string {
   backlight ext add <目录>      注册未打包扩展（--name 别名）
   backlight ext ls              列出已注册扩展
   backlight ext rm <名称>       移除扩展
+  backlight import              从本机 Chrome 导入 cookie/登录态（--profile 目录名 --space 名称，--list 列出）
   backlight doctor              环境体检
 
 环境变量:
@@ -270,6 +271,27 @@ async function main() {
       } else {
         throw new Error('usage: backlight ext add|ls|rm')
       }
+      return
+    }
+
+    case 'import': {
+      const info = await ensureDaemon()
+      const list = args.flags.has('list')
+      if (list) {
+        const res = await api(info, '/api/import/sources', {}, 10000)
+        for (const s of res.sources ?? []) {
+          console.log(`${(s.browser + ' / ' + s.dir).padEnd(30)} ${s.name}${s.email ? ' <' + s.email + '>' : ''}`)
+        }
+        if (!res.sources?.length) console.log('(no Chrome profiles found)')
+        return
+      }
+      const body: Record<string, unknown> = {}
+      if (args.flags.get('profile')) body.source = args.flags.get('profile')
+      if (args.flags.get('space')) body.space = args.flags.get('space')
+      const res = await api(info, '/api/import', { method: 'POST', body: JSON.stringify(body) })
+      console.log(`imported into space "${res.space}" from ${res.source}:`)
+      for (const f of res.copied) console.log(`  - ${f}`)
+      console.log('note: cookies are encrypted per-browser; launch with the same browser binary (default Google Chrome) to reuse the login state')
       return
     }
 
