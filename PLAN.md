@@ -62,7 +62,7 @@ Backlight（后台浏览器）：对标 ego-lite 的 AI 友好浏览器监督器
   1. 每次被唤醒时：跑 `pnpm --filter @backlight/daemon test` 确认 11 项全绿（需 caffeinate，见下）；若失败→修复
   2. 不做新功能开发
   3. 若一切正常且无失败，更新本段"最后巡检时间"即可
-- 最后巡检：05:11 全量测试 11 PASS / 0 FAIL（exit 0），一切正常。下次巡检 05:40。
+- 最后巡检：05:41 全量测试 11 PASS / 0 FAIL（exit 0），一切正常。下次巡检 06:10。
 - 已知遗留（白天处理，不影响使用）：
   1. 捕获后 DOM visibilityState 冻结代码未生效（visibilityState 仍可能读 hidden；rAF/截图不受影响）
   2. health 的 shim rAF/s 在 SPA 长会话下可能出现异常大数值（多链累加疑似），native/s 才是真实帧率
