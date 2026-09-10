@@ -56,12 +56,17 @@ Backlight（后台浏览器）：对标 ego-lite 的 AI 友好浏览器监督器
 
 ## 状态段（每完成一项更新）
 
-- P1 ✅ 完成（02:55）：capture keep-alive 集成（详见上轮 commit）。全套测试 11 PASS / 0 FAIL。
-- P3 ✅ 完成（03:25）：`bl import` 从本机 Chrome profile 文件级导入 Cookies/Login Data/Web Data。**实测：导入"您的 Chrome"后 x.com 后台启动即登录态（loggedIn:true）**。测试：tests/import.ts（fixture）。已知限制：仅同二进制可解密（README 已注明）。
-- P2 ✅ 大部分（03:30）：x.com 后台启动验证 ✅（零弹窗、登录态、健康度 visible）。
-- P4 ✅ 完成（03:35）：Swift 菜单栏托盘（packages/tray，swiftc 编译通过，进程稳定）。`bl tray` 启动。已实测：AI 指令经 CDP 代理正常进入活动流（托盘闪烁的视觉确认需人工）。待人工验收：菜单栏图标闪烁观感、菜单项点击。
-- P5 进行中：doctor/README/晨报
-- 已知遗留（白天处理）：① 捕获后 DOM visibilityState 冻结未生效（不影响 rAF/截图，待查）；② capture 10fps 编码 CPU 成本可优化（试降 fps）；③ supervisor 测试依赖显示器未睡眠（已用 caffeinate 包裹）。
+- P1 ✅ P3 ✅ P4 ✅ P5 ✅（全部完成，03:30，commits 66e0df3 之前 + timer 修复）
+- 当前活体会话：x.com 在 default space 后台运行（capture keep-alive 生效，native 59.9/s），托盘已启动
+- 全部路线图任务完成。夜间剩余时间（至 8:00）：
+  1. 每次被唤醒时：跑 `pnpm --filter @backlight/daemon test` 确认 11 项全绿（需 caffeinate，见下）；若失败→修复
+  2. 不做新功能开发
+  3. 若一切正常且无失败，更新本段"最后巡检时间"即可
+- 已知遗留（白天处理，不影响使用）：
+  1. 捕获后 DOM visibilityState 冻结代码未生效（visibilityState 仍可能读 hidden；rAF/截图不受影响）
+  2. health 的 shim rAF/s 在 SPA 长会话下可能出现异常大数值（多链累加疑似），native/s 才是真实帧率
+  3. capture 10fps 编码有 CPU 成本，可试降 fps
+  4. 托盘图标闪烁需人工目视验收
 
 ## ego-lite 功能对照（docs 调研结论）
 
