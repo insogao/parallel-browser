@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 import net from 'node:net'
 import { Cdp, fetchTargets, fetchVersion, type CdpTargetInfo } from './cdp.ts'
@@ -6,7 +6,10 @@ import { paths } from './paths.ts'
 import { findFreePort } from './ports.ts'
 import { loadSettings } from './store.ts'
 import { ExtensionManager } from './extensions.ts'
+import { OFFSCREEN_MARGIN, readWorkArea } from './windows.ts'
 import { log, warn, error } from './log.ts'
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 const BROWSER_CANDIDATES = [
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -29,6 +32,24 @@ export function detectBrowserBinary(preferred?: string): string {
   )
 }
 
+/** pgrep for a Chrome process using the given managed profile dir. */
+async function isProfileAlive(profileDir: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile('pgrep', ['-f', `user-data-dir=${profileDir}`], (err, stdout) =>
+      resolve(!err && stdout.trim().length > 0))
+  })
+}
+
+/** Resolve the real browser pid (needed when launched via `open`, where we only own the `open` process). */
+async function resolveChromePid(profileDir: string): Promise<number> {
+  return new Promise((resolve) => {
+    execFile('pgrep', ['-f', `user-data-dir=${profileDir}`], (err, stdout) => {
+      const first = stdout.trim().split('\n')[0]
+      resolve(!err && first ? Number(first) : -1)
+    })
+  })
+}
+
 /**
  * Branded Google Chrome >= 136 ignores --load-extension. Chromium and Chrome
  * for Testing still honour it, so dev-extension workflows need one of those.
@@ -44,15 +65,20 @@ export interface LaunchOptions {
   with?: string[]
   /** launch without any dev extensions */
   bare?: boolean
+  /** override settings.launchMode for this launch */
+  focus?: boolean
+  /** internal: skip auto-collapse after launch (tests that measure visible baseline) */
+  keepVisible?: boolean
 }
 
 export interface BrowserInstance {
-  child: ChildProcess
+  child: ChildProcess | null
   pid: number
   binary: string
   version: string
   upstreamPort: number
   space: string
+  profileDir: string
   extensionPaths: string[]
   cdp: Cdp
   startedAt: number
@@ -60,18 +86,21 @@ export interface BrowserInstance {
 
 export interface ManagerDeps {
   extensions: ExtensionManager
+  /** hook that records/manages collapsed windows (set by the daemon wiring) */
+  cornerWindow?: (cdp: Cdp, windowId: number) => Promise<boolean>
 }
 
 export class BrowserManager {
   current: BrowserInstance | null = null
   private deps: ManagerDeps
+  private reaper: NodeJS.Timeout | null = null
 
   constructor(deps: ManagerDeps) {
     this.deps = deps
   }
 
   get running(): boolean {
-    return this.current != null && this.current.child.exitCode == null
+    return this.current != null
   }
 
   private spaceProfileDir(space: string): string {
@@ -96,6 +125,7 @@ export class BrowserManager {
         )
     }
 
+    const backgroundLaunch = opts.keepVisible ? false : !(opts.focus ?? settings.launchMode === 'visible')
     const upstreamPort = await findFreePort()
     const args = [
       `--user-data-dir=${profileDir}`,
@@ -108,21 +138,147 @@ export class BrowserManager {
       '--no-default-browser-check',
       '--hide-crash-restore-bubble',
       '--disable-session-crashed-bubble',
+      // allow the silent-audio keep-alive to run without a user gesture
+      '--autoplay-policy=no-user-gesture-required',
     ]
+    if (backgroundLaunch) {
+      // start with no window; pages open as background targets afterwards so
+      // nothing pops to the front. The first window is born AT the offscreen
+      // corner (position args are legal there — only fully-offscreen positions
+      // get clamped), so there is no visible move/resize dance.
+      const wa = settings.workArea
+      const winW = 1440
+      const winH = 900
+      args.push(
+        '--no-startup-window',
+        `--window-position=${wa.al - (winW - OFFSCREEN_MARGIN)},${wa.at + wa.ah - OFFSCREEN_MARGIN}`,
+        `--window-size=${winW},${winH}`,
+      )
+    }
     if (extensionPaths.length > 0) {
       args.push(`--load-extension=${extensionPaths.join(',')}`)
       if (settings.soloExtensions) {
         args.push(`--disable-extensions-except=${extensionPaths.join(',')}`)
       }
     }
-    const urls = []
-    if (opts.url) urls.push(opts.url)
 
-    log(`launching ${binary} (space=${space}, upstreamPort=${upstreamPort}, extensions=${extensionPaths.length})`)
-    const child = spawn(binary, [...args, ...urls], {
-      stdio: 'ignore',
-      env: { ...process.env },
+    const { child, pid } = await this.spawnBrowser(binary, args, profileDir)
+    log(`launching ${binary} (space=${space}, upstreamPort=${upstreamPort}, extensions=${extensionPaths.length}, mode=${backgroundLaunch ? 'background' : 'visible'})`)
+
+    // wait for the debug endpoint
+    const deadline = Date.now() + 20_000
+    let version: { Browser: string; webSocketDebuggerUrl: string } | null = null
+    while (Date.now() < deadline) {
+      if (child && (child.pid ?? 0) > 0 && child.exitCode != null) {
+        throw new Error(`browser exited immediately (code=${child.exitCode})`)
+      }
+      try {
+        version = await fetchVersion(upstreamPort, 1500)
+        break
+      } catch { await sleep(300) }
+    }
+    if (!version) throw new Error('browser debug endpoint did not come up within 20s')
+
+    const cdp = await Cdp.connect(version.webSocketDebuggerUrl)
+    const realPid = await resolveChromePid(profileDir)
+    this.current = {
+      child,
+      pid: realPid,
+      binary,
+      version: version.Browser,
+      upstreamPort,
+      space,
+      profileDir,
+      extensionPaths,
+      cdp,
+      startedAt: Date.now(),
+    }
+    this.startReaper()
+
+    // background mode: open initial url(s) as background targets, then collapse
+    // any on-screen window as fast as possible (frame pump keeps pages fast)
+    if (backgroundLaunch) {
+      if (opts.url) {
+        await cdp.send('Target.createTarget', { url: opts.url, background: true }).catch((e) =>
+          warn(`background target failed: ${e.message}`))
+      }
+      await this.autoCollapse(cdp)
+    } else if (opts.url) {
+      // visible mode: open the initial url(s) in the startup window
+      const cur = this.current
+      const urls = [opts.url]
+      await cdp.send('Target.createTarget', { url: urls[0] }).catch((e) =>
+        warn(`initial target failed: ${e.message}`))
+      void cur
+    }
+
+    log(`browser up: ${version.Browser} pid=${realPid}`)
+    return this.current
+  }
+
+  /**
+   * Background launch: make sure every window Chrome creates ends up parked at
+   * the offscreen corner. Preferred path is a single position move (no resize,
+   * no visible dance); windows already born at the corner are left alone.
+   */
+  private async autoCollapse(cdp: Cdp): Promise<void> {
+    const done = new Set<number>()
+    const deadline = Date.now() + 6000
+    let quiet = 0
+    while (Date.now() < deadline) {
+      const ids = await this.collectWindowIds(cdp)
+      for (const windowId of ids) {
+        if (done.has(windowId)) continue
+        try {
+          if (this.deps.cornerWindow && await this.deps.cornerWindow(cdp, windowId)) {
+            done.add(windowId)
+            continue
+          }
+        } catch { /* fall through */ }
+        done.add(windowId)
+      }
+      quiet = ids.length > 0 && ids.every(id => done.has(id)) ? quiet + 1 : 0
+      if (quiet >= 5) break
+      await sleep(200)
+    }
+  }
+
+  private async collectWindowIds(cdp: Cdp): Promise<number[]> {
+    const { targetInfos } = await cdp.send<{ targetInfos: Array<{ targetId: string; type: string }> }>('Target.getTargets')
+    const ids = new Set<number>()
+    for (const t of targetInfos) {
+      if (t.type !== 'page') continue
+      try {
+        const { windowId } = await cdp.send<{ windowId: number }>('Browser.getWindowForTarget', { targetId: t.targetId })
+        ids.add(windowId)
+      } catch { /* target without window */ }
+    }
+    return [...ids]
+  }
+
+  /**
+   * Spawn the browser. Prefers `open -g -j` (launches WITHOUT activating the
+   * app — no focus steal) when no instance of that binary is running yet;
+   * falls back to a direct spawn otherwise (args are lost via `open` when an
+   * instance already exists).
+   */
+  private async spawnBrowser(
+    binary: string,
+    args: string[],
+    _profileDir: string,
+  ): Promise<{ child: ChildProcess | null; pid: number }> {
+    const appPath = binary.includes('/Contents/MacOS/')
+      ? binary.slice(0, binary.indexOf('/Contents/MacOS/'))
+      : null
+    const alreadyRunning = await new Promise<boolean>((resolve) => {
+      execFile('pgrep', ['-f', binary], (err, stdout) => resolve(!err && stdout.trim().length > 0))
     })
+    if (appPath && !alreadyRunning) {
+      log(`spawning via open -g -j (no activation): ${appPath}`)
+      spawn('/usr/bin/open', ['-g', '-j', '-a', appPath, '--args', ...args], { stdio: 'ignore' })
+      return { child: null, pid: -1 }
+    }
+    const child = spawn(binary, args, { stdio: 'ignore' })
     child.on('exit', (code) => {
       if (this.current?.child === child) {
         log(`browser exited (code=${code})`)
@@ -130,33 +286,23 @@ export class BrowserManager {
         this.current = null
       }
     })
-
-    // wait for the debug endpoint
-    const deadline = Date.now() + 20_000
-    let version: { Browser: string; webSocketDebuggerUrl: string } | null = null
-    while (Date.now() < deadline) {
-      if (child.exitCode != null) throw new Error(`browser exited immediately (code=${child.exitCode})`)
-      try {
-        version = await fetchVersion(upstreamPort, 1500)
-        break
-      } catch { await new Promise(r => setTimeout(r, 300)) }
-    }
-    if (!version) throw new Error('browser debug endpoint did not come up within 20s')
-
-    const cdp = await Cdp.connect(version.webSocketDebuggerUrl)
-    this.current = {
-      child,
-      pid: child.pid!,
-      binary,
-      version: version.Browser,
-      upstreamPort,
-      space,
-      extensionPaths,
-      cdp,
-      startedAt: Date.now(),
-    }
-    log(`browser up: ${version.Browser} pid=${child.pid}`)
-    return this.current
+    return { child, pid: child.pid ?? -1 }
+  }
+  /** Clear `current` if the browser process disappears (e.g. user quits it). */
+  private startReaper() {
+    if (this.reaper) return
+    this.reaper = setInterval(() => {
+      const cur = this.current
+      if (!cur) return
+      void isProfileAlive(cur.profileDir).then(alive => {
+        if (!alive && this.current === cur) {
+          log('browser process is gone; clearing state')
+          cur.cdp.close()
+          this.current = null
+        }
+      })
+    }, 4000)
+    this.reaper.unref?.()
   }
 
   async stop(): Promise<void> {
@@ -164,14 +310,16 @@ export class BrowserManager {
     if (!cur) return
     this.current = null
     cur.cdp.close()
-    await new Promise<void>((resolve) => {
-      const kill = () => { try { cur.child.kill('SIGKILL') } catch { /* ignore */ } resolve() }
-      try {
-        cur.child.once('exit', resolve)
-        cur.child.kill('SIGTERM')
-        setTimeout(kill, 3000).unref()
-      } catch { kill() }
-    })
+    // kill by profile dir — works for both direct spawns and `open -g` launches
+    await new Promise<void>(resolve => execFile('pkill', ['-f', `user-data-dir=${cur.profileDir}`], () => resolve()))
+    if (cur.child && cur.pid > 0) {
+      try { cur.child.kill('SIGTERM') } catch { /* ignore */ }
+    }
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      if (!(await isProfileAlive(cur.profileDir))) break
+      await sleep(200)
+    }
     log('browser stopped')
   }
 

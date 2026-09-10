@@ -140,9 +140,21 @@ async function main() {
       if (args.flags.get('space')) body.space = args.flags.get('space')
       if (withList) body.with = withList
       if (args.flags.has('bare')) body.bare = true
+      if (args.flags.has('focus')) body.focus = true
+      if (args.flags.has('keep-visible')) body.keepVisible = true
       const res = await api(info, '/api/launch', { method: 'POST', body: JSON.stringify(body) })
       console.log(`browser launched: pid=${res.pid} upstream=${res.upstreamPort} version=${res.version}`)
+      if (!args.flags.has('focus') && !args.flags.has('keep-visible')) {
+        console.log('launched in background (no focus steal); use `bl show` to bring it up')
+      }
       console.log(`AI tools connect via CDP proxy: http://127.0.0.1:${info.port}`)
+      return
+    }
+
+    case 'show': {
+      const info = readDaemonInfo(); if (!info) throw new Error('daemon not running')
+      const res = await api(info, '/api/show', { method: 'POST', body: '{}' })
+      console.log(`restored ${res.restored} window(s) to screen`)
       return
     }
 
@@ -190,7 +202,7 @@ async function main() {
         console.log(`         binary=${b.binary}`)
         console.log(`         space=${b.space} extensions=[${b.extensions.join(', ')}]`)
         console.log(`         CDP proxy: http://127.0.0.1:${s.daemon.port} (upstream ${b.upstreamPort})`)
-        console.log(`         backgroundMode=${s.settings.backgroundMode} pumpFps=${s.settings.pumpFps} halo=${s.settings.halo}`)
+        console.log(`         launchMode=${s.settings.launchMode} backgroundMode=${s.settings.backgroundMode} pumpFps=${s.settings.pumpFps} halo=${s.settings.halo}`)
       } else {
         console.log('browser: not running (backlight launch)')
       }
@@ -201,10 +213,10 @@ async function main() {
       const info = readDaemonInfo(); if (!info) throw new Error('daemon not running')
       const h = await api(info, '/api/health', {}, 5000)
       if (!h.targets?.length) { console.log('no pages tracked yet'); return }
-      console.log('visibility  rAF/s   timer/s  page')
+      console.log('visibility  rAF/s(shim)  native/s  timer/s  page')
       for (const t of h.targets) {
         console.log(
-          `${t.visibility.padEnd(10)}  ${String(t.rafPerSec).padEnd(7)} ${String(t.timerPerSec).padEnd(8)} ${(t.title || t.url).slice(0, 70)}`,
+          `${t.visibility.padEnd(10)}  ${String(t.rafPerSec).padEnd(13)} ${String(t.nativeRafPerSec).padEnd(9)} ${String(t.timerPerSec).padEnd(8)} ${(t.title || t.url).slice(0, 60)}`,
         )
       }
       return

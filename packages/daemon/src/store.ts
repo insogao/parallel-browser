@@ -16,6 +16,20 @@ export interface Settings {
   soloExtensions: boolean
   /** 'auto' or an absolute browser binary path */
   browser: string
+  /**
+   * 'background' (default): launch without stealing focus; the first window is
+   * born at the offscreen corner (2px sliver) so pages run at native full speed.
+   * 'visible': launch focused/on screen like a normal browser.
+   */
+  launchMode: 'background' | 'visible'
+  /**
+   * How "collapse to background" behaves:
+   * 'corner'   — window parks at the offscreen corner (2px sliver, full speed)
+   * 'minimize' — native minimize (invisible; page logic runs via the rAF shim)
+   */
+  collapseMode: 'corner' | 'minimize'
+  /** cached display work area {availLeft, availTop, availHeight} for corner math */
+  workArea: { al: number; at: number; ah: number }
 }
 
 export const defaultSettings: Settings = {
@@ -26,6 +40,9 @@ export const defaultSettings: Settings = {
   halo: true,
   soloExtensions: false,
   browser: 'auto',
+  launchMode: 'background',
+  collapseMode: 'corner',
+  workArea: { al: 0, at: 25, ah: 922 },
 }
 
 let cache: Settings | null = null

@@ -6,27 +6,51 @@ import { debug, log } from './log.ts'
 export interface WindowStateInfo {
   windowId: number
   state: string
-  pumped: boolean
+  cornered: boolean
+}
+
+export interface WorkArea { al: number; at: number; ah: number }
+
+/** 2px of the window stays on-screen: invisible in practice, but Chromium
+ * still counts the window as visible (full-speed rAF, real screenshots). */
+export const OFFSCREEN_MARGIN = 2
+
+/** Read the main display work area from any page (CDP has no screen API). */
+export async function readWorkArea(cdp: Cdp): Promise<WorkArea> {
+  const { targetInfos } = await cdp.send<{ targetInfos: Array<{ targetId: string; type: string }> }>('Target.getTargets')
+  for (const t of targetInfos) {
+    if (t.type !== 'page') continue
+    try {
+      const sessionId = await cdp.attach(t.targetId)
+      const r = await cdp.send<{ result?: { value?: string } }>('Runtime.evaluate', {
+        expression: 'JSON.stringify({al:screen.availLeft,at:screen.availTop,ah:screen.availHeight})',
+        returnByValue: true,
+      }, sessionId)
+      if (r.result?.value) return JSON.parse(r.result.value)
+    } catch { /* next page */ }
+  }
+  return { al: 0, at: 25, ah: 900 }
 }
 
 /**
- * "Background stays full-speed" mechanism — FRAME PUMP.
+ * "Background stays full-speed" — CORNER COLLAPSE.
  *
- * Verified on macOS (Chrome 152): no flag or window trick keeps rAF running
- * for hidden pages — minimized/occluded/background tabs pause rAF, and
- * Browser.setWindowBounds cannot move a window offscreen (Chrome clamps it).
- * What DOES work: Page.captureScreenshot forces BeginFrames, which drives
- * rAF. A ~10fps capture pump on hidden targets keeps them rendering at
- * ~40-45 rAF/s while the window stays 100% native (minimized is fine).
+ * Verified on macOS (Chrome 152): hidden pages pause native rAF and nothing
+ * launchable changes that; but Chrome only clamps window moves when the
+ * window would be FULLY offscreen. Leaving a 2px sliver on-screen is allowed
+ * and Chromium still treats the window as visible: native rAF at 60fps,
+ * real screenshots, document.visibilityState === 'visible' — everything
+ * works as if the window were in front, while occupying a 2px corner.
  *
- * Flags handle timers (--disable-background-timer-throttling etc.); the pump
- * handles frames. Hidden = anything whose visibilityState is not "visible":
- * minimized windows, fully occluded windows, background tabs.
+ * Secondary layer for pages the USER minimized (true hidden): the health
+ * monitor injects a rAF shim (16ms timer fallback) and the frame pump forces
+ * occasional real frames via fromSurface:false captures.
  */
 export class FramePumpSupervisor {
   private timer: NodeJS.Timeout | null = null
   private pumps = new Map<string, { cdp: Cdp; sessionId: string; running: boolean }>()
   private ticking = false
+  private collapsed = new Map<number, { left: number; top: number; wasMinimized: boolean }>()
   private getContext: () => { cdp: Cdp } | null
   private getHealth: () => TargetHealth[]
 
@@ -47,10 +71,12 @@ export class FramePumpSupervisor {
     for (const targetId of [...this.pumps.keys()]) this.stopPump(targetId)
   }
 
+  private settings = () => loadSettings()
+
   async tick(): Promise<void> {
     if (this.ticking) return
     const ctx = this.getContext()
-    if (!ctx || !loadSettings().backgroundMode) return
+    if (!ctx || !this.settings().backgroundMode) return
     this.ticking = true
     try {
       const { cdp } = ctx
@@ -75,8 +101,7 @@ export class FramePumpSupervisor {
   private startPump(targetId: string) {
     const ctx = this.getContext()
     if (!ctx) return
-    const settings = loadSettings()
-    const fps = Math.max(1, Math.min(30, settings.pumpFps))
+    const fps = Math.max(1, Math.min(30, this.settings().pumpFps))
     const entry = { cdp: ctx.cdp, sessionId: '', running: true }
     this.pumps.set(targetId, entry)
     void (async () => {
@@ -86,7 +111,12 @@ export class FramePumpSupervisor {
         const interval = 1000 / fps
         while (entry.running && this.pumps.get(targetId) === entry) {
           const t0 = Date.now()
-          await entry.cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 10 }, entry.sessionId).catch(async (err) => {
+          // fromSurface:false works for true-minimized windows (fromSurface
+          // deadlocks on heavy hidden pages); races a timeout as a guard.
+          await Promise.race([
+            entry.cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 10, fromSurface: false }, entry.sessionId),
+            new Promise<never>((_, rej) => setTimeout(() => rej(new Error('capture timeout')), 8000)),
+          ]).catch((err) => {
             debug(`pump capture failed: ${(err as Error).message}`)
             this.stopPump(targetId)
           })
@@ -113,34 +143,59 @@ export class FramePumpSupervisor {
     return [...this.pumps.keys()]
   }
 
-  /** Minimize every window natively ("collapse to background"; pump keeps them fast). */
+  /** Collapse every window to the offscreen corner (2px sliver stays visible). */
   async collapseAll(): Promise<number> {
     const ctx = this.getContext()
     if (!ctx) return 0
     let n = 0
     for (const windowId of await this.collectWindowIds()) {
-      try {
-        await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } })
-        n++
-      } catch { /* gone */ }
+      if (await this.cornerWindow(ctx.cdp, windowId)) n++
     }
-    log(`collapsed ${n} window(s); frame pump keeps pages at speed`)
+    log(`collapsed ${n} window(s) to the offscreen corner (pages run at full speed)`)
     return n
   }
 
-  /** Restore every minimized window. */
+  /** Move one window to the offscreen corner. Returns true if moved. */
+  async cornerWindow(cdp: Cdp, windowId: number): Promise<boolean> {
+    try {
+      const { bounds } = await cdp.send<{ bounds: any }>('Browser.getWindowBounds', { windowId })
+      if (this.collapsed.has(windowId)) return true
+      const wa = await readWorkArea(cdp)
+      const width = bounds.width ?? 1200
+      const orig = { left: bounds.left ?? wa.al, top: bounds.top ?? wa.at, wasMinimized: (bounds.windowState ?? 'normal') === 'minimized' }
+      await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
+      await cdp.send('Browser.setWindowBounds', { windowId, bounds: { width, height: bounds.height ?? 800 } })
+      const left = wa.al - (width - OFFSCREEN_MARGIN)
+      const top = wa.at + wa.ah - OFFSCREEN_MARGIN
+      await cdp.send('Browser.setWindowBounds', { windowId, bounds: { left, top } })
+      this.collapsed.set(windowId, orig)
+      log(`window ${windowId}: collapsed to corner (left=${left}, top=${top}, page keeps native full-speed)`)
+      return true
+    } catch (err) {
+      debug(`cornerWindow(${windowId}) failed: ${(err as Error).message}`)
+      return false
+    }
+  }
+
+  /** Bring cornered windows back to their original position. */
   async restoreAll(): Promise<number> {
     const ctx = this.getContext()
     if (!ctx) return 0
     let n = 0
-    for (const windowId of await this.collectWindowIds()) {
+    for (const [windowId, orig] of [...this.collapsed]) {
       try {
-        const { bounds } = await ctx.cdp.send<{ bounds: { windowState?: string } }>('Browser.getWindowBounds', { windowId })
-        if ((bounds.windowState ?? 'normal') === 'minimized') {
-          await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
-          n++
+        await ctx.cdp.send('Browser.setWindowBounds', {
+          windowId,
+          bounds: { windowState: 'normal', left: orig.left, top: orig.top },
+        })
+        if (orig.wasMinimized) {
+          await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } })
         }
-      } catch { /* gone */ }
+        this.collapsed.delete(windowId)
+        n++
+      } catch {
+        this.collapsed.delete(windowId)
+      }
     }
     log(`restored ${n} window(s)`)
     return n
@@ -153,7 +208,7 @@ export class FramePumpSupervisor {
     for (const windowId of await this.collectWindowIds()) {
       try {
         const { bounds } = await ctx.cdp.send<{ bounds: { windowState?: string } }>('Browser.getWindowBounds', { windowId })
-        out.push({ windowId, state: bounds.windowState ?? 'normal', pumped: this.pumps.size > 0 })
+        out.push({ windowId, state: bounds.windowState ?? 'normal', cornered: this.collapsed.has(windowId) })
       } catch { /* gone */ }
     }
     return out

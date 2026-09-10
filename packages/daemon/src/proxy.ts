@@ -203,6 +203,8 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         space: payload.space,
         with: payload.with,
         bare: payload.bare === true,
+        focus: payload.focus === true || payload.background === false ? true : undefined,
+        keepVisible: payload.keepVisible === true,
       })
       json(res, 200, { ok: true, pid: inst.pid, upstreamPort: inst.upstreamPort, version: inst.version })
       return
@@ -265,14 +267,26 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       if (!payload.url) return json(res, 400, { error: 'url required' })
       if (!deps.manager.running) {
         await deps.manager.launch({ url: payload.url, with: payload.with })
-        } else {
-        await deps.manager.current!.cdp.send('Target.createTarget', { url: payload.url })
+      } else {
+        // background:true — tab never activates; the window gets cornered so
+        // nothing pops to the front and the page keeps native full speed
+        const cur = deps.manager.current!
+        const { targetId } = await cur.cdp.send<{ targetId: string }>('Target.createTarget', { url: payload.url, background: true })
+        try {
+          const { windowId } = await cur.cdp.send<{ windowId: number }>('Browser.getWindowForTarget', { targetId })
+          await deps.supervisor.cornerWindow(cur.cdp, windowId)
+        } catch { /* window handling is best-effort */ }
       }
       json(res, 200, { ok: true })
       return
     }
+    case 'POST /api/show': {
+      const n = deps.manager.running ? await deps.supervisor.restoreAll() : 0
+      json(res, 200, { ok: true, restored: n })
+      return
+    }
     case 'POST /api/settings': {
-      const allowed: Array<keyof Settings> = ['backgroundMode', 'halo', 'pumpFps', 'soloExtensions', 'space', 'browser', 'proxyPort']
+      const allowed: Array<keyof Settings> = ['backgroundMode', 'halo', 'pumpFps', 'soloExtensions', 'space', 'browser', 'proxyPort', 'launchMode']
       const patch: Partial<Settings> = {}
       for (const k of allowed) if (k in payload) (patch as any)[k] = payload[k]
       const settings = saveSettings(patch)

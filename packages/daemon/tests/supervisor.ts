@@ -1,8 +1,8 @@
 /**
- * M1 supervisor e2e (frame pump): window visible ~2s at start for the
- * baseline, then stays minimized for everything else (exactly what a user
- * does). Verifies: collapse action, pump engagement, rAF kept alive while
- * minimized, restore, pump stop, and background-tab pumping.
+ * M1 supervisor e2e (corner collapse): window visible ~2s for the baseline,
+ * then /api/bg corners it (2px sliver, offscreen) — pages must render NATIVELY
+ * at full speed. Also verifies the user-minimize scenario: rAF shim keeps page
+ * logic alive and the frame pump produces real frames.
  *
  * Run: node tests/supervisor.ts
  */
@@ -21,25 +21,13 @@ const PAGE_HTML = (title: string) => `data:text/html;charset=utf-8,${encodeURICo
 <body style="font:42px monospace;background:#101418;color:#39d98a">
 <div>${title}</div>
 <script>
-  let raf = 0; window.__t = 0;
-  const step = () => { raf++; requestAnimationFrame(step) };
-  requestAnimationFrame(step);
-  setInterval(() => window.__t++, 100);
-  window.__raf = () => raf; window.__timer = () => window.__t;
+  window.__raf = () => window.__blHealth ? window.__blHealth.raf : 0
+  window.__native = () => window.__blHealth ? window.__blHealth.native : 0
 </script></body></html>`)}`
 
-async function apiGet(pathname: string): Promise<any> {
-  const res = await fetch(`http://127.0.0.1:${PORT}${pathname}`, { signal: AbortSignal.timeout(3000) })
-  return res.json()
-}
-async function apiPost(pathname: string, body: unknown): Promise<any> {
-  const res = await fetch(`http://127.0.0.1:${PORT}${pathname}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  return res.json()
-}
+const apiGet = (p: string): Promise<any> => fetch(`http://127.0.0.1:${PORT}${p}`, { signal: AbortSignal.timeout(3000) }).then(r => r.json())
+const apiPost = (p: string, b: unknown): Promise<any> => fetch(`http://127.0.0.1:${PORT}${p}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) }).then(r => r.json())
+
 async function waitApi(timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -61,86 +49,83 @@ async function main() {
   daemon.unref()
   try {
     await waitApi(10_000)
-    const launched = await apiPost('/api/launch', { url: PAGE_HTML('tab1') })
+    const launched = await apiPost('/api/launch', { url: PAGE_HTML('tab1'), keepVisible: true })
     if (!launched.ok) throw new Error(`launch failed: ${JSON.stringify(launched)}`)
 
     const version = await fetchVersion(launched.upstreamPort)
     const cdp = await Cdp.connect(version.webSocketDebuggerUrl)
     const findTab = async (title: string) => {
-      const { targetInfos } = await cdp.send<{ targetInfos: any[] }>('Target.getTargets')
-      return targetInfos.find(t => t.type === 'page' && t.title === title)!
+      for (let i = 0; i < 20; i++) {
+        const { targetInfos } = await cdp.send<{ targetInfos: any[] }>('Target.getTargets')
+        const found = targetInfos.find(t => t.type === 'page' && t.title === title)
+        if (found) return found
+        await sleep(400)
+      }
+      throw new Error(`tab ${title} not found`)
     }
-    const sess = async (targetId: string) => {
-      const sessionId = await cdp.attach(targetId)
-      await cdp.send('Page.enable', {}, sessionId)
-      return sessionId
-    }
-    const raf = async (sessionId: string) =>
-      (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__raf()', returnByValue: true }, sessionId)).result.value
-
     const tab1 = await findTab('tab1')
-    const s1 = await sess(tab1.targetId)
+    const sessionId = await cdp.attach(tab1.targetId)
+    await cdp.send('Page.enable', {}, sessionId)
+    const { windowId } = await cdp.send<{ windowId: number }>('Browser.getWindowForTarget', { targetId: tab1.targetId })
+    await sleep(1500) // let injection land
 
-    // visible baseline (2s on screen)
-    await sleep(500)
-    const r0 = await raf(s1)
+    // visible baseline
+    const v0 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__native()', returnByValue: true }, sessionId)).result.value
     await sleep(2000)
-    const r1 = await raf(s1)
-    const baseline = (r1 - r0) / 2
-    console.log(`baseline rAF/s (visible): ${baseline.toFixed(1)}`)
+    const v1 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__native()', returnByValue: true }, sessionId)).result.value
+    const baseline = (v1 - v0) / 2
+    console.log(`baseline native rAF/s (visible): ${baseline.toFixed(1)}`)
 
-    // collapse to background (native minimize; pump keeps speed)
-    await apiPost('/api/bg', {})
+    // 1. corner collapse → native full speed
     const t0 = Date.now()
-    let pumping = false
+    await apiPost('/api/bg', {})
+    let cornered = false
     while (Date.now() - t0 < 5000) {
+      await sleep(300)
+      const w = await apiGet('/api/windows')
+      const win = (w.windows ?? []).find((x: any) => x.windowId === windowId)
+      if (win?.cornered) { cornered = true; break }
+    }
+    const b0 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__native()', returnByValue: true }, sessionId)).result.value
+    await sleep(4000)
+    const b1 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__native()', returnByValue: true }, sessionId)).result.value
+    const cornerRate = (b1 - b0) / 4
+    const cornerRatio = cornerRate / baseline
+    const health = await apiGet('/api/health')
+    const t1h = (health.targets ?? []).find((t: any) => t.targetId === tab1.targetId)
+    console.log(`cornered: cornered=${cornered} native rAF/s=${cornerRate.toFixed(1)} ratio=${(cornerRatio * 100).toFixed(0)}% visibility=${t1h?.visibility}`)
+
+    // screenshot must be fresh and fast while cornered
+    const st0 = Date.now()
+    const shot = await cdp.send<{ data: string }>('Page.captureScreenshot', { format: 'jpeg', quality: 20 }, sessionId)
+    const shotMs = Date.now() - st0
+    console.log(`cornered screenshot: ${shot.data.length} bytes in ${shotMs}ms`)
+
+    // 2. user minimize → shim keeps logic alive + pump produces real frames
+    await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } })
+    const t2 = Date.now()
+    let pumping = false
+    while (Date.now() - t2 < 5000) {
       await sleep(300)
       const w = await apiGet('/api/windows')
       if ((w.pumping ?? 0) > 0) { pumping = true; break }
     }
-    const reactMs = Date.now() - t0
-    console.log(`collapse done; pump engaged in ~${reactMs}ms (engaged=${pumping}); window now minimized`)
+    const m0 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__raf()', returnByValue: true }, sessionId)).result.value
+    await sleep(4000)
+    const m1 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__raf()', returnByValue: true }, sessionId)).result.value
+    const shimRate = (m1 - m0) / 4
+    console.log(`minimized: pumping=${pumping} shimmed logic rAF/s=${shimRate.toFixed(1)}`)
 
-    // rAF must keep running while minimized (8s measurement)
-    const p0 = await raf(s1)
-    await sleep(8000)
-    const p1 = await raf(s1)
-    const bgRate = (p1 - p0) / 8
-    const ratio = bgRate / baseline
-    const health = await apiGet('/api/health')
-    const target = (health.targets ?? []).find((t: any) => t.targetId === tab1.targetId)
-    console.log(`minimized rAF/s: ${bgRate.toFixed(1)}  ratio ${(ratio * 100).toFixed(0)}%  visibility=${target?.visibility}`)
-
-    // background-tab case: open tab2 (active), tab1 becomes hidden background tab
-    await cdp.send('Target.createTarget', { url: PAGE_HTML('tab2') })
-    await sleep(1500)
-    let pumpingBg = false
-    const t1 = Date.now()
-    while (Date.now() - t1 < 5000) {
-      await sleep(300)
-      const w = await apiGet('/api/windows')
-      if ((w.pumping ?? 0) >= 1) { pumpingBg = w.pumping >= 1; if (pumpingBg) break }
-    }
-    const b0 = await raf(s1)
-    await sleep(5000)
-    const b1 = await raf(s1)
-    const bgTabRate = (b1 - b0) / 5
-    console.log(`background-tab rAF/s (pumped): ${bgTabRate.toFixed(1)} (${pumpingBg ? 'pump on' : 'pump OFF'})`)
-
-    // restore: windows come back normal; tab1 is still a BACKGROUND tab, so by
-    // design its pump keeps running — pumping targets must equal hidden targets
+    // 3. restore
     await apiPost('/api/restore', {})
-    await sleep(1000)
-    const w2 = await apiGet('/api/windows')
-    const allNormal = (w2.windows ?? []).every((x: any) => x.state === 'normal')
-    const health2 = await apiGet('/api/health')
-    const hiddenCount = (health2.targets ?? []).filter((t: any) => t.visibility !== 'visible').length
-    const tab2Health = (health2.targets ?? []).find((t: any) => t.title === 'tab2')
-    const pumpsMatchHidden = (w2.pumping ?? 0) === hiddenCount && (tab2Health?.visibility ?? 'hidden') === 'visible'
-    console.log(`restored: allNormal=${allNormal} pumping=${w2.pumping} hiddenTargets=${hiddenCount} tab2Visible=${tab2Health?.visibility}`)
+    await sleep(800)
+    const w3 = await apiGet('/api/windows')
+    const win3 = (w3.windows ?? []).find((x: any) => x.windowId === windowId)
+    const restored = win3 != null && !win3.cornered
+    console.log(`restore: ${restored}`)
 
-    const pass = pumping && reactMs <= 5000 && ratio >= 0.4 && bgTabRate >= baseline * 0.4 && allNormal && pumpsMatchHidden
-    console.log(`\n${pass ? 'PASS' : 'FAIL'} supervisor e2e (frame pump)`)
+    const pass = cornered && cornerRatio >= 0.9 && shotMs < 3000 && pumping && shimRate >= 12 && restored
+    console.log(`\n${pass ? 'PASS' : 'FAIL'} supervisor e2e (corner collapse)`)
     process.exitCode = pass ? 0 : 1
   } catch (err) {
     console.error('\nSUPERVISOR TEST ERROR:', err instanceof Error ? err.stack : err)

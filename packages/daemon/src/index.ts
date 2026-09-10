@@ -25,9 +25,12 @@ async function main() {
 
   const bus = new ActivityBus()
   const extensions = new ExtensionManager()
-  const manager = new BrowserManager({ extensions })
+  const manager: BrowserManager = new BrowserManager({
+    extensions,
+    cornerWindow: (cdp, windowId) => supervisor.cornerWindow(cdp, windowId),
+  })
   const health = new HealthMonitor(() => (manager.current ? { cdp: manager.current.cdp } : null))
-  const supervisor = new FramePumpSupervisor(
+  const supervisor: FramePumpSupervisor = new FramePumpSupervisor(
     () => (manager.current ? { cdp: manager.current.cdp } : null),
     () => health.snapshot(),
   )
