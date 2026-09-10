@@ -2,10 +2,11 @@ import http from 'node:http'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { ActivityBus } from './activity.ts'
 import type { BrowserManager } from './browser.ts'
+import type { CaptureKeepAlive } from './capture.ts'
 import type { ExtensionManager } from './extensions.ts'
 import type { HealthMonitor } from './inject.ts'
 import { loadSettings, saveSettings, type Settings } from './store.ts'
-import type { WindowStateInfo, FramePumpSupervisor } from './windows.ts'
+import type { FramePumpSupervisor } from './windows.ts'
 import { TapState, tapFrame } from './tap.ts'
 import { log, debug } from './log.ts'
 
@@ -13,6 +14,7 @@ export interface ServerDeps {
   manager: BrowserManager
   supervisor: FramePumpSupervisor
   health: HealthMonitor
+  capture: CaptureKeepAlive
   extensions: ExtensionManager
   bus: ActivityBus
   version: string
@@ -62,6 +64,11 @@ export function createServer(deps: ServerDeps): http.Server {
   httpServer.on('request', async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
     try {
+      if (url.pathname === '/controller') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+        res.end(controllerHtml())
+        return
+      }
       if (url.pathname === '/') {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         res.end(dashboardHtml(deps))
@@ -192,6 +199,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
               space: cur.space,
               extensions: deps.extensions.list().filter(e => cur.extensionPaths.includes(e.path)).map(e => e.name),
               startedAt: cur.startedAt,
+              captureTargetId: deps.capture.activeTargetId(),
             }
           : { running: false },
       })
@@ -286,7 +294,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return
     }
     case 'POST /api/settings': {
-      const allowed: Array<keyof Settings> = ['backgroundMode', 'halo', 'pumpFps', 'soloExtensions', 'space', 'browser', 'proxyPort', 'launchMode']
+      const allowed: Array<keyof Settings> = ['backgroundMode', 'captureKeepAlive', 'halo', 'pumpFps', 'soloExtensions', 'space', 'browser', 'proxyPort', 'launchMode', 'collapseMode']
       const patch: Partial<Settings> = {}
       for (const k of allowed) if (k in payload) (patch as any)[k] = payload[k]
       const settings = saveSettings(patch)
@@ -298,6 +306,30 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   }
 }
 
+
+// ---- controller tab (tab-capture keep-alive trigger) -------------------------
+
+function controllerHtml(): string {
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>bl-controller</title></head>
+<body style="font:24px monospace;background:#0b0f14;color:#37c8ff">
+Backlight controller · 后台保活运行中
+<script>
+  window.__stream = null;
+  window.startCapture = async (fps) => {
+    try {
+      if (window.__stream) return 'already';
+      window.__stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: fps || 10 }, audio: false });
+      window.__stream.getVideoTracks()[0].addEventListener('ended', () => { window.__stream = null });
+      return 'ok';
+    } catch (e) { return 'err: ' + (e && e.name); }
+  };
+  window.stopCapture = () => {
+    try { if (window.__stream) window.__stream.getTracks().forEach(t => t.stop()); } catch {}
+    const had = !!window.__stream; window.__stream = null; return had ? 'stopped' : 'none';
+  };
+</script></body></html>`
+}
 
 // ---- dashboard ---------------------------------------------------------------
 

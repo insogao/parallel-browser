@@ -82,7 +82,7 @@ export class FramePumpSupervisor {
       const { cdp } = ctx
       const wanted = new Set(
         this.getHealth()
-          .filter(t => t.visibility !== 'visible')
+          .filter(t => t.visibility !== 'visible' && !t.url.includes('/controller'))
           .map(t => t.targetId),
       )
       for (const [targetId, pump] of this.pumps) {

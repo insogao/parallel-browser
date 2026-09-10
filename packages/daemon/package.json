@@ -9,7 +9,7 @@
     "start": "node src/index.ts",
     "dev": "node --watch src/index.ts",
     "check": "tsc --noEmit",
-    "test": "node tests/spike.ts && node tests/supervisor.ts && node tests/extensions.ts && node tests/agent.ts",
+    "test": "caffeinate -dis node tests/spike.ts && caffeinate -dis node tests/supervisor.ts && caffeinate -dis node tests/extensions.ts && caffeinate -dis node tests/agent.ts",
     "build": "tsc --noEmit"
   },
   "dependencies": {

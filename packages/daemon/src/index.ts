@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import { ActivityBus } from './activity.ts'
 import { BrowserManager } from './browser.ts'
+import { CaptureKeepAlive } from './capture.ts'
 import { ExtensionManager } from './extensions.ts'
 import { HealthMonitor } from './inject.ts'
 import { ensureDirs, paths } from './paths.ts'
@@ -34,6 +35,10 @@ async function main() {
     () => (manager.current ? { cdp: manager.current.cdp } : null),
     () => health.snapshot(),
   )
+  const capture = new CaptureKeepAlive(
+    () => (manager.current ? { cdp: manager.current.cdp, controllerUrl: `http://127.0.0.1:${proxyPort}/controller` } : null),
+    () => health.snapshot(),
+  )
 
   const pulseSessions = new Map<string, Promise<string>>()
   const pulse = (targetId: string) => {
@@ -56,6 +61,7 @@ async function main() {
     manager,
     supervisor,
     health,
+    capture,
     extensions,
     bus,
     version: VERSION,
@@ -70,6 +76,7 @@ async function main() {
 
   supervisor.start(500)
   health.start(2000)
+  capture.start(1000)
 
   server.listen(proxyPort, '127.0.0.1', () => {
     log(`backlight daemon v${VERSION} listening on http://127.0.0.1:${proxyPort}`)
@@ -80,6 +87,7 @@ async function main() {
     log(`daemon ${signal}; shutting down`)
     supervisor.stop()
     health.stop()
+    capture.stop()
     extensions.stopWatching()
     try { fs.rmSync(paths.daemonFile, { force: true }) } catch { /* ignore */ }
     if (manager.running) await manager.stop()

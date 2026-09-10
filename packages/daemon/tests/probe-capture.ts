@@ -59,6 +59,7 @@ async function main() {
     '--disable-backgrounding-occluded-windows',
     '--autoplay-policy=no-user-gesture-required',
     '--auto-select-tab-capture-source-by-title=BACKLIGHT_AGENT',
+    '--blink-settings=displayCaptureRequiresUserGesture=false',
   ]
   const child = spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', args, { stdio: 'ignore' })
   try {

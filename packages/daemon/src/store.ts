@@ -8,6 +8,8 @@ export interface Settings {
   space: string
   /** frame-pump hidden pages so they keep rendering (rAF) at full speed */
   backgroundMode: boolean
+  /** tab-capture keep-alive: captured tabs report visible (native 60fps) even minimized */
+  captureKeepAlive: boolean
   /** pump rate (captures per second) per hidden page */
   pumpFps: number
   /** in-page halo pulse when an AI command touches the page */
@@ -36,6 +38,7 @@ export const defaultSettings: Settings = {
   proxyPort: Number(process.env.BACKLIGHT_PORT ?? 9333),
   space: 'default',
   backgroundMode: true,
+  captureKeepAlive: true,
   pumpFps: 10,
   halo: true,
   soloExtensions: false,

@@ -140,6 +140,11 @@ export class BrowserManager {
       '--disable-session-crashed-bubble',
       // allow the silent-audio keep-alive to run without a user gesture
       '--autoplay-policy=no-user-gesture-required',
+      // tab-capture keep-alive: getDisplayMedia() from the controller tab
+      // auto-selects the BACKLIGHT_AGENT tab (CapturerCount exemption);
+      // blink-settings removes the user-gesture requirement (daemon-initiated)
+      '--auto-select-tab-capture-source-by-title=BACKLIGHT_AGENT',
+      '--blink-settings=displayCaptureRequiresUserGesture=false',
     ]
     if (backgroundLaunch) {
       // start with no window; pages open as background targets afterwards so
@@ -162,7 +167,7 @@ export class BrowserManager {
       }
     }
 
-    const { child, pid } = await this.spawnBrowser(binary, args, profileDir)
+    const { child, pid } = await this.spawnBrowser(binary, args, profileDir, backgroundLaunch)
     log(`launching ${binary} (space=${space}, upstreamPort=${upstreamPort}, extensions=${extensionPaths.length}, mode=${backgroundLaunch ? 'background' : 'visible'})`)
 
     // wait for the debug endpoint
@@ -257,15 +262,17 @@ export class BrowserManager {
   }
 
   /**
-   * Spawn the browser. Prefers `open -g -j` (launches WITHOUT activating the
-   * app — no focus steal) when no instance of that binary is running yet;
-   * falls back to a direct spawn otherwise (args are lost via `open` when an
-   * instance already exists).
+   * Spawn the browser. For background launches prefers `open -g -j` (launches
+   * WITHOUT activating the app — no focus steal) when no instance of that
+   * binary is running yet; falls back to a direct spawn otherwise (args are
+   * lost via `open` when an instance already exists). Visible launches always
+   * spawn directly — a hidden launch would leave the app permanently occluded.
    */
   private async spawnBrowser(
     binary: string,
     args: string[],
     _profileDir: string,
+    allowHiddenLaunch: boolean,
   ): Promise<{ child: ChildProcess | null; pid: number }> {
     const appPath = binary.includes('/Contents/MacOS/')
       ? binary.slice(0, binary.indexOf('/Contents/MacOS/'))
@@ -273,7 +280,7 @@ export class BrowserManager {
     const alreadyRunning = await new Promise<boolean>((resolve) => {
       execFile('pgrep', ['-f', binary], (err, stdout) => resolve(!err && stdout.trim().length > 0))
     })
-    if (appPath && !alreadyRunning) {
+    if (allowHiddenLaunch && appPath && !alreadyRunning) {
       log(`spawning via open -g -j (no activation): ${appPath}`)
       spawn('/usr/bin/open', ['-g', '-j', '-a', appPath, '--args', ...args], { stdio: 'ignore' })
       return { child: null, pid: -1 }

@@ -104,17 +104,20 @@ async function main() {
     // 2. user minimize → shim keeps logic alive + pump produces real frames
     await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } })
     const t2 = Date.now()
-    let pumping = false
-    while (Date.now() - t2 < 5000) {
-      await sleep(300)
-      const w = await apiGet('/api/windows')
-      if ((w.pumping ?? 0) > 0) { pumping = true; break }
+    let captured = false
+    while (Date.now() - t2 < 15000) {
+      await sleep(500)
+      const h = await apiGet('/api/health')
+      const th = (h.targets ?? []).find((t: any) => t.targetId === tab1.targetId)
+      if (th?.visibility === 'visible' && th?.nativeRafPerSec >= 45) { captured = true; break }
     }
-    const m0 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__raf()', returnByValue: true }, sessionId)).result.value
+    const m0 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__native()', returnByValue: true }, sessionId)).result.value
     await sleep(4000)
-    const m1 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__raf()', returnByValue: true }, sessionId)).result.value
-    const shimRate = (m1 - m0) / 4
-    console.log(`minimized: pumping=${pumping} shimmed logic rAF/s=${shimRate.toFixed(1)}`)
+    const m1 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__native()', returnByValue: true }, sessionId)).result.value
+    const nativeRate = (m1 - m0) / 4
+    const health2 = await apiGet('/api/health')
+    const th2 = (health2.targets ?? []).find((t: any) => t.targetId === tab1.targetId)
+    console.log(`minimized: captureEngaged=${captured} NATIVE rAF/s=${nativeRate.toFixed(1)} visibility=${th2?.visibility}`)
 
     // 3. restore
     await apiPost('/api/restore', {})
@@ -124,7 +127,9 @@ async function main() {
     const restored = win3 != null && !win3.cornered
     console.log(`restore: ${restored}`)
 
-    const pass = cornered && cornerRatio >= 0.9 && shotMs < 3000 && pumping && shimRate >= 12 && restored
+    const pass = cornered && cornerRatio >= 0.9 && shotMs < 3000 && captured && nativeRate >= 45 && restored
+    // known cosmetic gap: DOM visibilityState may still read 'hidden' while
+    // captured (rAF + screenshots unaffected); the in-page freeze polish is pending
     console.log(`\n${pass ? 'PASS' : 'FAIL'} supervisor e2e (corner collapse)`)
     process.exitCode = pass ? 0 : 1
   } catch (err) {
