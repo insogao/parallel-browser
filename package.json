@@ -1,0 +1,15 @@
+{
+  "name": "backlight",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backlight（后台浏览器）— AI-friendly background browser: full-speed pages when minimized, first-class extension dev loop, live AI-command indicators.",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r --if-present run build",
+    "dev:daemon": "pnpm --filter @backlight/daemon dev",
+    "test": "pnpm --filter @backlight/daemon test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

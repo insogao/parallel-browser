@@ -1,0 +1,25 @@
+{
+  "name": "@backlight/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backlight daemon: browser supervisor, CDP proxy, activity bus, extension manager.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "node src/index.ts",
+    "dev": "node --watch src/index.ts",
+    "check": "tsc --noEmit",
+    "test": "node tests/spike.ts && node tests/supervisor.ts && node tests/extensions.ts && node tests/agent.ts",
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@puppeteer/browsers": "^3.2.2",
+    "chokidar": "^4.0.3",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.2"
+  }
+}
