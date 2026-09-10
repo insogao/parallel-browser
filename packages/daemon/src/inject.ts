@@ -266,7 +266,7 @@ export class HealthMonitor {
       if (res.exceptionDetails) return
       const health = await cdp.send<{ result?: { value?: any } }>(
         'Runtime.evaluate',
-        { expression: '(()=>{const h=window.__blHealth;if(!h)return null;return{raf:h.raf,native:h.native,vis:document.visibilityState}})()', returnByValue: true },
+        { expression: '(()=>{const h=window.__blHealth;if(!h)return null;return{raf:h.raf,native:h.native,timer:h.timer,vis:document.visibilityState}})()', returnByValue: true },
         sessionId,
       )
       const v = health.result?.value
