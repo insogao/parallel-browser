@@ -64,6 +64,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     pollTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { _ in self.poll() }
     iconTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { _ in self.updateIcon() }
+
+    // 用户点击 Dock 里的浏览器图标（应用被激活）→ 自动还原被收起的窗口，
+    // 让"辅助登录/查看进度"像普通浏览器一样自然。按 PID 精确匹配我们的实例，
+    // 用户自己的 Chrome 被激活时不会误触发。
+    NSWorkspace.shared.notificationCenter.addObserver(
+      forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+    ) { [weak self] note in
+      guard let self,
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+            app.bundleIdentifier?.lowercased().contains("chrom") == true else { return }
+      apiGet("/api/status") { [weak self] data in
+        guard let self, let data,
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let browser = obj["browser"] as? [String: Any],
+              browser["running"] as? Bool == true,
+              let pid = browser["pid"] as? Int else { return }
+        if pid == app.processIdentifier {
+          DispatchQueue.main.async { self.restoreAll(NSApplication.shared) }
+        }
+      }
+    }
   }
 
   private func menuItem(_ title: String, _ action: Selector) -> NSMenuItem {
