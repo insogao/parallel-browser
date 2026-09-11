@@ -1,5 +1,6 @@
 # Backlight 夜间工作计划（自主执行用）
 
+> ⛔ **自动化停止指令（2026-09-11 08:11）**：夜间计划已全部完成、晨报已写、已达 8:00 截止时间。任何由「Backlight 夜间进度自检」自动化触发的运行：读到这里请**立即结束本次运行，不做任何测试、不写任何文件、不提交任何 commit**。该自动化等待用户在 ZCode 面板中手动删除（id: automation-8d9b4fe0-948e-458a-ba1d-75ec212c7af7）。
 > 本文件是夜间自主工作的唯一上下文入口。每完成一项就更新「状态」段并 git commit。
 > 当前时间起点：2026-09-11 凌晨约 01:30（本地）。工作到早上 8:00 为止。
 
@@ -83,9 +84,31 @@ Backlight（后台浏览器）：对标 ego-lite 的 AI 友好浏览器监督器
 | 插件热重载/直达测试 | ✅✅（ego-lite 没有，反超点） |
 | AI 指令可视化 | ✅ 光环 + 活动流 + dashboard + 托盘（反超点） |
 
-## 晨报（8:00 收尾时填写）
+## 晨报（2026-09-11 08:11 收尾）
 
-（待填）
+### 夜间完成事项（01:30–03:45 开发，03:46–08:11 巡检）
+1. **P0 实验验证**：Tab Capture → CapturerCount 豁免机制实测成功——最小化标签页原生 rAF 60fps、visibilityState=visible、截图 70-90ms 真实帧（零 fork，靠 `--auto-select-tab-capture-source-by-title` + getDisplayMedia + `--blink-settings=displayCaptureRequiresUserGesture=false`）
+2. **P1 产品化**：CaptureKeepAlive 集成（controller 标签轮换捕获、手势绕过、连续 hidden 采样防抖、3 败熔断），修复 5 个集成 bug
+3. **P3 cookie 导入**：`bl import` 从本机 Chrome profile 文件级导入 Cookies/Login Data/Web Data，实测导入"您的 Chrome"后 **x.com 后台启动即登录态（loggedIn:true，原生 60fps 跑了一整夜）**
+4. **后台优先启动**：默认零弹窗零焦点（open -g -j + 窗口出生即贴角）；`bl show`/`bl bg`/`bl restore`；修复 visible 模式误走隐藏启动的回归
+5. **P4 托盘**：Swift 菜单栏应用（packages/tray，无 Electron），AI 指令闪烁 + 收起/恢复菜单，`bl tray`
+6. **P5**：doctor 体检、README v2、ego-lite 功能对照表（见下方）
+
+### 测试结果
+- 最终状态：**11 PASS / 0 FAIL**（spike/supervisor/extensions/agent/background/import 全绿）
+- 夜间 11 次巡检：8 次全绿，2 次发现真实回归并当场修复（① capture 候选过滤误排 data: URL；② spike 对照组未关 capture），1 次环境噪音（显示器睡眠 → 已用 caffeinate 包裹测试）
+
+### 遗留风险 / 待办（白天）
+1. 捕获生效后页面内 `visibilityState` 冻结代码未生效（DOM 仍可能读 hidden；rAF/截图不受影响）——需查 defineProperty 注入时序
+2. shim rAF 计数在 SPA 长会话出现异常大数值（疑似多链累加），native/s 才是可信帧率指标
+3. capture 10fps 编码有 CPU 成本，可试验 1-2fps（若豁免与 fps 无关可大幅降耗）
+4. 托盘图标闪烁、菜单点击需人工目视验收
+5. 多标签并发保活：当前单 magic title 只保活 1 个标签，全量并发需 tabCapture 扩展或小 fork（方案见 DISCUSSION.md）
+
+### 建议白天事项
+- 人工体验：`bl launch https://x.com` → 手动最小化 → `bl health` 看 native 60fps → `bl show` 恢复
+- 目视验收托盘闪烁与菜单
+- 决定是否立小 fork 项目（Capture token 方案，DISCUSSION.md Q8）
 
 ## 晨报（8:00 收尾时填写）
 
