@@ -349,7 +349,7 @@ async function main() {
       } else {
         console.log('ℹ daemon 未运行（任意命令会自动启动）')
       }
-      const cacheDir = path.join(home, "browsers")
+      const cacheDir = path.join(home, "..", "Caches", "Backlight", "browsers")
       const hasCft = fs.existsSync(cacheDir) && fs.readdirSync(cacheDir).length > 0
       console.log(`${hasCft ? '✓' : 'ℹ'} 扩展用浏览器缓存: ${hasCft ? cacheDir : '未下载（插件开发时自动下载 Chrome for Testing）'}`)
       try {
