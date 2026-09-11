@@ -198,15 +198,26 @@ export async function brandBundle(opts: BrandOptions): Promise<string> {
   if (!fs.existsSync(masterPng)) throw new Error(`icon not found: ${masterPng}`)
   await makeIcns(masterPng, path.join(resources, 'backlight.icns'))
 
-  // Info.plist: display name + icon; keep CFBundleIdentifier untouched so
-  // Keychain service names (and imported cookie decryption) stay consistent
+  // Info.plist: display name + icon. CFBundleIdentifier is set to a DEDICATED
+  // id (not CfT's) so macOS registers the branded app as a fresh, separate
+  // application — no icon-cache collision with Chrome/CfT registrations.
+  // Keychain caveat: the branded browser has its own login store.
   const plistPath = path.join(destApp, 'Contents', 'Info.plist')
   const patched = patchPlist(fs.readFileSync(plistPath, 'utf8'), {
     CFBundleName: name,
     CFBundleDisplayName: name,
     CFBundleIconFile: 'backlight',
+    CFBundleIdentifier: 'dev.backlight.browser',
   })
   fs.writeFileSync(plistPath, patched)
+
+  // register with LaunchServices so the Dock shows the branded icon immediately
+  try {
+    await run('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister', ['-f', destApp])
+    await run('/bin/killall', ['Dock'])
+  } catch (err) {
+    warn(`LaunchServices refresh failed: ${(err as Error).message.slice(0, 120)}`)
+  }
 
   // NOTE: do NOT re-sign. The main executable is untouched (still validly
   // signed by Google); a --deep ad-hoc re-sign would strip the helpers'

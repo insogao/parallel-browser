@@ -56,7 +56,7 @@ try {
   const appDir = path.dirname(path.dirname(path.dirname(destBin)))
   const plist = fs.readFileSync(path.join(appDir, 'Contents', 'Info.plist'), 'utf8')
   ok('CFBundleName rebranded', plist.includes('<string>MyBrand</string>'))
-  ok('CFBundleIdentifier PRESERVED (cookie/keychain semantics)', plist.includes('com.google.chrome.for.testing'))
+  ok('CFBundleIdentifier set to dedicated brand id', plist.includes('dev.backlight.browser'))
   ok('icon switched to backlight.icns', plist.includes('<string>backlight</string>') && fs.existsSync(path.join(appDir, 'Contents', 'Resources', 'backlight.icns')))
   ok('old app.icns untouched', fs.existsSync(path.join(appDir, 'Contents', 'Resources', 'app.icns')))
 } catch (err) {
