@@ -100,6 +100,7 @@ function usage(): string {
   backlight ext ls              列出已注册扩展
   backlight ext rm <名称>       移除扩展
   backlight import              从本机 Chrome 导入 cookie/登录态（--profile 目录名 --space 名称，--list 列出）
+  backlight brand               品牌化浏览器（--name 名称 --icon logo.png）
   backlight doctor              环境体检
 
 环境变量:
@@ -306,6 +307,19 @@ async function main() {
       }
       spawn('open', ['-a', appPath], { detached: true, stdio: 'ignore' }).unref()
       console.log('tray launched — menu bar icon appears (bolt = AI activity, menu: 收起/恢复/控制台)')
+      return
+    }
+
+    case 'brand': {
+      const info = await ensureDaemon()
+      const body: Record<string, unknown> = {}
+      if (args.flags.get('name')) body.name = args.flags.get('name')
+      if (args.flags.get('icon')) body.icon = path.resolve(String(args.flags.get('icon')))
+      console.log('branding: downloading Chrome for Testing (if needed) and creating your branded browser…')
+      const res = await api(info, '/api/browser/brand', { method: 'POST', body: JSON.stringify(body) }, 600_000)
+      console.log(`branded browser ready: ${res.browser}`)
+      console.log('`bl launch` will now use it — Dock shows your brand.')
+      console.log('ℹ 品牌浏览器有独立登录存储（手动登录一次即可）；要复用导入的 cookie 请使用默认 Google Chrome 引擎')
       return
     }
 

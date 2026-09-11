@@ -1,4 +1,5 @@
 import http from 'node:http'
+import path from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { ActivityBus } from './activity.ts'
 import type { BrowserManager } from './browser.ts'
@@ -7,6 +8,9 @@ import type { ExtensionManager } from './extensions.ts'
 import type { HealthMonitor } from './inject.ts'
 import { loadSettings, saveSettings, type Settings } from './store.ts'
 import { listChromeProfiles, importProfile } from './import.ts'
+import { ensureChromiumForExtensions } from './browser.ts'
+import { brandBundle } from './brand.ts'
+import { paths } from './paths.ts'
 import type { FramePumpSupervisor } from './windows.ts'
 import { TapState, tapFrame } from './tap.ts'
 import { log, debug } from './log.ts'
@@ -315,6 +319,33 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         return json(res, 400, { error: (err as Error).message })
       }
       json(res, 200, { ok: true, space, source: `${src.browser} / ${src.dir} (${src.name})`, copied })
+      return
+    }
+    case 'POST /api/browser/brand': {
+      if (deps.manager.running) return json(res, 409, { error: 'stop the browser first (bl stop)' })
+      const name = String(payload.name ?? 'Backlight').slice(0, 40)
+      let cftBin: string | null = null
+      try {
+        cftBin = await ensureChromiumForExtensions()
+      } catch (err) {
+        return json(res, 500, { error: `CfT unavailable: ${(err as Error).message}` })
+      }
+      if (!cftBin) return json(res, 500, { error: 'Chrome for Testing unavailable (download failed)' })
+      const srcApp = cftBin.slice(0, cftBin.indexOf('.app') + '.app'.length)
+      const safe = name.replace(/[^a-zA-Z0-9\u4e00-\u9fff_-]+/g, '-')
+      const destApp = path.join(paths.root, 'apps', `${safe}.app`)
+      const destBin = await brandBundle({
+        srcApp,
+        destApp,
+        name,
+        iconPng: payload.icon ? path.resolve(String(payload.icon)) : undefined,
+      })
+      saveSettings({ browser: destBin })
+      json(res, 200, {
+        ok: true,
+        browser: destBin,
+        note: 'branded browser keeps its own login store (fresh logins); imported cookies work with the unbranded Google Chrome engine',
+      })
       return
     }
     case 'POST /api/settings': {

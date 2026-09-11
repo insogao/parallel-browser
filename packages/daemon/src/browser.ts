@@ -368,7 +368,7 @@ export class BrowserManager {
  * Download a Chromium build (Chrome for Testing) that still supports
  * --load-extension. Cached under BACKLIGHT_HOME/browsers.
  */
-async function ensureChromiumForExtensions(): Promise<string | null> {
+export async function ensureChromiumForExtensions(): Promise<string | null> {
   // Lazy import: keeps daemon startup cheap when extensions aren't used.
   let mod: any
   try {

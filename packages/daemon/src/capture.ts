@@ -197,6 +197,10 @@ export class CaptureKeepAlive {
       this.failures++
       warn(`capture keep-alive failed (started=${started}, vis=${meV}); failure #${this.failures}`)
       await cdp.send('Runtime.evaluate', { expression: 'window.stopCapture()' }, controllerSession).catch(() => {})
+      // restore the tab title even on failure, or it stays BACKLIGHT_AGENT forever
+      await cdp.send('Runtime.evaluate', {
+        expression: `(() => { if (window.__blOrigTitle !== undefined) { document.title = String(window.__blOrigTitle); delete window.__blOrigTitle } })()`,
+      }, targetSession).catch(() => {})
       if (this.failures >= 3) {
         this.disabled = true
         warn('capture keep-alive disabled for this session after repeated failures (pump/shim remain)')
