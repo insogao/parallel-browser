@@ -124,19 +124,23 @@ export class CaptureKeepAlive {
 
     // 2. the controller tab must be the ACTIVE, visible tab for
     // getDisplayMedia to be allowed (hidden callers get InvalidStateError).
-    // The window is collapsed to a 2px corner at this point, so activating a
-    // tab inside it is invisible in practice. If the window was minimized we
-    // restore it to the corner first (one brief flash), capture, and leave it
-    // cornered — the stream persists across any later minimize.
+    // If its window is minimized, restore it straight to the offscreen corner
+    // in ONE step (≈one frame flash at worst), capture, then re-minimize and
+    // put the original restored-position back so dock-clicks still work.
     const win = await cdp.send<{ windowId?: number }>('Browser.getWindowForTarget', { targetId: this.controller!.targetId }).catch(() => ({ windowId: undefined }))
+    let reMinimizeAfter = false
+    let origLeft: number | undefined
+    let origTop: number | undefined
     if (win.windowId !== undefined) {
       const { bounds } = await cdp.send<{ bounds: any }>('Browser.getWindowBounds', { windowId: win.windowId })
       if ((bounds.windowState ?? 'normal') === 'minimized') {
-        await cdp.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal' } })
+        reMinimizeAfter = true
+        origLeft = bounds.left
+        origTop = bounds.top
         const wa = await readWorkArea(cdp)
         const left = wa.al - ((bounds.width ?? 1200) - OFFSCREEN_MARGIN)
         const top = wa.at + wa.ah - OFFSCREEN_MARGIN
-        await cdp.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { left, top } })
+        await cdp.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal', left, top } })
       }
     }
     await cdp.send('Target.activateTarget', { targetId: this.controller!.targetId })
@@ -181,6 +185,13 @@ export class CaptureKeepAlive {
         })()`,
       }, targetSession).catch(() => {})
       log(`capture keep-alive engaged for ${target.targetId.slice(0, 8)} (native full speed while hidden)`)
+      // preserve the user's minimize + their original window position so
+      // dock-click still restores the window exactly where it was
+      if (reMinimizeAfter && win.windowId !== undefined) {
+        await cdp.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'minimized' } })
+        await cdp.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { left: origLeft, top: origTop } })
+        log(`window re-minimized after capture; original position preserved`)
+      }
     } else {
       const meV = this.getHealth().find(t => t.targetId === target.targetId)?.visibility
       this.failures++

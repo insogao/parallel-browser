@@ -153,15 +153,24 @@ export class FramePumpSupervisor {
     return [...this.pumps.keys()]
   }
 
-  /** Collapse every window to the offscreen corner (2px sliver stays visible). */
+  /** Collapse: 'minimize' mode (default) = native minimize (dock-click restores
+   * natively; capture keep-alive keeps pages fast). 'corner' = 2px sliver. */
   async collapseAll(): Promise<number> {
     const ctx = this.getContext()
     if (!ctx) return 0
     let n = 0
+    const mode = this.settings().collapseMode
     for (const windowId of await this.collectWindowIds()) {
-      if (await this.cornerWindow(ctx.cdp, windowId)) n++
+      try {
+        if (mode === 'minimize') {
+          await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } })
+        } else {
+          await this.cornerWindow(ctx.cdp, windowId)
+        }
+        n++
+      } catch { /* gone */ }
     }
-    log(`collapsed ${n} window(s) to the offscreen corner (pages run at full speed)`)
+    log(`collapsed ${n} window(s) (${mode}); pages keep running at full speed`)
     return n
   }
 
@@ -187,24 +196,38 @@ export class FramePumpSupervisor {
     }
   }
 
-  /** Bring cornered windows back to their original position. */
+  /** Bring collapsed windows back: 'minimize' mode un-minimizes everything
+   * (native dock-click semantics); 'corner' mode restores cornered positions. */
   async restoreAll(): Promise<number> {
     const ctx = this.getContext()
     if (!ctx) return 0
+    const mode = this.settings().collapseMode
     let n = 0
-    for (const [windowId, orig] of [...this.collapsed]) {
-      try {
-        await ctx.cdp.send('Browser.setWindowBounds', {
-          windowId,
-          bounds: { windowState: 'normal', left: orig.left, top: orig.top },
-        })
-        if (orig.wasMinimized) {
-          await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } })
+    if (mode === 'minimize') {
+      for (const windowId of await this.collectWindowIds()) {
+        try {
+          const { bounds } = await ctx.cdp.send<{ bounds: { windowState?: string } }>('Browser.getWindowBounds', { windowId })
+          if ((bounds.windowState ?? 'normal') === 'minimized') {
+            await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
+            n++
+          }
+        } catch { /* gone */ }
+      }
+    } else {
+      for (const [windowId, orig] of [...this.collapsed]) {
+        try {
+          await ctx.cdp.send('Browser.setWindowBounds', {
+            windowId,
+            bounds: { windowState: 'normal', left: orig.left, top: orig.top },
+          })
+          if (orig.wasMinimized) {
+            await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } })
+          }
+          this.collapsed.delete(windowId)
+          n++
+        } catch {
+          this.collapsed.delete(windowId)
         }
-        this.collapsed.delete(windowId)
-        n++
-      } catch {
-        this.collapsed.delete(windowId)
       }
     }
     log(`restored ${n} window(s)`)

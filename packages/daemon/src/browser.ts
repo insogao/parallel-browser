@@ -381,12 +381,27 @@ async function ensureChromiumForExtensions(): Promise<string | null> {
     const platform = mod.detectBrowserPlatform()
     const buildId = await mod.resolveBuildId('chrome', platform, 'stable')
     log(`fetching Chrome for Testing ${buildId} (${platform}) for extension support...`)
-    const installed = await mod.install({
-      browser: 'chrome',
-      buildId,
-      cacheDir: paths.browserCache,
-      baseUrl: process.env.BACKLIGHT_DOWNLOAD_BASE_URL || undefined,
-    })
+    const envBase = process.env.BACKLIGHT_DOWNLOAD_BASE_URL
+    const baseUrls = envBase
+      ? [envBase]
+      : [undefined, 'https://cdn.npmmirror.com/binaries/chrome-for-testing']
+    let installed: any = null
+    let lastErr: Error | null = null
+    for (const baseUrl of baseUrls) {
+      try {
+        installed = await mod.install({
+          browser: 'chrome',
+          buildId,
+          cacheDir: paths.browserCache,
+          baseUrl,
+        })
+        break
+      } catch (err) {
+        lastErr = err as Error
+        warn(`CfT download failed (${(err as Error).message.slice(0, 80)}); trying next source...`)
+      }
+    }
+    if (!installed) throw lastErr ?? new Error('download failed')
     log(`chromium ready: ${installed.executablePath}`)
     return installed.executablePath
   } catch (err) {

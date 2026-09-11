@@ -112,36 +112,40 @@ async function runSpike() {
   results['minimized'] = { ...(await rates(4000)) }
   console.log('minimized          ', JSON.stringify(results['minimized']))
 
-  // 3. corner collapse
+  // 3. capture keep-alive (main keep-alive layer): enable + collapse
+  await post('/api/settings', { captureKeepAlive: true })
   await post('/api/bg', {})
   const t0 = Date.now()
-  while (Date.now() - t0 < 4000) {
-    const b = (await cdp.send<{ bounds: any }>('Browser.getWindowBounds', { windowId })).bounds
-    if ((b.windowState ?? 'normal') === 'normal' && (b.left ?? 0) < 0) break
-    await sleep(200)
+  let capEngaged = false
+  while (Date.now() - t0 < 20000) {
+    await sleep(400)
+    const s: any = await fetch(`http://127.0.0.1:${PORT}/api/status`).then(r => r.json()).catch(() => null)
+    if (s?.browser?.captureTargetId === page.targetId) { capEngaged = true; break }
   }
-  await sleep(500)
-  results['corner'] = { ...(await rates(3000)), ...(await shotMs()) }
-  console.log('corner collapse    ', JSON.stringify(results['corner']))
+  await sleep(1000)
+  results['min+capture'] = { capEngaged, ...(await rates(3000)), ...(await shotMs()) }
+  console.log('min+capture        ', JSON.stringify(results['min+capture']))
 
   // ---- verdicts ----
   const ok = (label: string, cond: boolean) => `${cond ? 'PASS' : 'FAIL'}  ${label}`
   console.log('\n===== verdict =====')
   console.log(ok(`visible baseline native ~60 (${results['visible']!.nativePerSec})`, results['visible']!.nativePerSec >= 45))
-  console.log(ok('minimized: native frames pause (browser reality)', results['minimized']!.nativePerSec < 10))
+  console.log(ok('minimized without keep-alive: native frames pause (browser reality)', results['minimized']!.nativePerSec < 10))
   console.log(ok(`minimized: rAF shim keeps logic alive (adaptive clamp 12-60Hz)`, results['minimized']!.shimRafPerSec >= 12))
   console.log(ok('minimized: timers full speed (flags)', results['minimized']!.timerPerSec >= 8))
-  console.log(ok(`corner: NATIVE full speed (${results['corner']!.nativePerSec})`, results['corner']!.nativePerSec >= 45))
-  console.log(ok('corner: visibilityState visible', results['corner']!.visibility === 'visible'))
-  console.log(ok(`corner: real screenshot fast (${results['corner']!.ms}ms)`, results['corner']!.ms < 3000 && results['corner']!.bytes > 5000))
-  console.log(ok('minimized screenshot still returns (fromSurface fallback irrelevant here: native capture ok while minimized data pages)', true))
+  console.log(ok(`capture keep-alive: NATIVE full speed while minimized (${results['min+capture']!.nativePerSec})`, results['min+capture']!.nativePerSec >= 45))
+  console.log(ok('capture keep-alive: engaged', results['min+capture']!.capEngaged === true))
+  console.log(ok(`capture: real screenshot fast (${results['min+capture']!.ms}ms)`, results['min+capture']!.ms < 3000 && results['min+capture']!.bytes > 5000))
+  console.log(ok('corner: visibilityState visible', results['min+capture']!.visibility === 'visible'))
+  console.log(ok(`capture: real screenshot fast (${results['min+capture']!.ms}ms)`, results['min+capture']!.ms < 3000 && results['min+capture']!.bytes > 5000))
+  console.log(ok('minimized: visibilityState visible (frozen by capture keep-alive)', results['min+capture']!.visibility === 'visible'))
 
   const verdict =
     results['minimized']!.shimRafPerSec >= 12 &&
     results['minimized']!.nativePerSec < 10 &&
-    results['corner']!.nativePerSec >= 45 &&
-    results['corner']!.visibility === 'visible'
-  console.log(`\nstrategy: ${verdict ? 'corner collapse (native full-speed) + rAF shim fallback CONFIRMED' : 'FAILED'}`)
+    results['min+capture']!.nativePerSec >= 45 &&
+    results['min+capture']!.capEngaged === true
+  console.log(`\nstrategy: ${verdict ? 'capture keep-alive (native full-speed while minimized) + rAF shim fallback CONFIRMED' : 'FAILED'}`)
   fs.writeFileSync(path.join(TMP, 'spike-report.json'), JSON.stringify({ results, verdict }, null, 2))
   if (!verdict) process.exitCode = 1
 }

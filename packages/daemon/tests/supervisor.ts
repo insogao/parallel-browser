@@ -76,61 +76,56 @@ async function main() {
     const baseline = (v1 - v0) / 2
     console.log(`baseline native rAF/s (visible): ${baseline.toFixed(1)}`)
 
-    // 1. corner collapse → native full speed
-    const t0 = Date.now()
+    // 1. collapse (native minimize by default) → capture keep-alive engages →
+    //    NATIVE full speed while invisible
     await apiPost('/api/bg', {})
-    let cornered = false
+    const t0 = Date.now()
+    let minimized = false
     while (Date.now() - t0 < 5000) {
       await sleep(300)
       const w = await apiGet('/api/windows')
       const win = (w.windows ?? []).find((x: any) => x.windowId === windowId)
-      if (win?.cornered) { cornered = true; break }
+      if (win?.state === 'minimized') { minimized = true; break }
+    }
+    // capture keep-alive: daemon engages on the hidden target (status.captureTargetId)
+    let captured = false
+    const t1 = Date.now()
+    while (Date.now() - t1 < 20000) {
+      await sleep(500)
+      const s = await apiGet('/api/status')
+      if (s.browser?.captureTargetId === tab1.targetId) { captured = true; break }
     }
     const b0 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__native()', returnByValue: true }, sessionId)).result.value
     await sleep(4000)
     const b1 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__native()', returnByValue: true }, sessionId)).result.value
-    const cornerRate = (b1 - b0) / 4
-    const cornerRatio = cornerRate / baseline
+    const hiddenRate = (b1 - b0) / 4
+    const hiddenRatio = hiddenRate / baseline
     const health = await apiGet('/api/health')
     const t1h = (health.targets ?? []).find((t: any) => t.targetId === tab1.targetId)
-    console.log(`cornered: cornered=${cornered} native rAF/s=${cornerRate.toFixed(1)} ratio=${(cornerRatio * 100).toFixed(0)}% visibility=${t1h?.visibility}`)
+    console.log(`collapsed: minimized=${minimized} captured=${captured} native rAF/s=${hiddenRate.toFixed(1)} ratio=${(hiddenRatio * 100).toFixed(0)}% visibility=${t1h?.visibility}`)
 
-    // screenshot must be fresh and fast while cornered
+    // screenshot must be fresh and fast while minimized+captured
     const st0 = Date.now()
-    const shot = await cdp.send<{ data: string }>('Page.captureScreenshot', { format: 'jpeg', quality: 20 }, sessionId)
+    const shot = await Promise.race([
+      cdp.send<{ data: string }>('Page.captureScreenshot', { format: 'jpeg', quality: 20 }, sessionId),
+      new Promise<'HANG'>(r => setTimeout(() => r('HANG' as any), 8000)),
+    ])
     const shotMs = Date.now() - st0
-    console.log(`cornered screenshot: ${shot.data.length} bytes in ${shotMs}ms`)
+    const shotOk = typeof shot === 'object' && (shot as any).data?.length > 5000 && shotMs < 3000
+    console.log(`minimized screenshot: ${typeof shot === 'string' ? shot : `${(shot as any).data.length} bytes in ${shotMs}ms`}`)
 
-    // 2. user minimize → shim keeps logic alive + pump produces real frames
-    await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } })
-    const t2 = Date.now()
-    let captured = false
-    while (Date.now() - t2 < 15000) {
-      await sleep(500)
-      const h = await apiGet('/api/health')
-      const th = (h.targets ?? []).find((t: any) => t.targetId === tab1.targetId)
-      if (th?.visibility === 'visible' && th?.nativeRafPerSec >= 45) { captured = true; break }
-    }
-    const m0 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__native()', returnByValue: true }, sessionId)).result.value
-    await sleep(4000)
-    const m1 = (await cdp.send<{ result: { value: number } }>('Runtime.evaluate', { expression: 'window.__native()', returnByValue: true }, sessionId)).result.value
-    const nativeRate = (m1 - m0) / 4
-    const health2 = await apiGet('/api/health')
-    const th2 = (health2.targets ?? []).find((t: any) => t.targetId === tab1.targetId)
-    console.log(`minimized: captureEngaged=${captured} NATIVE rAF/s=${nativeRate.toFixed(1)} visibility=${th2?.visibility}`)
-
-    // 3. restore
+    // 2. restore: native un-minimize (same as dock-click)
     await apiPost('/api/restore', {})
     await sleep(800)
     const w3 = await apiGet('/api/windows')
     const win3 = (w3.windows ?? []).find((x: any) => x.windowId === windowId)
-    const restored = win3 != null && !win3.cornered
+    const restored = win3 != null && win3.state === 'normal'
     console.log(`restore: ${restored}`)
 
-    const pass = cornered && cornerRatio >= 0.9 && shotMs < 3000 && captured && nativeRate >= 45 && restored
-    // known cosmetic gap: DOM visibilityState may still read 'hidden' while
-    // captured (rAF + screenshots unaffected); the in-page freeze polish is pending
-    console.log(`\n${pass ? 'PASS' : 'FAIL'} supervisor e2e (corner collapse)`)
+    const pass = minimized && captured && hiddenRatio >= 0.75 && shotOk && restored
+    // note: DOM visibilityState may read 'hidden' while captured — known cosmetic
+    // gap; native frames + real screenshots are the actual contract
+    console.log(`\n${pass ? 'PASS' : 'FAIL'} supervisor e2e (minimize + capture keep-alive)`)
     process.exitCode = pass ? 0 : 1
   } catch (err) {
     console.error('\nSUPERVISOR TEST ERROR:', err instanceof Error ? err.stack : err)

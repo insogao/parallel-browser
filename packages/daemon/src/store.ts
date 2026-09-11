@@ -26,8 +26,10 @@ export interface Settings {
   launchMode: 'background' | 'visible'
   /**
    * How "collapse to background" behaves:
+   * 'minimize' (default) — native minimize: fully invisible, dock-click
+   *   restores natively, capture keep-alive keeps pages at native 60fps
    * 'corner'   — window parks at the offscreen corner (2px sliver, full speed)
-   * 'minimize' — native minimize (invisible; page logic runs via the rAF shim)
+   *   fallback for when capture keep-alive is unavailable
    */
   collapseMode: 'corner' | 'minimize'
   /** cached display work area {availLeft, availTop, availHeight} for corner math */
@@ -44,7 +46,7 @@ export const defaultSettings: Settings = {
   soloExtensions: false,
   browser: 'auto',
   launchMode: 'background',
-  collapseMode: 'corner',
+  collapseMode: 'minimize',
   workArea: { al: 0, at: 25, ah: 922 },
 }
 

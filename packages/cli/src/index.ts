@@ -227,7 +227,7 @@ async function main() {
       const info = readDaemonInfo(); if (!info) throw new Error('daemon not running')
       const w = await api(info, '/api/windows', {}, 5000)
       for (const win of w.windows ?? []) {
-        console.log(`window ${win.windowId}: ${win.state}${win.offscreen ? ' (pseudo-minimized, offscreen)' : ''}`)
+        console.log(`window ${win.windowId}: ${win.state}${win.cornered ? ' (cornered, 2px sliver)' : ''}`)
       }
       if (!w.windows?.length) console.log('no windows')
       return

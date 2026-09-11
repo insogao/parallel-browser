@@ -16,7 +16,9 @@ export const paths = {
   settingsFile: path.join(root, 'settings.json'),
   extensionsFile: path.join(root, 'extensions.json'),
   daemonFile: path.join(root, 'daemon.json'),
-  browserCache: path.join(root, 'browsers'),
+  // shared across spaces AND test runs: CfT downloads are ~150MB, never per-test
+  browserCache: process.env.BACKLIGHT_BROWSER_CACHE
+    ?? path.join(os.homedir(), 'Library', 'Caches', 'Backlight', 'browsers'),
   spaceDir(name: string) { return path.join(paths.spaces, sanitizeName(name)) },
 }
 
