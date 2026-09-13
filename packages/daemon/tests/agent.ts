@@ -78,7 +78,10 @@ async function main() {
     await waitApi(10_000)
     // settings proxyPort must equal PORT for the proxy under test
     await apiPost('/api/settings', { proxyPort: PORT })
-    const launched = await apiPost('/api/launch', { url: PAGE })
+    // Visible window: the proxy is under test here, and Page.captureScreenshot
+    // needs a compositor frame. Cornered background windows produce no frames,
+    // so background capture is covered by spike's capture keep-alive scenario.
+    const launched = await apiPost('/api/launch', { url: PAGE, keepVisible: true })
     if (!launched.ok) throw new Error(`launch failed: ${JSON.stringify(launched)}`)
 
     // ---- the AI tool connects THROUGH THE PROXY ----
@@ -89,8 +92,14 @@ async function main() {
     console.log(`proxy rewrite ok: ${meta.webSocketDebuggerUrl}`)
     const cdp = await Cdp.connect(meta.webSocketDebuggerUrl)
 
-    const { targetInfos } = await send<{ targetInfos: any[] }>(cdp, 'Target.getTargets')
-    const page = targetInfos.find(t => t.type === 'page' && t.title === 'BL Agent')!
+    let page: any
+    const pageDeadline = Date.now() + 10_000
+    while (!page && Date.now() < pageDeadline) {
+      const { targetInfos } = await send<{ targetInfos: any[] }>(cdp, 'Target.getTargets')
+      page = targetInfos.find((t: any) => t.type === 'page' && (t.title === 'BL Agent' || t.url.startsWith('data:text/html')))
+      if (!page) await sleep(200)
+    }
+    if (!page) throw new Error('agent page target did not appear')
     const sessionId = await bounded(cdp.attach(page.targetId), 'Target.attachToTarget')
     await send(cdp, 'Page.enable', {}, sessionId)
 
