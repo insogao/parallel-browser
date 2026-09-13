@@ -54,6 +54,9 @@ export class FramePumpSupervisor {
   private pumpCooldown = new Map<string, number>()
   private ticking = false
   humanMode = false
+  /** Last user intent: every collapse/restore starts a generation; slower
+   * in-flight work checks it before each delayed step so a newer intent wins. */
+  private controlGeneration = 0
   private collapsed = new Map<number, { left: number; top: number; wasMinimized: boolean }>()
   private getContext: () => { cdp: Cdp } | null
   private getHealth: () => TargetHealth[]
@@ -156,19 +159,36 @@ export class FramePumpSupervisor {
     return [...this.pumps.keys()]
   }
 
+  /** Start a new user-intent generation. Older in-flight collapses see their
+   * generation go stale and stop before the next delayed step. */
+  beginControl(): number {
+    return ++this.controlGeneration
+  }
+
+  isControlCurrent(gen: number): boolean {
+    return gen === this.controlGeneration
+  }
+
   /** Collapse: 'minimize' mode (default) = native minimize (dock-click restores
    * natively; capture keep-alive keeps pages fast). 'corner' = 2px sliver. */
-  async collapseAll(appHidden = false): Promise<number> {
+  async collapseAll(appHidden = false, gen: number = this.beginControl()): Promise<number> {
     this.humanMode = false
     const ctx = this.getContext()
     if (!ctx) return 0
     let n = 0
     const mode = this.settings().collapseMode
     for (const windowId of await this.collectWindowIds()) {
+      if (!this.isControlCurrent(gen)) break
       try {
-        const ok = mode === 'minimize' ? await this.minimizeWindow(ctx.cdp, windowId, appHidden) : await this.cornerWindow(ctx.cdp, windowId)
+        const ok = mode === 'minimize'
+          ? await this.minimizeWindow(ctx.cdp, windowId, appHidden, gen)
+          : await this.cornerWindow(ctx.cdp, windowId)
         if (ok) n++
       } catch { /* gone */ }
+    }
+    if (!this.isControlCurrent(gen)) {
+      debug('collapse superseded by a newer control request')
+      return 0
     }
     log(`collapsed ${n} window(s) (${mode}); pages keep running at full speed`)
     return n
@@ -178,25 +198,27 @@ export class FramePumpSupervisor {
    * Native minimize, verified. macOS quirks measured on Chrome for Testing 153:
    * - a minimize request issued while the window leaves maximized/fullscreen is
    *   dropped, so settle to normal and wait for that state first;
-   * - when the app is hidden (`open -g -j` background launches), a single
-   *   request updates the reported window state while AppKit never really
-   *   miniaturizes: the active tab keeps `document.hidden === false`. The full
-   *   normal -> minimized cycle has to run twice (measured: one cycle fails,
-   *   two succeed). Pass `settleRepeat` for hidden apps — the repeat is
-   *   invisible because the app is hidden anyway.
-   * Returns false if the window never reaches the minimized state.
+   * - when the app is hidden (`open -g -j` background launches), the reported
+   *   window state can claim "minimized" while AppKit never really miniaturized
+   *   (the active tab keeps `document.hidden === false`). A full
+   *   normal -> minimized cycle repairs it, and the cycle has to run twice
+   *   (measured: one cycle fails, two succeed). `settleRepeat` (hidden apps)
+   *   therefore forces the recovery cycle even when the initial report is
+   *   already "minimized" — a repeated `/api/bg` must still repair it.
+   * `gen` invalidates delayed steps when a newer control request arrives.
+   * Returns false if the window is gone, superseded, or never minimized.
    */
-  async minimizeWindow(cdp: Cdp, windowId: number, settleRepeat = false): Promise<boolean> {
+  async minimizeWindow(cdp: Cdp, windowId: number, settleRepeat = false, gen?: number): Promise<boolean> {
+    const current = () => gen === undefined || this.isControlCurrent(gen)
     const cycles = settleRepeat ? 2 : 1
     for (let cycle = 0; cycle < cycles; cycle++) {
-      if (cycle > 0) {
-        await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } }).catch(() => {})
-        await sleep(300)
-      }
+      if (!current()) return false
       const initial = await this.windowBounds(cdp, windowId)
       if (initial === null) return false
-      if (initial.windowState === 'minimized') return true
-      if (initial.windowState === 'maximized' || initial.windowState === 'fullscreen') {
+      if (!settleRepeat && initial.windowState === 'minimized') return true
+      // Settling to normal is required both to leave maximized/fullscreen and
+      // to repair a falsely reported minimized state on a hidden app.
+      if (initial.windowState !== 'normal') {
         await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } }).catch(() => {})
         for (let i = 0; i < 20; i++) {
           const b = await this.windowBounds(cdp, windowId)
@@ -206,6 +228,7 @@ export class FramePumpSupervisor {
         }
         await sleep(300)
       }
+      if (!current()) return false
       await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } }).catch(() => {})
       for (let i = 0; i < 20; i++) {
         const b = await this.windowBounds(cdp, windowId)
@@ -213,6 +236,7 @@ export class FramePumpSupervisor {
         if (b.windowState === 'minimized') break
         await sleep(50)
       }
+      if (!current()) return false
       if (cycle + 1 < cycles) await sleep(500)
     }
     const final = await this.windowBounds(cdp, windowId)
@@ -254,6 +278,7 @@ export class FramePumpSupervisor {
   /** Bring collapsed windows back: 'minimize' mode un-minimizes everything
    * (native dock-click semantics); 'corner' mode restores cornered positions. */
   async restoreAll(maximize = false): Promise<number> {
+    this.beginControl() // newer intent: any in-flight collapse must stop
     const ctx = this.getContext()
     if (!ctx) return 0
     this.humanMode = true

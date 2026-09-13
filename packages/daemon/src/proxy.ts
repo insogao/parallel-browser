@@ -13,7 +13,7 @@ import { listChromeProfiles, importProfile } from './import.ts'
 import { ensureChromiumForExtensions } from './browser.ts'
 import { brandBundle } from './brand.ts'
 import { paths } from './paths.ts'
-import { activateBrowser, hideBrowser, browserAppState } from './native.ts'
+import { activateBrowser } from './native.ts'
 import type { FramePumpSupervisor } from './windows.ts'
 import { TapState, tapFrame } from './tap.ts'
 import { log, debug } from './log.ts'
@@ -29,6 +29,9 @@ export interface ServerDeps {
   version: string
   startedAt: number
   pulse: (targetId: string) => void
+  /** native app helpers, injectable so unit tests never touch the OS */
+  appState: (pid: number) => Promise<{ active: boolean; hidden: boolean }>
+  hideBrowser: (pid: number) => Promise<void>
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
@@ -231,6 +234,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return
     }
     case 'POST /api/launch': {
+      deps.supervisor.beginControl() // a new launch outranks any settling collapse
       deps.supervisor.humanMode = payload.focus === true || payload.keepVisible === true || payload.background === false
       await deps.capture.setPaused(deps.supervisor.humanMode)
       deps.supervisor.start()
@@ -259,20 +263,26 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     }
     case 'POST /api/bg': {
       await deps.capture.setPaused(false)
+      // Last user intent wins: this generation is superseded the moment a
+      // newer show/restore/launch arrives. Checked before every delayed step
+      // and again before hiding, so an old bg can never steal the window back.
+      const gen = deps.supervisor.beginControl()
       // A hidden app needs the normal -> minimized cycle repeated for the
       // miniaturize (and renderer visibility) to actually apply; the repeat is
       // invisible there. A visible app minimizes on the first cycle.
       let appHidden = false
       if (deps.manager.current) {
-        try { appHidden = (await browserAppState(deps.manager.current.pid)).hidden } catch { /* unknown: single cycle */ }
+        try { appHidden = (await deps.appState(deps.manager.current.pid)).hidden } catch { /* unknown: single cycle */ }
       }
-      const n = deps.manager.running ? await deps.supervisor.collapseAll(appHidden) : 0
-      if (deps.manager.current) await hideBrowser(deps.manager.current.pid)
-      json(res, 200, { ok: true, collapsed: n })
+      const n = deps.manager.running ? await deps.supervisor.collapseAll(appHidden, gen) : 0
+      const superseded = !deps.supervisor.isControlCurrent(gen)
+      if (deps.manager.current && !superseded) await deps.hideBrowser(deps.manager.current.pid)
+      json(res, 200, { ok: true, collapsed: n, superseded })
       return
     }
     case 'POST /api/show':
     case 'POST /api/restore': {
+      deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
       deps.supervisor.humanMode = true
       await deps.capture.setPaused(true)
       const n = deps.manager.running ? await deps.supervisor.restoreAll(payload.maximize === true) : 0
@@ -320,6 +330,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return
     }
     case 'POST /api/extensions/dev': {
+      deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
       const name = String(payload.name ?? '')
       deps.extensionDev.entry(name)
       if (!deps.manager.running) {
@@ -350,6 +361,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       if (!cur) return json(res, 409, { error: 'browser not running' })
       const target = (await deps.manager.listTabs()).find(t => t.targetId === payload.targetId)
       if (!target) return json(res, 404, { error: 'target is no longer available; refresh the target list' })
+      deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
       deps.supervisor.humanMode = true
       await deps.capture.setPaused(true)
       // Go through our loopback proxy: Chromium rejects the frontend's
