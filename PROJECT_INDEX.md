@@ -18,16 +18,18 @@
 - 人工接手：show 暂停 capture 的窗口操作，支持最大化；后台打开新页不移动当前人工窗口；capture 增加取消和超时保护。人工接手与 capture setup 竞态时，controller 不再停留在前台；用户竞态中选择的新标签保持不变（`tests/capture-unit.ts`）。
 - 扩展：原生 sidePanel 调试、指定扩展热重载、面板与网页通信、持久化示例；DevTools 通过 CDP 代理连接，修复初始消息丢失。侧栏显式绑定请求网页的 windowId，双窗口同扩展 3/3 无串窗（`tests/extension-dev-unit.ts` + `tests/extensions.ts`）。
 - 观测：修复多条 rAF 调度链；区分原生帧率与补偿回调，不伪造 document.hidden。
-- 最小化：查清“CDP 报告 minimized 但 AppKit 未真正最小化”的根因；应用隐藏时执行两次 normal→minimized 循环，`document.hidden === true`、三页持续轮询（`tests/usability.ts` 连续通过，证据含 target/windowId/bounds/native 状态）。
+- 最小化：查清“CDP 报告 minimized 但 AppKit 未真正最小化”的根因；应用隐藏时执行两次 normal→minimized 循环，`document.hidden === true`、三页持续轮询（`tests/usability.ts` 连续通过，证据含 target/windowId/bounds/native 状态）。假性 minimized（隐藏应用上报告可为假）在 `settleRepeat` 下强制恢复循环，重复 `/api/bg` 可修复（`tests/windows-unit.ts`）。
+- 控制代际（last-intent-wins）：`collapseAll`/`restoreAll` 开启代际，`/api/bg` 在进入路由时（任何 await 前）就分配代际，延迟最小化步骤会校验；show/restore/launch/ext-dev/inspect 会作废在途 bg。native hide/unhide/activate 由每服务器队列按到达顺序串行化，临界区内重查代际：bg 先进 hide 则后到 show 的 unhide 排后执行，show 先进则旧 bg 跳过 hide。`tests/proxy-race-unit.ts` 3 个 API 级竞态用例覆盖 settle 中 show、setPaused(false) 挂起中 show、hide 在途时 show。
+- 原生可见性：新增 `app-control unhide`（不抢焦点）；AppKit hide/unhide 异步生效，改为发出请求后用新进程校验状态并有界重试，show(activate:false) 与 bg 连续切换不再出现状态漂移。
 - CDP：`Cdp.send` 先注册 waiter 再发送，修复快速响应被丢弃导致的永久挂起；`tests/cdp-unit.ts` 3 个确定性测试。
-- **验证状态（2026-09-13 18:50，品牌化 Backlight）：`pnpm --filter @backlight/daemon test` 通过 —— 单元 20/20 + brand 11 项 + spike/supervisor/extensions/agent/background/usability 全部 PASS；6 条 `[Backlight acceptance]` 路径均为 `.../Backlight.app/...`，sha256 一致，无临时进程遗留。**
+- **验证状态（2026-09-13 19:47 CST，品牌化 Backlight）：`pnpm --filter @backlight/daemon test` 通过 —— 单元 25/25 + brand 11 项 + spike/supervisor/extensions/agent/background/usability 全部 PASS（32 条 PASS，无 FAIL）；6 条 `[Backlight acceptance]` 路径均为 `.../Backlight.app/...`，sha256 一致，无临时进程/目录遗留。**
 - 本轮修复已全部提交（自 `6a4b097` capture 修复起，至本文档更新）。日常 daemon 不会自动加载源码，需用户下次安全重启后生效；不要在用户使用期间擅自终止其浏览器。
 
 ## 测试规范
 
 入口：`pnpm --filter @backlight/daemon test`，类型检查：`pnpm -r --if-present run check`。
 
-单元测试为 `tests/*-unit.ts`（capture、windows、extension-dev、cdp、proxy、targets 等）加 `tests/brand.ts`。集成入口 `tests/agent.ts` 的每次 CDP 调用有 15s 上限，回归失败快速报错而非无限挂起；生产代码不设短超时。
+单元测试为 `tests/*-unit.ts`（capture、windows、extension-dev、cdp、proxy、proxy-race、targets、raf 等）加 `tests/brand.ts`。集成入口 `tests/agent.ts` 的每次 CDP 调用有 15s 上限，回归失败快速报错而非无限挂起；生产代码不设短超时。
 
 所有会启动浏览器的测试（含 probe）使用 `packages/daemon/tests/backlight-fixture.ts`：
 
@@ -58,7 +60,7 @@ node packages/cli/bin/backlight.js inspect <targetId>
 - windows.ts、capture.ts、inject.ts：窗口、捕获保活、健康状态。
 - extension-dev.ts、extensions.ts：原生侧栏与热重载。
 - proxy.ts、cdp.ts：API、Dashboard、DevTools 代理。
-- packages/daemon/tests/：单元与 Backlight 集成验收（capture-unit、windows-unit、extension-dev-unit、cdp-unit 覆盖本轮修复）。
+- packages/daemon/tests/：单元与 Backlight 集成验收（capture-unit、windows-unit、extension-dev-unit、cdp-unit、proxy-race-unit 覆盖本轮修复）。
 - docs/development/2026-09-13.md：本轮开发记录。
 
 ## 能力边界与未完成项
