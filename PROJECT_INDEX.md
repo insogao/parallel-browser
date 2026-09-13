@@ -21,7 +21,7 @@
 - 最小化：查清“CDP 报告 minimized 但 AppKit 未真正最小化”的根因；应用隐藏时执行两次 normal→minimized 循环，`document.hidden === true`、三页持续轮询（`tests/usability.ts` 连续通过，证据含 target/windowId/bounds/native 状态）。
 - CDP：`Cdp.send` 先注册 waiter 再发送，修复快速响应被丢弃导致的永久挂起；`tests/cdp-unit.ts` 3 个确定性测试。
 - **验证状态（2026-09-13 18:50，品牌化 Backlight）：`pnpm --filter @backlight/daemon test` 通过 —— 单元 20/20 + brand 11 项 + spike/supervisor/extensions/agent/background/usability 全部 PASS；6 条 `[Backlight acceptance]` 路径均为 `.../Backlight.app/...`，sha256 一致，无临时进程遗留。**
-- 本轮修复已全部提交（HEAD `f5e9651`）。日常 daemon 不会自动加载源码，需用户下次安全重启后生效；不要在用户使用期间擅自终止其浏览器。
+- 本轮修复已全部提交（自 `6a4b097` capture 修复起，至本文档更新）。日常 daemon 不会自动加载源码，需用户下次安全重启后生效；不要在用户使用期间擅自终止其浏览器。
 
 ## 测试规范
 
