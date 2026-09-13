@@ -4,6 +4,7 @@ import type { BrowserManager } from './browser.ts'
 import type { ExtensionManager, ExtEntry } from './extensions.ts'
 import type { ActivityBus } from './activity.ts'
 import type { Cdp } from './cdp.ts'
+import { debug } from './log.ts'
 
 interface RuntimeExtension { id: string; name: string; path: string; version: string; enabled: boolean }
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
@@ -98,48 +99,72 @@ export class ExtensionDev {
     }
     const ext = await this.load(name)
     const cdp = this.cdp()
+    // Side panels are per-window. Resolve the requested page's window first and
+    // use that id for every sidePanel call: the temporary gesture bridge may be
+    // created in any window if focus moves during setup, so its own window is
+    // never allowed to choose the panel's window.
+    const resolved = await cdp.send<{ windowId?: number }>('Browser.getWindowForTarget', { targetId })
+    if (resolved.windowId == null) throw new Error('cannot resolve the window of the selected page')
+    const windowId = resolved.windowId
+    debug(`openPanel ${name}: page ${targetId.slice(0, 8)} window=${windowId}`)
     await cdp.send('Target.activateTarget', { targetId })
     const pageSession = await cdp.attach(targetId)
     let bridge: string | undefined
     let extensionSession: string | undefined
     try {
-      // Activating a page within the managed app selects the window whose active
-      // tab the extension APIs will address. No website content is reloaded.
       await cdp.send('Page.bringToFront', {}, pageSession)
       // Runtime's userGesture flag is honored by extension documents, but not
-      // service workers. Use a short-lived background extension document so
-      // this also supports side-panel extensions without a background worker.
+      // service workers. Use a short-lived background extension document as the
+      // gesture source; it only provides the gesture. No website content is
+      // reloaded.
       const created = await cdp.send<{ targetId: string }>('Target.createTarget', { url: `chrome-extension://${ext.id}/${panelPath}`, background: true })
       bridge = created.targetId
       extensionSession = await cdp.attach(created.targetId)
-      let tab: any
+      let ready = false
       for (let i = 0; i < 40; i++) {
-        tab = await this.evaluate(cdp, extensionSession, 'chrome.tabs.getCurrent()').catch(() => null)
-        if (tab?.windowId != null) break
+        ready = await this.evaluate(cdp, extensionSession, 'typeof chrome !== "undefined" && !!chrome.runtime?.id').catch(() => false) === true
+        if (ready) break
         await sleep(100)
       }
-      if (tab?.windowId == null) throw new Error('extension page failed to load')
-      const options = { windowId: tab.windowId }
-      // Reopen only this window's panel so its new CDP target can be identified
-      // unambiguously even when another window has the same extension open.
+      if (!ready) throw new Error('extension page failed to load')
+      debug(`openPanel ${name}: bridge ${created.targetId.slice(0, 8)} ready`)
+      const options = { windowId }
+      // Closing first keeps stale panel content from a previous extension build
+      // out of the debugging target. A hidden panel may keep its WebContents, so
+      // open() can legitimately reuse the same target: identify it by ownership,
+      // never by "is new".
       await this.evaluate(cdp, extensionSession, `chrome.sidePanel.close(${JSON.stringify(options)}).catch(() => {})`)
-      const before = new Set((await cdp.send('Target.getTargets')).targetInfos.map((t: any) => t.targetId))
       await this.evaluate(cdp, extensionSession, `chrome.sidePanel.open(${JSON.stringify(options)})`, true)
       if (bridge) { await cdp.send('Target.closeTarget', { targetId: bridge }); bridge = undefined }
       for (let i = 0; i < 50; i++) {
-        const candidates = (await cdp.send('Target.getTargets')).targetInfos.filter((t: any) => t.type === 'page' && !before.has(t.targetId) && t.url.startsWith(`chrome-extension://${ext.id}/`))
+        const candidates = (await cdp.send('Target.getTargets')).targetInfos.filter((t: any) => t.type === 'page' && t.url.startsWith(`chrome-extension://${ext.id}/`))
+        let owned: string | undefined
         for (const candidate of candidates) {
           const sid = await cdp.attach(candidate.targetId)
           try {
             // A native side panel is an extension page with no tabs.getCurrent().
-            const native = await this.evaluate(cdp, sid, `(async () => {
-              if (await chrome.tabs.getCurrent()) return false;
+            // It must also report the requested window as its host: a panel that
+            // landed in another window is never returned.
+            const owner = await this.evaluate(cdp, sid, `(async () => {
+              if (await chrome.tabs.getCurrent()) return null;
               const contexts = await chrome.runtime.getContexts({contextTypes:['SIDE_PANEL'],documentUrls:[location.href]});
-              return contexts.length > 0;
+              if (!contexts.length) return null;
+              const win = await chrome.windows.getCurrent();
+              return win?.id ?? null;
             })()`)
-            if (native) return { extensionId: ext.id, targetId, panelTargetId: candidate.targetId }
+            if (owner === windowId) {
+              owned = candidate.targetId
+              const visible = await this.evaluate(cdp, sid, 'document.visibilityState === "visible"').catch(() => false) === true
+              if (visible) return { extensionId: ext.id, targetId, panelTargetId: candidate.targetId }
+            }
           } catch { /* still loading */ }
           finally { await cdp.send('Target.detachFromTarget', { sessionId: sid }).catch(() => {}) }
+        }
+        // A hidden-but-owned panel is still the right target (e.g. the window is
+        // occluded); prefer a visible one while polling but do not fail on it.
+        if (owned && i >= 5) {
+          debug(`openPanel ${name}: returning hidden panel ${owned.slice(0, 8)} for window ${windowId}`)
+          return { extensionId: ext.id, targetId, panelTargetId: owned }
         }
         await sleep(100)
       }

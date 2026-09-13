@@ -167,6 +167,41 @@ async function main() {
     const stored = await conn.cdp.send('Runtime.evaluate', { expression: 'chrome.storage.local.get("draft")', returnByValue: true, awaitPromise: true }, againSession)
     if (stored.result.value?.draft !== 'persist') throw new Error('extension storage lost during reload')
     console.log('PASS extension storage survives reload')
+    await conn.cdp.send('Target.detachFromTarget', { sessionId: againSession }).catch(() => {})
+
+    // Two windows, same extension: a side panel request for window A must open
+    // and return A's panel even when focus was deliberately moved to window B.
+    const extId = devAgain.extensionId as string
+    const winA = (await conn.cdp.send<{ windowId: number }>('Browser.getWindowForTarget', { targetId: siteTarget.targetId })).windowId
+    const second = await conn.cdp.send<{ targetId: string }>('Target.createTarget', { url: `http://127.0.0.1:${SITE_PORT}/second-window`, newWindow: true })
+    await sleep(1500)
+    const winB = (await conn.cdp.send<{ windowId: number }>('Browser.getWindowForTarget', { targetId: second.targetId })).windowId
+    if (winA === winB) throw new Error('second window was not created')
+    const secondSession = await conn.cdp.attach(second.targetId)
+    const panelHost = async (targetId: string): Promise<number | null> => {
+      const sid = await conn.cdp.attach(targetId)
+      try {
+        const r = await conn.cdp.send<{ result: { value: number | null } }>('Runtime.evaluate', {
+          expression: '(async () => { const w = await chrome.windows.getCurrent(); return w?.id ?? null })()',
+          awaitPromise: true, returnByValue: true,
+        }, sid)
+        return r.result.value ?? null
+      } finally { await conn.cdp.send('Target.detachFromTarget', { sessionId: sid }).catch(() => {}) }
+    }
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await conn.cdp.send('Page.bringToFront', {}, secondSession)
+      await sleep(250)
+      const openA = await post('/api/extensions/dev', { name: added.extension.name, targetId: siteTarget.targetId, activate: false })
+      if (!openA.ok || !openA.panelTargetId) throw new Error(`two-window side panel failed: ${JSON.stringify(openA)}`)
+      const owner = await panelHost(openA.panelTargetId)
+      if (owner !== winA) throw new Error(`attempt ${attempt}: panel opened in window ${owner}, expected ${winA}`)
+      const strays = (await conn.cdp.send('Target.getTargets')).targetInfos
+        .filter((t: any) => t.type === 'page' && t.targetId !== openA.panelTargetId && t.url.startsWith(`chrome-extension://${extId}/panel`))
+      for (const stray of strays) {
+        if (await panelHost(stray.targetId) === winB) throw new Error(`attempt ${attempt}: foreign panel opened in window B`)
+      }
+    }
+    console.log('PASS two windows, same extension: panel stays bound to the requested window (3/3)')
     pass = v2 === '1.0.1'
     console.log(`\n${pass ? 'PASS' : 'FAIL'} extension dev loop e2e`)
     process.exitCode = pass ? 0 : 1
