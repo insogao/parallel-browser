@@ -11,6 +11,7 @@ function fixture(t: any) {
   const calls: { method: string; params: any; session?: string }[] = []
   let bounds = { windowState: 'minimized', left: 50, top: 60, width: 1200 }
   let hook: (method: string, params: any) => any = () => undefined
+  let controllerVisibility: 'visible' | 'hidden' = 'visible'
   const fake = {
     closed: false,
     attach: async (id: string) => `session-${id}`,
@@ -25,6 +26,9 @@ function fixture(t: any) {
       if (method === 'Browser.setWindowBounds') { Object.assign(bounds, params.bounds); return {} }
       if (method === 'Runtime.evaluate') {
         if (params.expression.includes('screen.avail')) return { result: { value: '{"al":0,"at":25,"ah":900}' } }
+        if (params.expression === 'document.visibilityState' && session === 'session-controller') {
+          return { result: { value: controllerVisibility } }
+        }
         if (session === 'session-page') return { result: { value: vm.runInNewContext(params.expression, page) } }
         return { result: { value: params.expression.includes('startCapture') ? 'ok' : true } }
       }
@@ -44,7 +48,12 @@ function fixture(t: any) {
     assert.ok(done, 'operation must finish within bounded time')
     await promise
   }
-  return { capture, calls, page, bounds, settle, setHook: (h: typeof hook) => { hook = h }, restart: () => { cdp = { ...fake } as unknown as Cdp } }
+  return {
+    capture, calls, page, bounds, settle,
+    setHook: (h: typeof hook) => { hook = h },
+    setControllerVisibility: (v: 'visible' | 'hidden') => { controllerVisibility = v },
+    restart: () => { cdp = { ...fake } as unknown as Cdp },
+  }
 }
 
 test('hidden DOM can have a successful capture; title restored and visibility remains honest', async t => {
@@ -76,6 +85,55 @@ for (const stage of ['Browser.getWindowForTarget', 'Target.activateTarget', 'Inp
     assert.equal(f.calls.filter(c => c.method === 'Input.dispatchMouseEvent').length, stage === 'Input.dispatchMouseEvent' ? 1 : 0)
   })
 }
+
+test('takeover after controller activation returns the human to the captured page', async t => {
+  const f = fixture(t)
+  let paused: Promise<void> | undefined
+  f.setHook(method => {
+    if (method === 'Input.dispatchMouseEvent' && !paused) {
+      paused = f.capture.setPaused(true)
+      Object.assign(f.bounds, { windowState: 'normal', left: 200, top: 250 })
+    }
+  })
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.ok(paused)
+  await f.settle(paused)
+  assert.equal(f.bounds.windowState, 'normal', 'takeover window is not re-minimized')
+  assert.equal(f.bounds.left, 200, 'takeover window is not moved')
+  assert.equal(f.page.document.title, 'Original')
+  const activations = f.calls.filter(c => c.method === 'Target.activateTarget')
+  assert.equal(activations.at(-1)?.params.targetId, 'page', 'captured page is active again after takeover')
+})
+
+test('takeover keeps the tab the human chose during the race', async t => {
+  const f = fixture(t)
+  f.setControllerVisibility('hidden')
+  let paused: Promise<void> | undefined
+  f.setHook(method => {
+    if (method === 'Input.dispatchMouseEvent' && !paused) paused = f.capture.setPaused(true)
+  })
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.ok(paused)
+  await f.settle(paused)
+  const activations = f.calls.filter(c => c.method === 'Target.activateTarget')
+  assert.equal(activations.length, 1, 'no activation once the human picked another tab')
+})
+
+test('takeover completing after capture started still returns the page', async t => {
+  const f = fixture(t)
+  let paused: Promise<void> | undefined
+  f.setHook((method, params) => {
+    if (method === 'Runtime.evaluate' && params.expression.includes('__blOrigTitle !== undefined') && !paused) {
+      paused = f.capture.setPaused(true)
+    }
+  })
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.ok(paused)
+  await f.settle(paused)
+  assert.equal(f.page.document.title, 'Original')
+  const activations = f.calls.filter(c => c.method === 'Target.activateTarget')
+  assert.equal(activations.at(-1)?.params.targetId, 'page', 'captured page is active again after takeover')
+})
 
 test('setup error restores title and minimized window position', async t => {
   const f = fixture(t)

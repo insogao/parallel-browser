@@ -220,8 +220,15 @@ export class CaptureKeepAlive {
     } finally {
       if (!started && controllerSession) await this.stopStream(cdp, controllerSession)
       if (titleTouched && targetSession) await this.restoreTitle(cdp, targetSession)
-      if (switched && allowed()) {
-        await this.send(cdp, 'Target.activateTarget', { targetId: target.targetId }).catch(() => {})
+      if (switched) {
+        if (allowed()) {
+          await this.send(cdp, 'Target.activateTarget', { targetId: target.targetId }).catch(() => {})
+        } else {
+          // Takeover/cancel: never leave the human in front of the controller.
+          // Undo our own switch only if the controller is still the active tab;
+          // a tab the human selected during the race wins.
+          await this.restorePageIfControllerActive(cdp, target.targetId, controllerSession)
+        }
       }
       if (parked && windowId !== undefined && current()) {
         // Only undo our own offscreen move. A human may have restored/moved
@@ -239,6 +246,41 @@ export class CaptureKeepAlive {
           }
         }
       }
+    }
+  }
+
+  /**
+   * Takeover-safe cleanup: activate the page we switched away from, but only
+   * while our controller is still what the human would see. If the controller
+   * is hidden because another tab was selected, that choice is preserved.
+   * Every probe is bounded and failures (closed target, dead connection) are
+   * swallowed so takeover never blocks on cleanup.
+   */
+  private async restorePageIfControllerActive(cdp: Cdp, targetId: string, controllerSession: string | null) {
+    if (!controllerSession) return
+    if (!(await this.controllerIsActive(cdp, controllerSession))) return
+    await this.send(cdp, 'Target.activateTarget', { targetId }).catch(() => {})
+  }
+
+  private async controllerIsActive(cdp: Cdp, session: string): Promise<boolean> {
+    try {
+      const r = await this.send<{ result?: { value?: unknown } }>(cdp, 'Runtime.evaluate', {
+        expression: 'document.visibilityState',
+        returnByValue: true,
+      }, session)
+      if (r?.result?.value === 'visible') return true
+      if (r?.result?.value !== 'hidden') return false
+      // Hidden: the human may have selected another tab (keep it), or the
+      // window may be minimized (nothing is visible; still put the page back
+      // so restoring the window later shows the website, not our controller).
+      const controllerTargetId = this.controller?.targetId
+      if (!controllerTargetId) return false
+      const win = await this.send<{ windowId?: number }>(cdp, 'Browser.getWindowForTarget', { targetId: controllerTargetId }).catch(() => null)
+      if (win?.windowId === undefined) return false
+      const bounds = await this.send<{ bounds?: { windowState?: string } }>(cdp, 'Browser.getWindowBounds', { windowId: win.windowId }).catch(() => null)
+      return bounds?.bounds?.windowState === 'minimized'
+    } catch {
+      return false
     }
   }
 
