@@ -24,11 +24,25 @@ func apiGet(_ path: String, completion: @escaping (Data?) -> Void) {
   URLSession.shared.dataTask(with: url) { data, _, _ in completion(data) }.resume()
 }
 
-func apiPost(_ path: String) {
+func apiPost(_ path: String, body: String = "{}") {
   guard let url = URL(string: "http://127.0.0.1:\(daemonPort())\(path)") else { return }
   var req = URLRequest(url: url)
   req.httpMethod = "POST"
+  req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+  req.httpBody = body.data(using: .utf8)
   URLSession.shared.dataTask(with: req) { _, _, _ in }.resume()
+}
+
+func isManagedApp(_ app: NSRunningApplication, browser: [String: Any]) -> Bool {
+  if let pid = browser["pid"] as? Int, Int(app.processIdentifier) == pid { return true }
+  // A Dock launch can select a second instance of our branded .app. Route
+  // that activation to the managed profile, never to/from the user's Chrome.
+  guard app.bundleIdentifier == "dev.backlight.browser",
+        let binary = browser["binary"] as? String,
+        let range = binary.range(of: ".app/"),
+        let bundlePath = app.bundleURL?.standardizedFileURL.path else { return false }
+  let managedPath = String(binary[..<range.lowerBound]) + ".app"
+  return URL(fileURLWithPath: managedPath).standardizedFileURL.path == bundlePath
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -40,6 +54,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   var iconTimer: Timer?
   var blinkOn = false
   var browserRunning = false
+  var checkingWindow = false
+  var restoringUntil = Date.distantPast
 
   let idleIcon = NSImage(systemSymbolName: "circle.dashed", accessibilityDescription: "Backlight idle")
   let activeIcon = NSImage(systemSymbolName: "bolt.circle.fill", accessibilityDescription: "Backlight activity")
@@ -68,23 +84,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 用户点击 Dock 里的浏览器图标（应用被激活）→ 自动还原被收起的窗口，
     // 让"辅助登录/查看进度"像普通浏览器一样自然。按 PID 精确匹配我们的实例，
     // 用户自己的 Chrome 被激活时不会误触发。
-    NSWorkspace.shared.notificationCenter.addObserver(
-      forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
-    ) { [weak self] note in
-      guard let self,
-            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-            app.bundleIdentifier?.lowercased().contains("chrom") == true else { return }
-      apiGet("/api/status") { [weak self] data in
-        guard let self, let data,
+    for event in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didUnhideApplicationNotification] {
+      NSWorkspace.shared.notificationCenter.addObserver(
+        forName: event, object: nil, queue: .main
+      ) { [weak self] note in
+      guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+      apiGet("/api/status") { data in
+        guard let data,
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let browser = obj["browser"] as? [String: Any],
               browser["running"] as? Bool == true,
               let pid = browser["pid"] as? Int else { return }
-        if pid == app.processIdentifier {
-          DispatchQueue.main.async { self.restoreAll(NSApplication.shared) }
+        if isManagedApp(app, browser: browser) {
+          DispatchQueue.main.async {
+            self?.restoringUntil = Date().addingTimeInterval(3)
+            apiPost("/api/show", body: Int(app.processIdentifier) == pid ? "{\"activate\":false}" : "{}")
+          }
         }
       }
+      }
     }
+    poll()
   }
 
   private func menuItem(_ title: String, _ action: Selector) -> NSMenuItem {
@@ -107,18 +127,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   func poll() {
+    // Status comes from the browser lifecycle, not the presence of AI events.
+    // A click on an already-active application may emit no activation event.
+    // Recover only cornered normal windows in that case; respect minimization.
+    apiGet("/api/status") { [weak self] data in
+      guard let self else { return }
+      let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+      let browser = obj?["browser"] as? [String: Any]
+      let running = browser?["running"] as? Bool == true
+      let pid = browser?["pid"] as? Int
+      DispatchQueue.main.async {
+        self.browserRunning = running
+        guard running, let pid, let browser, !self.checkingWindow,
+              Date() > self.restoringUntil,
+              let frontmost = NSWorkspace.shared.frontmostApplication,
+              isManagedApp(frontmost, browser: browser) else { return }
+        if Int(frontmost.processIdentifier) != pid {
+          self.restoringUntil = Date().addingTimeInterval(3)
+          apiPost("/api/show")
+          return
+        }
+        self.checkingWindow = true
+        apiGet("/api/windows") { [weak self] data in
+          let result = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+          let windows = result?["windows"] as? [[String: Any]] ?? []
+          let needsRestore = windows.contains { $0["cornered"] as? Bool == true && $0["state"] as? String != "minimized" }
+          let allMinimized = !windows.isEmpty && windows.allSatisfy { $0["state"] as? String == "minimized" }
+          DispatchQueue.main.async {
+            self?.checkingWindow = false
+            guard let self, Date() > self.restoringUntil else { return }
+            if needsRestore {
+              self.restoringUntil = Date().addingTimeInterval(3)
+              apiPost("/api/show", body: "{\"activate\":false}")
+            } else if allMinimized {
+              // --no-startup-window can suppress Chromium's ordinary reopen.
+              // Hiding after the last minimize guarantees a later Dock click
+              // emits didUnhide/didActivate, even if this app was already active.
+              NSRunningApplication(processIdentifier: Int32(pid))?.hide()
+            }
+          }
+        }
+      }
+    }
     apiGet("/api/activity?limit=1") { [weak self] data in
       guard let self, let data,
             let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
             let events = obj["events"] as? [[String: Any]], let last = events.last,
             let ts = last["ts"] as? Double else {
-        DispatchQueue.main.async { self?.browserRunning = false }
         return
       }
       let kind = last["kind"] as? String ?? ""
-      let isRunning = (obj["events"] != nil)
       DispatchQueue.main.async {
-        self.browserRunning = isRunning
         if kind == "ai-command" && ts > self.lastActivityTsMs {
           self.lastActivityTsMs = ts
           self.blinkUntil = Date().addingTimeInterval(4)

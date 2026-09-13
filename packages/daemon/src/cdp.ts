@@ -125,5 +125,6 @@ export async function fetchVersion(port: number, timeoutMs = 3000): Promise<CdpV
 export async function fetchTargets(port: number, timeoutMs = 3000): Promise<CdpTargetInfo[]> {
   const res = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(timeoutMs) })
   if (!res.ok) throw new Error(`/json/list ${res.status}`)
-  return res.json() as Promise<CdpTargetInfo[]>
+  const targets = await res.json() as Array<CdpTargetInfo & { id?: string }>
+  return targets.map(target => ({ ...target, targetId: target.targetId ?? target.id! }))
 }

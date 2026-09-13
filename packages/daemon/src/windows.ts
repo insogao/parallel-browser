@@ -51,6 +51,7 @@ export class FramePumpSupervisor {
   private pumps = new Map<string, { cdp: Cdp; sessionId: string; running: boolean; strikes: number }>()
   private pumpCooldown = new Map<string, number>()
   private ticking = false
+  humanMode = false
   private collapsed = new Map<number, { left: number; top: number; wasMinimized: boolean }>()
   private getContext: () => { cdp: Cdp } | null
   private getHealth: () => TargetHealth[]
@@ -156,6 +157,7 @@ export class FramePumpSupervisor {
   /** Collapse: 'minimize' mode (default) = native minimize (dock-click restores
    * natively; capture keep-alive keeps pages fast). 'corner' = 2px sliver. */
   async collapseAll(): Promise<number> {
+    this.humanMode = false
     const ctx = this.getContext()
     if (!ctx) return 0
     let n = 0
@@ -163,6 +165,10 @@ export class FramePumpSupervisor {
     for (const windowId of await this.collectWindowIds()) {
       try {
         if (mode === 'minimize') {
+          const { bounds } = await ctx.cdp.send<{ bounds: { windowState?: string } }>('Browser.getWindowBounds', { windowId })
+          if (bounds.windowState === 'maximized' || bounds.windowState === 'fullscreen') {
+            await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
+          }
           await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } })
         } else {
           await this.cornerWindow(ctx.cdp, windowId)
@@ -198,37 +204,32 @@ export class FramePumpSupervisor {
 
   /** Bring collapsed windows back: 'minimize' mode un-minimizes everything
    * (native dock-click semantics); 'corner' mode restores cornered positions. */
-  async restoreAll(): Promise<number> {
+  async restoreAll(maximize = false): Promise<number> {
     const ctx = this.getContext()
     if (!ctx) return 0
-    const mode = this.settings().collapseMode
+    this.humanMode = true
+    const wa = await readWorkArea(ctx.cdp)
     let n = 0
-    if (mode === 'minimize') {
-      for (const windowId of await this.collectWindowIds()) {
-        try {
-          const { bounds } = await ctx.cdp.send<{ bounds: { windowState?: string } }>('Browser.getWindowBounds', { windowId })
-          if ((bounds.windowState ?? 'normal') === 'minimized') {
-            await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
-            n++
+    for (const windowId of await this.collectWindowIds()) {
+      try {
+        const { bounds } = await ctx.cdp.send<{ bounds: any }>('Browser.getWindowBounds', { windowId })
+        const orig = this.collapsed.get(windowId)
+        const offscreen = bounds.left + bounds.width <= wa.al + 40 || bounds.top >= wa.at + wa.ah - 40
+        if (bounds.windowState === 'minimized' || orig || offscreen || maximize) {
+          await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
+          if (orig || offscreen) {
+            const left = orig?.left ?? bounds.left
+            const top = orig?.top ?? bounds.top
+            await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: {
+              left: left + bounds.width <= wa.al + 40 ? wa.al + 40 : left,
+              top: top >= wa.at + wa.ah - 40 ? wa.at + 40 : top,
+            } })
           }
-        } catch { /* gone */ }
-      }
-    } else {
-      for (const [windowId, orig] of [...this.collapsed]) {
-        try {
-          await ctx.cdp.send('Browser.setWindowBounds', {
-            windowId,
-            bounds: { windowState: 'normal', left: orig.left, top: orig.top },
-          })
-          if (orig.wasMinimized) {
-            await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } })
-          }
+          if (maximize) await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'maximized' } })
           this.collapsed.delete(windowId)
           n++
-        } catch {
-          this.collapsed.delete(windowId)
         }
-      }
+      } catch (err) { debug(`restore window ${windowId}: ${(err as Error).message}`) }
     }
     log(`restored ${n} window(s)`)
     return n

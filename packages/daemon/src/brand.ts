@@ -174,8 +174,7 @@ export interface BrandOptions {
 }
 
 /**
- * Create a branded copy of a Chromium .app: new name, new icon, same bundle
- * identifier (so Keychain/cookie encryption semantics stay intact).
+ * Create a branded copy with its own name, icon and bundle identifier.
  */
 export async function brandBundle(opts: BrandOptions): Promise<string> {
   const { srcApp, destApp, name } = opts
@@ -197,13 +196,20 @@ export async function brandBundle(opts: BrandOptions): Promise<string> {
   }
   if (!fs.existsSync(masterPng)) throw new Error(`icon not found: ${masterPng}`)
   await makeIcns(masterPng, path.join(resources, 'backlight.icns'))
+  // Chromium can load app.icns directly instead of consulting Info.plist.
+  fs.copyFileSync(path.join(resources, 'backlight.icns'), path.join(resources, 'app.icns'))
 
   // Info.plist: display name + icon. CFBundleIdentifier is set to a DEDICATED
   // id (not CfT's) so macOS registers the branded app as a fresh, separate
   // application — no icon-cache collision with Chrome/CfT registrations.
   // Keychain caveat: the branded browser has its own login store.
   const plistPath = path.join(destApp, 'Contents', 'Info.plist')
-  const patched = patchPlist(fs.readFileSync(plistPath, 'utf8'), {
+  // Modern CfT also declares AppIcon in Assets.car. CFBundleIconName takes
+  // precedence over the legacy icns key, so remove that application-icon key.
+  // Keep the asset catalog: it also contains document icons.
+  const plist = fs.readFileSync(plistPath, 'utf8')
+    .replace(/\s*<key>CFBundleIconName<\/key>\s*<string>[^<]*<\/string>/g, '')
+  const patched = patchPlist(plist, {
     CFBundleName: name,
     CFBundleDisplayName: name,
     CFBundleIconFile: 'backlight',
@@ -214,7 +220,6 @@ export async function brandBundle(opts: BrandOptions): Promise<string> {
   // register with LaunchServices so the Dock shows the branded icon immediately
   try {
     await run('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister', ['-f', destApp])
-    await run('/bin/killall', ['Dock'])
   } catch (err) {
     warn(`LaunchServices refresh failed: ${(err as Error).message.slice(0, 120)}`)
   }

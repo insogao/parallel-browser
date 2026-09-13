@@ -1,3 +1,4 @@
+import { backlightFixture } from './backlight-fixture.ts'
 /**
  * M1 supervisor e2e (corner collapse): window visible ~2s for the baseline,
  * then /api/bg corners it (2px sliver, offscreen) — pages must render NATIVELY
@@ -13,6 +14,7 @@ import path from 'node:path'
 import { Cdp, fetchVersion } from '../src/cdp.ts'
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'backlight-sup-'))
+backlightFixture(TMP)
 const PORT = 9434
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 

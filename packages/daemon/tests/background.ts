@@ -1,3 +1,4 @@
+import { backlightFixture } from './backlight-fixture.ts'
 /**
  * M4 background-first launch e2e: `launch` must NOT leave a visible window —
  * windows are auto-minimized within seconds, pages keep rendering via frame
@@ -12,6 +13,7 @@ import path from 'node:path'
 import { Cdp, fetchVersion } from '../src/cdp.ts'
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'backlight-bg-'))
+backlightFixture(TMP)
 const PORT = 9440
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 

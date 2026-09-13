@@ -29,6 +29,7 @@ fs.writeFileSync(path.join(srcApp, 'Contents', 'Info.plist'), `<?xml version="1.
   <key>CFBundleIdentifier</key><string>com.google.chrome.for.testing</string>
   <key>CFBundleName</key><string>Test Chrome for Testing</string>
   <key>CFBundleIconFile</key><string>app.icns</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
 </dict></plist>`)
 
 // ---- default icon generation (pure JS PNG encoder) ----
@@ -58,7 +59,9 @@ try {
   ok('CFBundleName rebranded', plist.includes('<string>MyBrand</string>'))
   ok('CFBundleIdentifier set to dedicated brand id', plist.includes('dev.backlight.browser'))
   ok('icon switched to backlight.icns', plist.includes('<string>backlight</string>') && fs.existsSync(path.join(appDir, 'Contents', 'Resources', 'backlight.icns')))
-  ok('old app.icns untouched', fs.existsSync(path.join(appDir, 'Contents', 'Resources', 'app.icns')))
+  ok('asset catalog no longer overrides custom icon', !plist.includes('<key>CFBundleIconName</key>'))
+  ok('runtime app.icns uses brand icon', fs.readFileSync(path.join(appDir, 'Contents', 'Resources', 'app.icns')).equals(fs.readFileSync(path.join(appDir, 'Contents', 'Resources', 'backlight.icns'))))
+  ok('source browser icon remains untouched', fs.readFileSync(path.join(srcApp, 'Contents', 'Resources', 'app.icns'), 'utf8') === 'FAKE_OLD_ICNS')
 } catch (err) {
   console.error('BRAND ERROR:', err instanceof Error ? err.stack : err)
   pass = false

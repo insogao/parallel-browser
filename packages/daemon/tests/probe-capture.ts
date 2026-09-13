@@ -1,3 +1,4 @@
+import { backlightFixture } from './backlight-fixture.ts'
 /**
  * P0 experiment v2: Tab Capture → CapturerCount keep-alive.
  * Pages served from http://127.0.0.1 (secure context) so getDisplayMedia works.
@@ -17,6 +18,7 @@ import { findFreePort } from '../src/ports.ts'
 import { Cdp, fetchVersion } from '../src/cdp.ts'
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'bl-cap-'))
+const backlightBinary = backlightFixture(TMP)
 const SITE = 9491
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
@@ -61,7 +63,7 @@ async function main() {
     '--auto-select-tab-capture-source-by-title=BACKLIGHT_AGENT',
     '--blink-settings=displayCaptureRequiresUserGesture=false',
   ]
-  const child = spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', args, { stdio: 'ignore' })
+  const child = spawn(backlightBinary, args, { stdio: 'ignore' })
   try {
     const deadline = Date.now() + 15_000
     let version: any = null

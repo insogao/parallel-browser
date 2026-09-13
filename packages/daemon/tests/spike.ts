@@ -1,3 +1,4 @@
+import { backlightFixture } from './backlight-fixture.ts'
 /**
  * M1 verification spike (final architecture, non-intrusive):
  * A window is visible only for the 2s baseline; everything else runs collapsed
@@ -17,6 +18,7 @@ import path from 'node:path'
 import { Cdp, fetchVersion } from '../src/cdp.ts'
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'backlight-spike-'))
+backlightFixture(TMP)
 const PORT = 9433
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
@@ -60,9 +62,14 @@ async function runSpike() {
 
   const version = await fetchVersion(launched.upstreamPort)
   const cdp = await Cdp.connect(version.webSocketDebuggerUrl)
-  const { targetInfos } = await cdp.send<{ targetInfos: any[] }>('Target.getTargets')
-  const page = targetInfos.find(t => t.type === 'page' && t.title === 'BL Spike')
-    ?? targetInfos.find(t => t.type === 'page' && t.url.startsWith('data:'))!
+  let page: any
+  const navigationDeadline = Date.now() + 10000
+  while (!page && Date.now() < navigationDeadline) {
+    const { targetInfos } = await cdp.send<{ targetInfos: any[] }>('Target.getTargets')
+    page = targetInfos.find(t => t.type === 'page' && (t.title === 'BL Spike' || t.url.startsWith('data:')))
+    if (!page) await sleep(100)
+  }
+  if (!page) throw new Error('Backlight initial page did not navigate within 10s')
   const sessionId = await cdp.attach(page.targetId)
   await cdp.send('Page.enable', {}, sessionId)
   const { windowId } = await cdp.send<{ windowId: number }>('Browser.getWindowForTarget', { targetId: page.targetId })
@@ -136,9 +143,8 @@ async function runSpike() {
   console.log(ok(`capture keep-alive: NATIVE full speed while minimized (${results['min+capture']!.nativePerSec})`, results['min+capture']!.nativePerSec >= 45))
   console.log(ok('capture keep-alive: engaged', results['min+capture']!.capEngaged === true))
   console.log(ok(`capture: real screenshot fast (${results['min+capture']!.ms}ms)`, results['min+capture']!.ms < 3000 && results['min+capture']!.bytes > 5000))
-  console.log(ok('corner: visibilityState visible', results['min+capture']!.visibility === 'visible'))
   console.log(ok(`capture: real screenshot fast (${results['min+capture']!.ms}ms)`, results['min+capture']!.ms < 3000 && results['min+capture']!.bytes > 5000))
-  console.log(ok('minimized: visibilityState visible (frozen by capture keep-alive)', results['min+capture']!.visibility === 'visible'))
+  console.log(`capture DOM visibility (not spoofed): ${results['min+capture']!.visibility}`)
 
   const verdict =
     results['minimized']!.shimRafPerSec >= 12 &&

@@ -3,6 +3,7 @@ import { ActivityBus } from './activity.ts'
 import { BrowserManager } from './browser.ts'
 import { CaptureKeepAlive } from './capture.ts'
 import { ExtensionManager } from './extensions.ts'
+import { ExtensionDev } from './extension-dev.ts'
 import { HealthMonitor } from './inject.ts'
 import { ensureDirs, paths } from './paths.ts'
 import { findFreePort } from './ports.ts'
@@ -10,6 +11,7 @@ import { createServer } from './proxy.ts'
 import { loadSettings } from './store.ts'
 import { error, initFileLogging, log } from './log.ts'
 import { FramePumpSupervisor } from './windows.ts'
+import { startTray } from './native.ts'
 
 export const VERSION = '0.1.0'
 
@@ -39,6 +41,7 @@ async function main() {
     () => (manager.current ? { cdp: manager.current.cdp, controllerUrl: `http://127.0.0.1:${proxyPort}/controller` } : null),
     () => health.snapshot(),
   )
+  const extensionDev = new ExtensionDev(manager, extensions, bus)
 
   const pulseSessions = new Map<string, Promise<string>>()
   const pulse = (targetId: string) => {
@@ -63,15 +66,15 @@ async function main() {
     health,
     capture,
     extensions,
+    extensionDev,
     bus,
     version: VERSION,
     startedAt: Date.now(),
     pulse,
-    restartForReload: () => void manager.restartIfRunning('extension hot reload'),
   })
 
-  extensions.startWatching(() => {
-    void manager.restartIfRunning('extension hot reload')
+  extensions.startWatching((files) => {
+    void extensionDev.changed(files).catch(err => error(`extension reload: ${err.message}`))
   })
 
   supervisor.start(500)
@@ -81,6 +84,7 @@ async function main() {
   server.listen(proxyPort, '127.0.0.1', () => {
     log(`backlight daemon v${VERSION} listening on http://127.0.0.1:${proxyPort}`)
     fs.writeFileSync(paths.daemonFile, JSON.stringify({ pid: process.pid, port: proxyPort, startedAt: Date.now() }, null, 2))
+    void startTray().catch(err => error(`tray startup failed: ${err.message}`))
   })
 
   const shutdown = async (signal: string) => {

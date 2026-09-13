@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Backlight Side Panel Demo",
+  "version": "1.0.0",
+  "description": "在真实侧栏中读取网页、发送消息和保存笔记。",
+  "permissions": ["sidePanel", "storage"],
+  "side_panel": { "default_path": "panel.html" },
+  "action": { "default_title": "打开 Backlight 侧栏" },
+  "background": { "service_worker": "worker.js" },
+  "content_scripts": [{
+    "matches": ["http://127.0.0.1/*", "http://localhost/*", "https://example.com/*"],
+    "js": ["content.js"]
+  }]
+}

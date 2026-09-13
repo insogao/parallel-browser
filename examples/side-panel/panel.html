@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Backlight · 侧栏工作台</title><link rel="stylesheet" href="panel.css"></head>
+<body>
+  <header><span class="logo">B</span><div>BACKLIGHT<small>侧栏工作台</small></div><span class="live">已连接</span></header>
+  <main>
+    <p class="eyebrow">和网页一起工作</p><h1>一个侧栏，<br>两边实时联动。</h1>
+    <p class="intro">查看当前网页的信息，或把操作送回网页。切换标签后，再次读取即可。</p>
+    <section><span class="label">当前网页</span><h2 id="page-title">尚未读取</h2><p id="page-url">点击下方按钮连接网页。</p><div class="actions"><button id="read">读取网页</button><button id="highlight" class="secondary">高亮标题</button></div></section>
+    <section><label class="label" for="note">随手记 · 自动保存</label><textarea id="note" placeholder="写下想法，重载扩展后还在。"></textarea><small id="saved">笔记保存在此浏览器中</small></section>
+    <p id="result" role="status" aria-live="polite"></p>
+    <footer>网页与扩展保持各自的运行环境。<br>从 Backlight 控制台分别打开调试工具。</footer>
+  </main><script src="panel.js"></script>
+</body></html>

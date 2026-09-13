@@ -24,46 +24,61 @@ export const RAF_SHIM_JS = `(() => {
   let hiddenMode = document.hidden
   const pending = new Map()
   let worker = null
-  const pump = () => {
+  let scheduled = false
+  let nativeId = null
+  let timerId = null
+  let generation = 0
+  const pump = (ticket) => {
+    if (ticket !== generation) return
+    nativeId = null
+    timerId = null
     const now = performance.now()
-    for (const [id, cb] of [...pending]) { pending.delete(id); try { cb(now) } catch {} }
-    if (hiddenMode && pending.size > 0 && worker) worker.postMessage('tick')
+    for (const id of [...pending.keys()]) {
+      const cb = pending.get(id)
+      if (!cb) continue
+      pending.delete(id)
+      try { cb(now) } catch (err) { setTimeout(() => { throw err }, 0) }
+    }
+    scheduled = false
+    scheduleNext()
   }
   const scheduleNext = () => {
-    if (pending.size === 0) return
+    if (scheduled || pending.size === 0) return
+    scheduled = true
+    const ticket = ++generation
     if (hiddenMode) {
-      // worker timers are not subject to hidden-page clamping; setTimeout is
-      // the fallback when a strict CSP blocks blob: workers
-      if (worker) worker.postMessage('tick')
-      else setTimeout(pump, 16)
-    } else {
-      native(() => pump())
-    }
-  }
-  const setWorker = (w) => {
-    worker = w
-    if (w) {
-      w.onmessage = () => { if (hiddenMode && pending.size > 0) pump() }
-      if (hiddenMode) w.postMessage('tick')
-    }
+      if (worker) worker.postMessage(ticket)
+      else timerId = setTimeout(() => pump(ticket), 16)
+    } else nativeId = native(() => pump(ticket))
   }
   try {
-    const src = 'let t=null;const loop=()=>{postMessage(0);t=setTimeout(loop,16)};onmessage=()=>{if(!t)loop()}'
-    setWorker(new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))))
-  } catch { /* strict CSP: setTimeout fallback at ~28Hz when hidden */ }
-  // rescue in-flight native callbacks when the page becomes hidden: the last
-  // scheduled native frame may never fire once minimized
+    const url = URL.createObjectURL(new Blob(['onmessage=e=>setTimeout(()=>postMessage(e.data),16)'], { type: 'text/javascript' }))
+    worker = new Worker(url)
+    URL.revokeObjectURL(url)
+    worker.onmessage = e => pump(e.data)
+    worker.onerror = () => {
+      worker.terminate(); worker = null
+      ++generation; scheduled = false; scheduleNext()
+    }
+  } catch { /* CSP may forbid blob workers; use one main-thread timer */ }
   document.addEventListener('visibilitychange', () => {
     hiddenMode = document.hidden
-    if (hiddenMode) scheduleNext()
+    if (nativeId !== null) nativeCancel(nativeId)
+    if (timerId !== null) clearTimeout(timerId)
+    nativeId = timerId = null
+    ++generation
+    scheduled = false
+    scheduleNext()
   })
   window.requestAnimationFrame = (cb) => {
+    if (typeof cb !== 'function') throw new TypeError('requestAnimationFrame requires a function')
     const id = ++nextId
     pending.set(id, cb)
     scheduleNext()
     return id
   }
-  window.cancelAnimationFrame = (id) => { pending.delete(id); nativeCancel(id) }
+  window.cancelAnimationFrame = (id) => { pending.delete(id) }
+
 })()`
 
 export function buildInjectJs(halo: boolean): string {
@@ -123,6 +138,7 @@ interface TrackedTarget {
   prevNative: number
   prevTimer: number
   prevTs: number
+  documentSince?: number
   rafPerSec: number
   nativeRafPerSec: number
   timerPerSec: number
@@ -174,7 +190,7 @@ export class HealthMonitor {
     try {
       const { cdp } = ctx
       const { targetInfos } = await cdp.send<{ targetInfos: any[] }>('Target.getTargets')
-      for (const page of targetInfos.filter(t => t.type === 'page')) {
+      for (const page of targetInfos.filter(t => t.type === 'page' && !/^(chrome|devtools):|^chrome-extension:/.test(t.url))) {
         if (this.sessions.has(page.targetId)) continue
         try {
           const sessionId = await cdp.attach(page.targetId)
@@ -217,7 +233,7 @@ export class HealthMonitor {
       const { targetInfos } = await cdp.send<{ targetInfos: Array<{ targetId: string; type: string; title: string; url: string }> }>(
         'Target.getTargets',
       )
-      const pages = targetInfos.filter(t => t.type === 'page')
+      const pages = targetInfos.filter(t => t.type === 'page' && !/^(chrome|devtools):|^chrome-extension:/.test(t.url))
       const alive = new Set(pages.map(p => p.targetId))
       for (const id of [...this.sessions.keys()]) {
         if (!alive.has(id)) this.sessions.delete(id)
@@ -266,16 +282,18 @@ export class HealthMonitor {
       if (res.exceptionDetails) return
       const health = await cdp.send<{ result?: { value?: any } }>(
         'Runtime.evaluate',
-        { expression: '(()=>{const h=window.__blHealth;if(!h)return null;return{raf:h.raf,native:h.native,timer:h.timer,vis:document.visibilityState}})()', returnByValue: true },
+        { expression: '(()=>{const h=window.__blHealth;if(!h)return null;return{raf:h.raf,native:h.native,timer:h.timer,since:h.since,vis:document.visibilityState}})()', returnByValue: true },
         sessionId,
       )
       const v = health.result?.value
       if (!v) return
       const now = Date.now()
       const dt = Math.max(1, now - tracked.prevTs) / 1000
-      tracked.rafPerSec = (v.raf - tracked.prevRaf) / dt
-      tracked.nativeRafPerSec = (v.native - tracked.prevNative) / dt
-      tracked.timerPerSec = (v.timer - tracked.prevTimer) / dt
+      const sameDocument = tracked.documentSince === v.since
+      tracked.rafPerSec = sameDocument ? Math.max(0, v.raf - tracked.prevRaf) / dt : 0
+      tracked.nativeRafPerSec = sameDocument ? Math.max(0, v.native - tracked.prevNative) / dt : 0
+      tracked.timerPerSec = sameDocument ? Math.max(0, v.timer - tracked.prevTimer) / dt : 0
+      tracked.documentSince = v.since
       tracked.prevRaf = v.raf
       tracked.prevNative = v.native
       tracked.prevTimer = v.timer

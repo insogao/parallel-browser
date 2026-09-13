@@ -1,106 +1,88 @@
 # Backlight · 后台浏览器
 
-一个对人和 AI Agent 都友好的「后台浏览器」：**页面在后台以原生 60fps 满速运行（连 rAF 都是原生的）**、**插件开发测试一体化**、**AI 指令实时可视化**。
+Backlight 是 macOS 上的 Chromium 浏览器监督器：AI 可通过本机 CDP 接口静默创建网页，用户可以从 Dock 或菜单栏展开窗口，辅助登录、扫码和插件调试。浏览器使用独立 profile，不修改用户平常使用的 Chrome。
 
-对标 [ego-lite](https://github.com/citrolabs/ego-lite) 的产品体验，但架构不同：ego-lite 是 Chromium 源码 fork；Backlight 是**监督器 + 真实 Chromium 内核**——因此扩展兼容性 100%，且把 ego-lite 没有解决的两个痛点在架构层解决了。
+## 使用
 
-## 它解决什么
-
-| 痛点 | 常见浏览器/ego-lite | Backlight |
-|---|---|---|
-| 最小化/后台后页面停摆（rAF 暂停、动画/逻辑冻结、截图陈旧） | 存在（Chromium 后台节流） | ✅ **Tab Capture 豁免**（原生 60fps）+ 贴角 + 垫片三层保活 |
-| 定时器后台降频（最慢 1 次/分钟） | 存在 | ✅ 启动参数禁用 |
-| 插件开发要手动 chrome://extensions 加载、改代码手动重载 | 存在 | ✅ `bl ext add` + 文件监听热重载 |
-| 想在具体网站上测插件 | 同上，费劲 | ✅ `bl open <url> --with <插件>` 一条命令 |
-| AI 操作浏览器时用户无感知 | 存在 | ✅ 页面光环 + 菜单栏托盘闪烁 + 活动流 |
-| 登录态要从头登录 | 存在 | ✅ `bl import` 从本机 Chrome 导入 cookie/密码/填充数据 |
-
-## 后台保活：三层机制（实测数据，macOS Chrome 152）
-
-Chromium 会暂停"不可见"页面的 rAF。我们的分层方案：
-
-1. **Tab Capture 豁免（主方案）**：Chromium 官方机制——被捕获的标签页直接上报 `visible`。启动参数 `--auto-select-tab-capture-source-by-title` + 常驻 controller 页的 `getDisplayMedia()` 触发。实测：**窗口最小化后原生 rAF 60fps、截图 70-90ms 真实帧**，页面可见性语义正常
-2. **贴角收起**：`bl bg` 把窗口移到屏幕角落只露 2px——Chrome 仍视为可见，原生满速；`bl show` 恢复
-3. **rAF 垫片 + 帧泵**（兜底）：垫片把隐藏页面的 rAF 重定向到 Worker 定时器（逻辑 12-60Hz 存活）；帧泵对轻量页面强制出帧
-
-已知边界：被捕获标签的 DOM `visibilityState` 个别时序下仍可能读 `hidden`（rAF/截图不受影响）。
-
-## 快速开始
+需要 pnpm、支持原生 TypeScript 的 Node（本机验证版本 25）以及 macOS Swift 编译工具。
 
 ```bash
 pnpm install
-alias bl="node $(pwd)/packages/cli/bin/backlight.js"
-
-bl import                    # 一键导入本机 Chrome 的 cookie/登录态（选 profile）
-bl launch https://x.com      # 后台启动 x.com —— 不弹窗、不抢焦点、已登录
-bl show                      # 想看页面时恢复窗口
-bl bg                        # 一键收起到后台（页面满速继续）
-bl status / bl health        # 状态 / 各标签页后台健康度
-bl tray                      # 菜单栏托盘（AI 指令时图标闪烁）
-bl doctor                    # 环境体检
+alias bl="node /Users/gaoshizai/work/ego/packages/cli/bin/backlight.js"
+bl launch https://example.com    # 后台启动，自动启动菜单栏托盘
+bl open https://example.org      # 开新页，保持已有窗口位置
+bl show                         # 展开窗口、进入人工接管
+bl show --maximize              # 展开并最大化
+bl bg                           # 最小化、隐藏应用，继续后台运行
+bl status
+bl health
 bl stop
 ```
 
-控制台 Dashboard：`http://127.0.0.1:9333/`——实时活动流 + 后台健康度表格。
+也可以点击 Backlight 的 Dock 图标，或使用菜单栏的“恢复窗口显示”。点击会路由到受管浏览器：即使 macOS 激活了同一品牌应用的另一个实例，也会将真正运行网页的窗口显示出来。用户自己的 Google Chrome 不参与此路由。
 
-## 插件开发循环
+控制台默认地址：[本机 Backlight 控制台](http://127.0.0.1:9333/)。包含窗口控制、扩展注册、侧栏开发、调试目标列表、后台健康度和活动记录。
+
+## 真实侧栏开发
+
+扩展需要在 manifest 中声明 `side_panel.default_path` 和 `sidePanel` 权限。示例位于 `examples/side-panel/`，支持读取网页、高亮标题和保存笔记。
 
 ```bash
-bl ext add ~/dev/my-extension            # 注册未打包扩展（读 manifest name）
-bl launch --with my-extension            # 带插件启动
-bl open taobao.com --with my-extension   # 带插件直达目标网站
-# ... 修改扩展源码，保存后自动热重载（浏览器重启、标签恢复，约 3s）
-bl ext ls / bl ext rm my-extension
+bl ext add /Users/gaoshizai/work/ego/examples/side-panel --name demo
+bl ext dev demo http://127.0.0.1:9333/demo
+bl targets                     # 网页、扩展侧栏和后台脚本的 targetId
+bl inspect <targetId>          # 在独立窗口调试所选目标
+bl ext reload demo             # 只重载扩展
+bl ext ls
+bl ext rm demo
 ```
 
-说明：Google Chrome 136+ 忽略 `--load-extension`。检测到「品牌版 Chrome + 需要加载扩展」时，Backlight 自动下载 **Chrome for Testing**（支持 `--load-extension`，内核与稳定版一致）。下载源可用 `BACKLIGHT_DOWNLOAD_BASE_URL` 指向镜像。
+保存扩展文件后，Backlight 使用 Chromium 的 `Extensions.loadUnpacked` 更新该扩展，不重启浏览器、不刷新网页，保留网页中的未提交输入和扩展本地存储。内容脚本修改后需要手动刷新目标网页；侧栏重载后可再次执行 `ext dev`。错误会显示在控制台及活动记录中，不会偷偷改为重启浏览器。
 
-## AI / Agent 接入
+`ext dev` 会重新打开指定窗口的原生侧栏，并使用一个短暂的后台扩展页面发起打开操作。因此扩展页面代码可能额外初始化一次；临时页面随后关闭。侧栏临时内存状态可能随重新打开丢失，持久笔记应放入 `chrome.storage`。
 
-内置 **CDP 代理**（默认 `127.0.0.1:9333`），字节级透传 + 指令打点：
+这些开发接口需要近期 Chromium / Chrome for Testing；已有 Google Chrome 实例不支持时会返回错误，请关闭后带扩展重新启动，或使用品牌化 CfT 引擎。
+
+## AI 接入与后台边界
 
 ```js
-// Playwright
 const browser = await chromium.connectOverCDP('http://127.0.0.1:9333')
-// Puppeteer
-const browser = await puppeteer.connect({ browserURL: 'http://127.0.0.1:9333' })
 ```
 
-每条 AI 指令（Input.* / Runtime.evaluate / Page.navigate / 截图…）→ 事件流广播（`ws://127.0.0.1:9333/activity`）+ Dashboard 活动面板 + 页面光环。指令被归因到具体标签页。
+- 默认后台启动；REST `/api/open` 使用后台标签，不移动或展开用户正在使用的窗口。
+- 最小化后的多标签网络加载、定时器轮询已通过本地端到端测试。
+- 原生渲染捕获保活目前同时覆盖 **一个目标**。其他页面使用定时器与 rAF 逻辑调度兜底，不能保证所有标签的原生渲染都为 60fps。
+- 健康面板分别报告逻辑帧率、原生帧率和定时器频率，不伪造 `document.visibilityState`。
+- 人工接管会暂停新的捕获设置，避免后台控制器切换标签；现有捕获可继续。`GET /api/status` 的 `control` 字段为 `human` 或 `background`，Agent 应尊重该状态。CDP 通道仍是调试接口，不会自动阻止所有第三方 Agent 输入。
+- 系统睡眠期间不承诺继续运行。网站自身的后台暂停逻辑、CSP 和认证行为也可能影响任务。
 
-## 架构
-
-```
-packages/
-  daemon/   监督器：浏览器生命周期、capture/贴角/垫片三层保活、CDP 代理、活动总线、扩展管理、健康监测、Dashboard
-  cli/      backlight (bl) 命令行
-  tray/     Swift 菜单栏托盘（swiftc 编译，无 Electron）
-tools/      winlist（CGWindowList 检测在屏窗口，测试用）
-```
-
-数据目录：`~/Library/Application Support/Backlight/`（`BACKLIGHT_HOME` 可覆盖）。
-
-## 测试（全程非侵入）
+## 独立品牌
 
 ```bash
-pnpm --filter @backlight/daemon test
-# spike.ts        三层保活机制对照实验
-# supervisor.ts   贴角/捕获/恢复 e2e
-# extensions.ts   插件注册→加载→内容脚本→热重载 e2e
-# agent.ts        CDP 代理透明性 + 活动流 + 光环 e2e
-# background.ts   后台优先启动 e2e
-# import.ts       cookie 导入 e2e
+bl stop
+bl brand --name Backlight                # 使用内置 B 图标
+bl brand --name Backlight --icon logo.png # 自定义 PNG
+bl launch https://example.com
 ```
 
-测试已用 `caffeinate` 包裹防止显示器睡眠影响结果；窗口只在基线阶段出现约 2 秒，其余时间最小化/贴角。
+品牌化复制 Chrome for Testing，替换应用图标、名称和 bundle id。移除 `CFBundleIconName` 对原有 Assets.car 图标的覆盖，并替换运行时 `app.icns`。不会重签浏览器或重启系统 Dock。
 
-## 路线图
+品牌浏览器有自己的登录存储，需要手动登录一次。`bl import --list` / `bl import` 是可选的本地 Chrome profile 导入；跨浏览器品牌的加密 cookie 不能保证可解密。
 
-- [ ] 捕获后 DOM visibilityState 冻结（细节打磨）
-- [ ] 多标签并发 capture（tabCapture 扩展或小 fork：给每个 Agent WebContents 持有 capture token）
-- [ ] space 管理 UI、`snapshot` 内置命令、站点技能包（对标 ego-lite Skills）
-- [ ] `npm i -g` 全局安装打包
+## 验证与结构
 
-## License
+```bash
+pnpm -r --if-present run check
+pnpm --filter @backlight/daemon test       # 单元测试 + 串行原生浏览器集成测试
+bash packages/tray/build.sh
+```
 
-MIT（本项目代码；浏览器使用用户已安装的 Chrome/Chromium 或自动下载的 Chrome for Testing，不做任何分发）
+所有浏览器测试仅使用已安装品牌化 Backlight.app 的相同构建副本（校验程序与图标 SHA256），不允许回退到 Google Chrome 或独立 Chrome for Testing。使用临时 profile 和独立应用路径隔离日常窗口；窗口测试由 caffeinate 包裹，部分阶段会短暂显示 Backlight 窗口。详细验收记录见 `docs/development/2026-09-13.md`。
+
+- `packages/daemon/`：浏览器生命周期、CDP 代理、窗口恢复、捕获、健康度与开发接口。
+- `packages/cli/`：`backlight` / `bl` 命令。
+- `packages/tray/`：原生菜单栏与 Dock 激活处理。
+- `tools/app-control.swift`：按受管 PID 激活、隐藏应用及读取运行图标。
+- `PROJECT_INDEX.md`：交接入口、已验证状态与剩余边界。
+
+实现参考：[Chromium Extensions CDP 接口](https://chromedevtools.github.io/devtools-protocol/tot/Extensions/)、[原生 sidePanel API](https://developer.chrome.com/docs/extensions/reference/api/sidePanel)。

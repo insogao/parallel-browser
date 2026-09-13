@@ -1,3 +1,4 @@
+import { backlightFixture } from './backlight-fixture.ts'
 /**
  * Probe: does getDisplayMedia work from a HIDDEN (background/minimized) controller tab?
  *   D1: controller ACTIVE + visible  → start capture (known good)
@@ -13,6 +14,7 @@ import { findFreePort } from '../src/ports.ts'
 import { Cdp, fetchVersion } from '../src/cdp.ts'
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'bl-cap2-'))
+const backlightBinary = backlightFixture(TMP)
 const SITE = 9492
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
@@ -45,7 +47,7 @@ async function main() {
     '--auto-select-tab-capture-source-by-title=BACKLIGHT_AGENT',
     '--blink-settings=displayCaptureRequiresUserGesture=false',
   ]
-  const child = spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', args, { stdio: 'ignore' })
+  const child = spawn(backlightBinary, args, { stdio: 'ignore' })
   try {
     const deadline = Date.now() + 15_000
     let version: any = null

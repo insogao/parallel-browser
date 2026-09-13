@@ -3,7 +3,7 @@
  * backlight (bl) — control the Backlight background-browser daemon.
  * Requires Node >= 22.6 (native TypeScript type stripping).
  */
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -89,7 +89,8 @@ function usage(): string {
 用法:
   backlight launch [url]        启动后台浏览器（可 --space 名称 --with 扩展名 --bare）
   backlight open <url>          在运行中的浏览器开新标签页（可 --with 扩展名）
-  backlight bg                  一键收起全部窗口到后台（伪最小化，页面满速运行）
+  backlight bg                  最小化窗口并交回后台运行
+  backlight show [--maximize]   显示浏览器并进入人工接管，可最大化
   backlight restore             恢复收起的窗口
   backlight status              查看 daemon / 浏览器状态
   backlight health              各标签页后台健康度（rAF/定时器速率）
@@ -99,6 +100,10 @@ function usage(): string {
   backlight ext add <目录>      注册未打包扩展（--name 别名）
   backlight ext ls              列出已注册扩展
   backlight ext rm <名称>       移除扩展
+  backlight ext dev <名称> <url> 打开网页与真实扩展侧栏
+  backlight ext reload <名称>   仅重载扩展，保留网页输入
+  backlight targets            列出可调试的网页、扩展和后台脚本
+  backlight inspect <targetId>  为选定目标打开独立 DevTools 窗口
   backlight import              从本机 Chrome 导入 cookie/登录态（--profile 目录名 --space 名称，--list 列出）
   backlight brand               品牌化浏览器（--name 名称 --icon logo.png）
   backlight doctor              环境体检
@@ -155,7 +160,7 @@ async function main() {
 
     case 'show': {
       const info = readDaemonInfo(); if (!info) throw new Error('daemon not running')
-      const res = await api(info, '/api/show', { method: 'POST', body: '{}' })
+      const res = await api(info, '/api/show', { method: 'POST', body: JSON.stringify({ maximize: args.flags.has('maximize') }) })
       console.log(`restored ${res.restored} window(s) to screen`)
       return
     }
@@ -248,7 +253,18 @@ async function main() {
     case 'ext': {
       const info = await ensureDaemon()
       const sub = args._[1]
-      if (sub === 'add') {
+      if (sub === 'dev') {
+        const name = args._[2], url = args._[3]
+        if (!name || !url) throw new Error('usage: backlight ext dev <名称> <url>')
+        const res = await api(info, '/api/extensions/dev', { method: 'POST', body: JSON.stringify({ name, url, maximize: args.flags.has('maximize') }) })
+        console.log(`网页与侧栏已打开。网页: ${res.targetId}  侧栏: ${res.panelTargetId}`)
+        console.log(`调试侧栏: bl inspect ${res.panelTargetId}`)
+      } else if (sub === 'reload') {
+        const name = args._[2]
+        if (!name) throw new Error('usage: backlight ext reload <名称>')
+        const res = await api(info, '/api/extensions/reload', { method: 'POST', body: JSON.stringify({ name }) })
+        console.log(`已加载 ${res.extension.name} ${res.extension.version}。${res.note}`)
+      } else if (sub === 'add') {
         const dir = args._[2]
         if (!dir) throw new Error('usage: backlight ext add <扩展目录> [--name 别名]')
         const res = await api(info, '/api/extensions/add', {
@@ -270,8 +286,23 @@ async function main() {
         const res = await api(info, '/api/extensions/remove', { method: 'POST', body: JSON.stringify({ name }) })
         console.log(res.ok ? `removed: ${name}` : `not found: ${name}`)
       } else {
-        throw new Error('usage: backlight ext add|ls|rm')
+        throw new Error('usage: backlight ext add|ls|rm|dev|reload')
       }
+      return
+    }
+
+    case 'targets': {
+      const info = readDaemonInfo(); if (!info) throw new Error('daemon not running')
+      const res = await api(info, '/api/targets')
+      for (const target of res.targets) console.log(`${target.targetId}  ${target.type}  ${target.title || target.url}`)
+      return
+    }
+    case 'inspect': {
+      const targetId = args._[1]
+      if (!targetId) throw new Error('usage: backlight inspect <targetId> (see bl targets)')
+      const info = readDaemonInfo(); if (!info) throw new Error('daemon not running')
+      await api(info, '/api/inspect', { method: 'POST', body: JSON.stringify({ targetId }) })
+      console.log('DevTools 已打开；原网页和侧栏保持打开。')
       return
     }
 
@@ -302,7 +333,6 @@ async function main() {
       if (!fs.existsSync(appPath)) {
         console.log('building tray app…')
         const build = path.join(cliDir, '..', '..', 'tray', 'build.sh')
-        const { execFileSync } = require('node:child_process')
         execFileSync('bash', [build], { stdio: 'inherit' })
       }
       spawn('open', ['-a', appPath], { detached: true, stdio: 'ignore' }).unref()

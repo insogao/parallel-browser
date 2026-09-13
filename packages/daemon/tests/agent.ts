@@ -1,3 +1,4 @@
+import { backlightFixture } from './backlight-fixture.ts'
 /**
  * M3 agent-channel e2e: an AI tool connects through the CDP PROXY (port 9333
  * path), drives the page, and the daemon must:
@@ -14,6 +15,7 @@ import path from 'node:path'
 import { Cdp } from '../src/cdp.ts'
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'backlight-agent-'))
+backlightFixture(TMP)
 const PORT = 9439
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 

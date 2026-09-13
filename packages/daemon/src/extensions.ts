@@ -24,7 +24,8 @@ interface ExtRegistry {
 export class ExtensionManager {
   private watcher?: import('chokidar').FSWatcher
   private debounceTimer?: NodeJS.Timeout
-  private onChange?: () => void
+  private onChange?: (files: string[]) => void
+  private changedFiles = new Set<string>()
 
   private read(): ExtRegistry {
     try {
@@ -85,6 +86,7 @@ export class ExtensionManager {
     const [gone] = reg.extensions.splice(idx, 1)
     this.write(reg)
     log(`extension removed: ${name}`)
+    this.startWatching(this.onChange ?? (() => {}))
     void gone
     return true
   }
@@ -97,7 +99,7 @@ export class ExtensionManager {
     const all = this.list()
     const wanted = names == null
       ? all
-      : names.map(n => this.get(n)).filter((e): e is ExtEntry => !!e)
+      : names.map(n => { const e = this.get(n); if (!e) throw new Error(`extension not registered: ${n}`); return e })
     return [...new Set(wanted.map(e => e.path))].filter(p => fs.existsSync(p))
   }
 
@@ -107,10 +109,10 @@ export class ExtensionManager {
   }
 
   /** Watch every registered extension dir; fire `onChange` (debounced) on any file event. */
-  startWatching(onChange: () => void) {
+  startWatching(onChange: (files: string[]) => void) {
     this.onChange = onChange
     const dirs = this.list().map(e => e.path).filter(p => fs.existsSync(p))
-    if (!dirs.length) return
+    if (!dirs.length) { this.stopWatching(); return }
     this.watchDirs(dirs)
   }
 
@@ -118,14 +120,18 @@ export class ExtensionManager {
     this.stopWatching()
     this.watcher = chokidar.watch(dirs, {
       ignoreInitial: true,
+      ignored: /(^|[/\\])(node_modules|\.git)([/\\]|$)/,
       awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 },
     })
     this.watcher.on('all', (_event, filePath) => {
       debug(`extension file change: ${filePath}`)
+      this.changedFiles.add(filePath)
       clearTimeout(this.debounceTimer)
       this.debounceTimer = setTimeout(() => {
         warn('extension file changed -> hot reload requested')
-        this.onChange?.()
+        const files = [...this.changedFiles]
+        this.changedFiles.clear()
+        this.onChange?.(files)
       }, 600)
     })
     this.watcher.on('error', (err: unknown) => warn(`extension watcher error: ${(err as Error)?.message ?? String(err)}`))

@@ -1,16 +1,19 @@
 import http from 'node:http'
+import fs from 'node:fs'
 import path from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { ActivityBus } from './activity.ts'
 import type { BrowserManager } from './browser.ts'
 import type { CaptureKeepAlive } from './capture.ts'
 import type { ExtensionManager } from './extensions.ts'
+import type { ExtensionDev } from './extension-dev.ts'
 import type { HealthMonitor } from './inject.ts'
 import { loadSettings, saveSettings, type Settings } from './store.ts'
 import { listChromeProfiles, importProfile } from './import.ts'
 import { ensureChromiumForExtensions } from './browser.ts'
 import { brandBundle } from './brand.ts'
 import { paths } from './paths.ts'
+import { activateBrowser, hideBrowser } from './native.ts'
 import type { FramePumpSupervisor } from './windows.ts'
 import { TapState, tapFrame } from './tap.ts'
 import { log, debug } from './log.ts'
@@ -21,11 +24,11 @@ export interface ServerDeps {
   health: HealthMonitor
   capture: CaptureKeepAlive
   extensions: ExtensionManager
+  extensionDev: ExtensionDev
   bus: ActivityBus
   version: string
   startedAt: number
   pulse: (targetId: string) => void
-  restartForReload: () => void
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
@@ -72,6 +75,11 @@ export function createServer(deps: ServerDeps): http.Server {
       if (url.pathname === '/controller') {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         res.end(controllerHtml())
+        return
+      }
+      if (url.pathname === '/demo') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+        res.end(fs.readFileSync(new URL('./demo.html', import.meta.url), 'utf8'))
         return
       }
       if (url.pathname === '/') {
@@ -144,6 +152,8 @@ function pipeCdpSocket(req: http.IncomingMessage, socket: import('node:stream').
     const targetUrl = `ws://127.0.0.1:${upstreamPort}${req.url}`
     const upstream = new WebSocket(targetUrl, { perMessageDeflate: false, maxPayload: 256 * 1024 * 1024 })
     const state = new TapState()
+    const pending: Array<{ data: Buffer; isBinary: boolean }> = []
+    let pendingBytes = 0
 
     const closeAll = () => {
       try { client.close() } catch { /* ignore */ }
@@ -151,10 +161,11 @@ function pipeCdpSocket(req: http.IncomingMessage, socket: import('node:stream').
     }
 
     upstream.on('open', () => {
-      if (head?.length) upstream.send(head)
+      for (const frame of pending.splice(0)) upstream.send(frame.data, { binary: frame.isBinary })
+      pendingBytes = 0
     })
     upstream.on('message', (data: Buffer, isBinary: boolean) => {
-      client.send(data, { binary: isBinary })
+      if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary })
       if (!isBinary && Buffer.byteLength(data) < 2_000_000) {
         tapFrame(data.toString(), 'b2c', state, { onAction: () => {} })
       }
@@ -163,8 +174,12 @@ function pipeCdpSocket(req: http.IncomingMessage, socket: import('node:stream').
     upstream.on('error', closeAll)
 
     client.on('message', (data: Buffer, isBinary: boolean) => {
-      if (upstream.readyState !== WebSocket.OPEN) return
-      upstream.send(data, { binary: isBinary })
+      if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary })
+      else if (upstream.readyState === WebSocket.CONNECTING) {
+        pendingBytes += data.length
+        if (pendingBytes > 16 * 1024 * 1024) { closeAll(); return }
+        pending.push({ data, isBinary })
+      } else return
       if (!isBinary && Buffer.byteLength(data) < 2_000_000) {
         tapFrame(data.toString(), 'c2b', state, {
           onAction: (hit) => {
@@ -188,12 +203,17 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   const route = `${req.method} ${url.pathname}`
 
   switch (route) {
+    case 'GET /api/demo': {
+      json(res, 200, { now: Date.now() })
+      return
+    }
     case 'GET /api/status': {
       const settings = loadSettings()
       const cur = deps.manager.current
       json(res, 200, {
         daemon: { version: deps.version, pid: process.pid, uptimeSec: Math.round((Date.now() - deps.startedAt) / 1000), port: settings.proxyPort },
         settings,
+        control: deps.supervisor.humanMode ? 'human' : 'background',
         browser: cur
           ? {
               running: true,
@@ -211,6 +231,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return
     }
     case 'POST /api/launch': {
+      deps.supervisor.humanMode = payload.focus === true || payload.keepVisible === true || payload.background === false
+      await deps.capture.setPaused(deps.supervisor.humanMode)
+      deps.supervisor.start()
       const inst = await deps.manager.launch({
         url: payload.url,
         space: payload.space,
@@ -235,12 +258,18 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return
     }
     case 'POST /api/bg': {
+      await deps.capture.setPaused(false)
       const n = deps.manager.running ? await deps.supervisor.collapseAll() : 0
+      if (deps.manager.current) await hideBrowser(deps.manager.current.pid)
       json(res, 200, { ok: true, collapsed: n })
       return
     }
+    case 'POST /api/show':
     case 'POST /api/restore': {
-      const n = deps.manager.running ? await deps.supervisor.restoreAll() : 0
+      deps.supervisor.humanMode = true
+      await deps.capture.setPaused(true)
+      const n = deps.manager.running ? await deps.supervisor.restoreAll(payload.maximize === true) : 0
+      if (deps.manager.current && payload.activate !== false) await activateBrowser(deps.manager.current.pid)
       json(res, 200, { ok: true, restored: n })
       return
     }
@@ -260,20 +289,69 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return
     }
     case 'GET /api/extensions': {
-      json(res, 200, { extensions: deps.extensions.list(), loaded: deps.manager.current?.extensionPaths ?? [] })
+      let runtime: unknown[] = []
+      let runtimeError: string | undefined
+      try { runtime = await deps.extensionDev.runtime() } catch (err) { runtimeError = (err as Error).message }
+      json(res, 200, { extensions: deps.extensions.list(), loaded: deps.manager.current?.extensionPaths ?? [], runtime, runtimeError, lastReload: deps.extensionDev.lastReload })
       return
     }
     case 'POST /api/extensions/add': {
       if (!payload.path) return json(res, 400, { error: 'path required' })
       const entry = deps.extensions.add(payload.path, payload.name)
-      if (deps.manager.running) await deps.manager.restart(`extension added: ${entry.name}`)
+      if (deps.manager.running) await deps.extensionDev.load(entry.name)
       json(res, 200, { ok: true, extension: entry })
       return
     }
     case 'POST /api/extensions/remove': {
-      const ok = deps.extensions.remove(String(payload.name ?? ''))
-      if (ok && deps.manager.running) await deps.manager.restart('extension removed')
+      const ok = await deps.extensionDev.remove(String(payload.name ?? ''))
       json(res, 200, { ok })
+      return
+    }
+    case 'POST /api/extensions/reload': {
+      const extension = await deps.extensionDev.load(String(payload.name ?? ''), true)
+      json(res, 200, { ok: true, extension, browserRestarted: false, note: '内容脚本更新需刷新目标网页；未自动刷新，以保留输入内容。' })
+      return
+    }
+    case 'POST /api/extensions/dev': {
+      const name = String(payload.name ?? '')
+      deps.extensionDev.entry(name)
+      if (!deps.manager.running) {
+        if (!payload.url) return json(res, 400, { error: 'url required to start extension development' })
+        await deps.manager.launch({ url: payload.url, with: [name] })
+      }
+      deps.supervisor.humanMode = true
+      await deps.capture.setPaused(true)
+      const cur = deps.manager.current!
+      let targetId = payload.targetId
+      if (!targetId && payload.url) {
+        targetId = (await deps.manager.listTabs()).find(t => t.type === 'page' && t.url === payload.url)?.targetId
+        if (!targetId) targetId = (await cur.cdp.send('Target.createTarget', { url: payload.url, background: true })).targetId
+      }
+      if (!targetId) return json(res, 400, { error: 'select a website targetId or url' })
+      await deps.supervisor.restoreAll(payload.maximize === true)
+      if (payload.activate !== false) await activateBrowser(cur.pid)
+      const result = await deps.extensionDev.openPanel(name, targetId)
+      json(res, 200, { ok: true, ...result })
+      return
+    }
+    case 'GET /api/targets': {
+      json(res, 200, { targets: (await deps.manager.listTabs()).filter(t => t.type === 'page' || t.type === 'service_worker') })
+      return
+    }
+    case 'POST /api/inspect': {
+      const cur = deps.manager.current
+      if (!cur) return json(res, 409, { error: 'browser not running' })
+      const target = (await deps.manager.listTabs()).find(t => t.targetId === payload.targetId)
+      if (!target) return json(res, 404, { error: 'target is no longer available; refresh the target list' })
+      deps.supervisor.humanMode = true
+      await deps.capture.setPaused(true)
+      // Go through our loopback proxy: Chromium rejects the frontend's
+      // devtools:// Origin at its raw remote-debugging socket.
+      const inspectorUrl = `devtools://devtools/bundled/inspector.html?ws=127.0.0.1:${req.socket.localPort}/devtools/page/${target.targetId}`
+      const { targetId } = await cur.cdp.send('Target.createTarget', { url: inspectorUrl, newWindow: true })
+      await deps.supervisor.restoreAll()
+      if (payload.activate !== false) await activateBrowser(cur.pid)
+      json(res, 200, { ok: true, targetId })
       return
     }
     case 'POST /api/open': {
@@ -281,21 +359,12 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       if (!deps.manager.running) {
         await deps.manager.launch({ url: payload.url, with: payload.with })
       } else {
-        // background:true — tab never activates; the window gets cornered so
-        // nothing pops to the front and the page keeps native full speed
+        // Never move or un-minimize an existing window when creating an AI tab.
         const cur = deps.manager.current!
-        const { targetId } = await cur.cdp.send<{ targetId: string }>('Target.createTarget', { url: payload.url, background: true })
-        try {
-          const { windowId } = await cur.cdp.send<{ windowId: number }>('Browser.getWindowForTarget', { targetId })
-          await deps.supervisor.cornerWindow(cur.cdp, windowId)
-        } catch { /* window handling is best-effort */ }
+        for (const name of payload.with ?? []) await deps.extensionDev.load(name)
+        await cur.cdp.send('Target.createTarget', { url: payload.url, background: true })
       }
       json(res, 200, { ok: true })
-      return
-    }
-    case 'POST /api/show': {
-      const n = deps.manager.running ? await deps.supervisor.restoreAll() : 0
-      json(res, 200, { ok: true, restored: n })
       return
     }
     case 'GET /api/import/sources': {
@@ -418,7 +487,9 @@ function dashboardHtml(deps: ServerDeps): string {
   #activity .m { color: #37c8ff; }
   #activity .t { color: #5c6f81; margin-right: 8px; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; }
-  input { background: #0b0f14; border: 1px solid #24374a; color: #d7e2ec; border-radius: 8px; padding: 7px 10px; font-size: 13px; min-width: 280px; }
+  input, select { background: #0b0f14; border: 1px solid #24374a; color: #d7e2ec; border-radius: 8px; padding: 7px 10px; font-size: 13px; min-width: 220px; max-width: 100%; }
+  select { flex: 1; }
+  button:disabled { opacity: .5; cursor: wait; }
   kbd { background:#16222e;border:1px solid #24374a;border-radius:4px;padding:1px 6px;font-size:11px;color:#9fb3c6; }
 </style>
 </head>
@@ -435,15 +506,25 @@ function dashboardHtml(deps: ServerDeps): string {
     <div class="row">
       <button id="bLaunch">启动浏览器</button>
       <button id="bBg">收起到后台</button>
-      <button id="bRestore">恢复窗口</button>
+      <button id="bRestore">显示并接管</button>
+      <button id="bMaximize">最大化</button>
       <button id="bStop">关闭浏览器</button>
       <input id="url" placeholder="https://example.com  — 打开新标签页" />
       <button id="bOpen">打开</button>
     </div>
+    <p id="notice" role="status" aria-live="polite" class="sub">默认静默打开网页。需要登录或扫码时，点击“显示并接管”。</p>
   </section>
   <section>
-    <h2>后台健康度（rAF/定时器 速率，页面在后台应保持与前台一致）</h2>
-    <table id="health"><thead><tr><th>页面</th><th>可见性</th><th>rAF/s</th><th>Timer/s</th><th>状态</th></tr></thead><tbody></tbody></table>
+    <h2>插件开发 · 网页与侧栏一起调试</h2>
+    <div class="row"><input id="extPath" placeholder="未打包扩展的本地绝对路径" aria-label="扩展目录"/><button id="bExtAdd">添加扩展</button></div>
+    <div class="row" style="margin-top:12px"><select id="extName" aria-label="选择扩展"></select><input id="devUrl" placeholder="目标网页，留空使用本地体验页" aria-label="侧栏目标网页"/><button id="bExtDev">打开网页 + 侧栏</button><button id="bExtReload">重载扩展</button></div>
+    <p class="sub" id="extStatus">加载扩展列表…</p>
+    <p class="sub">保存扩展代码后自动重载，网页输入保持原状。内容脚本修改后，请刷新目标网页。</p>
+    <div class="row"><select id="target" aria-label="选择调试目标"></select><button id="bInspect">调试所选目标</button></div>
+  </section>
+  <section>
+    <h2>后台健康度</h2>
+    <table id="health"><thead><tr><th>页面</th><th>可见性</th><th>逻辑帧/s</th><th>原生帧/s</th><th>定时器/s</th><th>状态</th></tr></thead><tbody></tbody></table>
   </section>
   <section>
     <h2>AI 指令活动流（WebSocket /activity）</h2>
@@ -451,17 +532,20 @@ function dashboardHtml(deps: ServerDeps): string {
   </section>
   <section>
     <h2>说明</h2>
-    <div class="sub">窗口最小化/遮挡/后台标签都会被帧泵（frame pump）保活：页面继续以接近满速渲染，rAF 与定时器不停。CDP 代理端口即本端口，AI 工具直接连 <kbd>http://127.0.0.1:${loadSettings().proxyPort}</kbd>。</div>
+    <div class="sub">后台页面可持续加载数据。原生渲染保活目前覆盖一个目标，其余页面使用定时器与逻辑帧兜底；请以实测健康度为准。人工接管期间暂停新的捕获设置。AI 连接地址：<kbd id="connection"></kbd>。</div>
   </section>
 </main>
 <script>
   const $ = (id) => document.getElementById(id);
-  async function api(path, opts) { const r = await fetch(path, opts); return r.json(); }
+  $('connection').textContent = location.origin;
+  async function api(path, opts) { const r = await fetch(path, opts); const body = await r.json(); if (!r.ok) throw new Error(body.error || '操作失败'); return body; }
+  const post = (path, body = {}) => api(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const action = (id, fn) => { $(id).onclick = async () => { $(id).disabled = true; $('notice').textContent = '处理中…'; try { const message = await fn(); $('notice').textContent = message || '已完成'; await refreshStatus(); await refreshExtensions(); } catch(e) { $('notice').textContent = e.message; } finally { $(id).disabled = false; } }; };
   async function refreshStatus() {
     try {
       const s = await api('/api/status');
       $('status').textContent = s.browser?.running
-        ? \`浏览器运行中 · pid \${s.browser.pid} · \${s.browser.version} · space=\${s.browser.space}\`
+        ? (s.control === 'human' ? '人工接管中 · 完成后可收起到后台' : '后台运行中')
         : '浏览器未运行';
     } catch { $('status').textContent = 'daemon 离线'; }
   }
@@ -471,25 +555,43 @@ function dashboardHtml(deps: ServerDeps): string {
       const tb = $('health').querySelector('tbody');
       tb.innerHTML = (h.targets ?? []).map(t => {
         const bg = t.visibility !== 'visible';
-        const good = t.rafPerSec >= 20;
+        const good = t.timerPerSec >= 5;
         return \`<tr><td>\${escapeHtml(t.title || t.url).slice(0, 60)}</td>
           <td class="\${bg ? 'warn' : 'ok'}">\${t.visibility}</td>
-          <td>\${t.rafPerSec}</td><td>\${t.timerPerSec}</td>
-          <td class="\${good ? 'ok' : 'bad'}">\${good ? '满速' : '被节流?'}</td></tr>\`;
+          <td>\${t.rafPerSec}</td><td>\${t.nativeRafPerSec}</td><td>\${t.timerPerSec}</td>
+          <td class="\${good ? 'ok' : 'warn'}">\${good ? '定时器正常' : '采样中 / 请检查'}</td></tr>\`;
       }).join('');
     } catch {}
   }
   function escapeHtml(s) { const d = document.createElement('div'); d.textContent = String(s ?? ''); return d.innerHTML; }
-  $('bLaunch').onclick = () => api('/api/launch', { method: 'POST', body: '{}' }).then(refreshStatus);
-  $('bBg').onclick = () => api('/api/bg', { method: 'POST', body: '{}' });
-  $('bRestore').onclick = () => api('/api/restore', { method: 'POST', body: '{}' });
-  $('bStop').onclick = () => api('/api/stop', { method: 'POST', body: '{}' }).then(refreshStatus);
-  $('bOpen').onclick = () => { const u = $('url').value.trim(); if (u) api('/api/open', { method: 'POST', body: JSON.stringify({ url: u }) }); };
+  function options(select, entries) {
+    const current = select.value;
+    select.replaceChildren(...entries.map(([value, label]) => { const option = document.createElement('option'); option.value = value; option.textContent = label; return option; }));
+    if (entries.some(([value]) => value === current)) select.value = current;
+  }
+  async function refreshExtensions() {
+    try {
+      const e = await api('/api/extensions');
+      options($('extName'), e.extensions.map(ext => [ext.name, ext.name]));
+      $('extStatus').textContent = e.lastReload ? e.lastReload.name + '：' + e.lastReload.message : e.runtimeError || '已注册 ' + e.extensions.length + ' 个扩展';
+      const t = await api('/api/targets');
+      options($('target'), t.targets.filter(x => !x.url.startsWith('devtools:')).map(x => [x.targetId, (x.type === 'service_worker' ? '后台脚本 · ' : x.url.startsWith('chrome-extension:') ? '扩展页面 / 侧栏 · ' : '网页 · ') + (x.title || x.url)]));
+    } catch(e) { $('extStatus').textContent = e.message; }
+  }
+  action('bLaunch', async () => { await post('/api/launch', { url: location.origin + '/demo' }); return '浏览器已在后台启动'; });
+  action('bBg', async () => { await post('/api/bg'); return '已收起，后台继续运行'; });
+  action('bRestore', async () => { await post('/api/show'); return '已进入人工接管'; });
+  action('bMaximize', async () => { await post('/api/show', { maximize: true }); return '已最大化，人工接管中'; });
+  action('bStop', async () => { await post('/api/stop'); return '浏览器已关闭'; });
+  action('bOpen', async () => { const url = $('url').value.trim(); if (!url) throw new Error('请输入网址'); await post('/api/open', { url }); return '已静默打开网页'; });
+  action('bExtAdd', async () => { await post('/api/extensions/add', { path: $('extPath').value.trim() }); return '扩展已添加'; });
+  action('bExtDev', async () => { if (!$('extName').value) throw new Error('请先添加扩展'); const result = await post('/api/extensions/dev', { name: $('extName').value, url: $('devUrl').value.trim() || location.origin + '/demo' }); await refreshExtensions(); $('target').value = result.panelTargetId; return '真实侧栏已打开，可选择网页、侧栏或后台脚本分别调试'; });
+  action('bExtReload', async () => { if (!$('extName').value) throw new Error('请先选择扩展'); await post('/api/extensions/reload', { name: $('extName').value }); return '扩展已重载；内容脚本更新需刷新目标网页'; });
+  action('bInspect', async () => { if (!$('target').value) throw new Error('请选择调试目标'); await post('/api/inspect', { targetId: $('target').value }); return '调试窗口已打开'; });
   const es = new WebSocket(\`ws://\${location.host}/activity\`);
   es.onmessage = (ev) => {
     try {
       const e = JSON.parse(ev.data);
-      if (e.kind !== 'ai-command') return;
       const div = document.createElement('div');
       div.innerHTML = \`<span class="t">\${new Date(e.ts).toLocaleTimeString()}</span><span class="m">\${escapeHtml(e.method)}</span> \${escapeHtml(e.detail ?? '')} \${e.targetId ? '· ' + escapeHtml(e.targetId.slice(0, 8)) : ''}\`;
       $('activity').prepend(div);
@@ -499,8 +601,8 @@ function dashboardHtml(deps: ServerDeps): string {
       while ($('activity').childElementCount > 100) $('activity').lastChild.remove();
     } catch {}
   };
-  refreshStatus(); refreshHealth();
-  setInterval(refreshStatus, 3000); setInterval(refreshHealth, 3000);
+  refreshStatus(); refreshHealth(); refreshExtensions();
+  setInterval(refreshStatus, 3000); setInterval(refreshHealth, 3000); setInterval(refreshExtensions, 3000);
 </script>
 </body>
 </html>`

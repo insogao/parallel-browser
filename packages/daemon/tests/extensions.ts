@@ -1,9 +1,10 @@
+import { backlightFixture } from './backlight-fixture.ts'
 /**
  * M2 extension dev-loop e2e:
  *   1. register a fixture unpacked extension (MV3, content script)
- *   2. launch — branded Chrome is swapped for a Chromium build (--load-extension)
+ *   2. launch — the installed Backlight build loads the unpacked extension
  *   3. content script must execute on a local test page
- *   4. edit the manifest (version bump) — hot reload must restart the browser
+ *   4. edit the manifest (version bump) — hot reload must preserve the browser process
  *      and the new content script version must run
  *
  * Run: node tests/extensions.ts
@@ -16,6 +17,7 @@ import path from 'node:path'
 import { Cdp, fetchVersion } from '../src/cdp.ts'
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'backlight-ext-'))
+backlightFixture(TMP)
 const PORT = 9435
 const SITE_PORT = 9490
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
@@ -26,6 +28,8 @@ function writeExt(version: string) {
     manifest_version: 3,
     name: 'Backlight Fixture',
     version,
+    permissions: ['sidePanel', 'storage'],
+    side_panel: { default_path: 'panel.html' },
     background: { service_worker: 'sw.js' },
     content_scripts: [{
       matches: ['http://*/*'],
@@ -33,10 +37,13 @@ function writeExt(version: string) {
       run_at: 'document_idle',
     }],
   }, null, 2))
+  for (const file of ['panel.html', 'panel.css', 'panel.js']) {
+    fs.copyFileSync(new URL(`../../../examples/side-panel/${file}`, import.meta.url), path.join(TMP, 'ext', file))
+  }
   fs.writeFileSync(path.join(TMP, 'ext', 'sw.js'), `console.log('backlight fixture sw ${version}')\n`)
   // content scripts run in an ISOLATED world: window.* markers are invisible to
   // CDP Runtime.evaluate (main world). Use a DOM marker instead.
-  fs.writeFileSync(path.join(TMP, 'ext', 'content.js'), `document.documentElement.dataset.blExtVersion = '${version}';\n`)
+  fs.writeFileSync(path.join(TMP, 'ext', 'content.js'), `document.documentElement.dataset.blExtVersion = '${version}';\n` + fs.readFileSync(new URL('../../../examples/side-panel/content.js', import.meta.url), 'utf8'))
 }
 
 async function waitFor(predicate: () => Promise<boolean>, timeoutMs: number, what: string) {
@@ -111,18 +118,55 @@ async function main() {
     console.log(`content script version after launch: ${v1}`)
     if (v1 !== '1.0.0') throw new Error(`expected 1.0.0, got ${v1}`)
 
-    // 3. bump the version — hot reload should restart the browser
+    const siteTarget = (await conn.cdp.send('Target.getTargets')).targetInfos.find((t: any) => t.url.startsWith(`http://127.0.0.1:${SITE_PORT}`))
+    await conn.cdp.send('Runtime.evaluate', { expression: 'window.unsavedDraft = "keep me"' }, conn.sessionId)
+    const dev = await post('/api/extensions/dev', { name: added.extension.name, targetId: siteTarget.targetId, activate: false })
+    if (!dev.ok || !dev.panelTargetId) throw new Error(`side panel failed: ${JSON.stringify(dev)}`)
+    const panelSession = await conn.cdp.attach(dev.panelTargetId)
+    const panelType = await conn.cdp.send('Runtime.evaluate', { expression: 'chrome.runtime.getContexts({contextTypes:["SIDE_PANEL"]})', awaitPromise: true, returnByValue: true }, panelSession)
+    if (!panelType.result.value?.length) throw new Error('not a real SIDE_PANEL context')
+    await conn.cdp.send('Runtime.evaluate', { expression: 'chrome.storage.local.set({draft:"persist"})', awaitPromise: true }, panelSession)
+    console.log('PASS real native side panel with extension context')
+    await conn.cdp.evaluateOnSession(panelSession, 'document.querySelector("#read").click()')
+    await waitFor(async () => await conn.cdp.evaluateOnSession(panelSession, 'document.querySelector("#page-title").textContent') === 'Ext Test Page', 5000, 'sample side panel reads the selected website')
+    await conn.cdp.evaluateOnSession(panelSession, 'document.querySelector("#highlight").click()')
+    await waitFor(async () => !!(await conn.cdp.evaluateOnSession(conn.sessionId, 'document.querySelector("h1").style.background')), 5000, 'sample side panel changes website heading')
+    console.log('PASS side panel ↔ website messaging')
+    const inspector = await post('/api/inspect', { targetId: dev.panelTargetId, activate: false })
+    if (!inspector.ok) throw new Error(`inspector failed: ${JSON.stringify(inspector)}`)
+    const inspectorSession = await conn.cdp.attach(inspector.targetId)
+    await waitFor(async () => {
+      const text = await conn.cdp.evaluateOnSession<string>(inspectorSession, `(() => {
+        const parts = []; const visit = n => { if (['SCRIPT','STYLE'].includes(n.nodeName)) return; if (n.nodeType === 3) parts.push(n.textContent); if (n.shadowRoot) visit(n.shadowRoot); for (const c of n.childNodes || []) visit(c) }; visit(document.body); return parts.join(' ');
+      })()`)
+      if (/disconnected|WebSocket disconnected|连接已断开/i.test(text)) throw new Error(text)
+      return /Elements|Console|元素|控制台/.test(text)
+    }, 10000, 'DevTools UI loads for side panel')
+    console.log('PASS separate DevTools window for native side panel')
+    await conn.cdp.send('Target.closeTarget', { targetId: inspector.targetId })
+
+    // 3. bump the version — reload only the extension
     const oldPid = conn.pid
     writeExt('1.0.1')
     console.log('manifest bumped to 1.0.1; waiting for hot reload...')
     await waitFor(async () => {
-      const s: any = await fetch(`http://127.0.0.1:${PORT}/api/status`).then(r => r.json()).catch(() => null)
-      return s?.browser?.running && s.browser.pid !== oldPid
-    }, 20_000, 'browser restart (hot reload)')
+      const e: any = await fetch(`http://127.0.0.1:${PORT}/api/extensions`).then(r => r.json())
+      return e.runtime?.some((x: any) => x.version === '1.0.1')
+    }, 20_000, 'extension reload without browser restart')
+    const after: any = await fetch(`http://127.0.0.1:${PORT}/api/status`).then(r => r.json())
+    if (after.browser.pid !== oldPid) throw new Error('browser restarted during extension reload')
+    if (await conn.cdp.evaluateOnSession(conn.sessionId, 'window.unsavedDraft') !== 'keep me') throw new Error('page draft lost during extension reload')
+    conn.cdp.close()
 
     conn = await connectPage()
     const v2 = await readVersion(conn.cdp, conn.sessionId)
     console.log(`content script version after hot reload: ${v2}`)
+    const devAgain = await post('/api/extensions/dev', { name: added.extension.name, targetId: siteTarget.targetId, activate: false })
+    if (!devAgain.ok) throw new Error(JSON.stringify(devAgain))
+    const againSession = await conn.cdp.attach(devAgain.panelTargetId)
+    const stored = await conn.cdp.send('Runtime.evaluate', { expression: 'chrome.storage.local.get("draft")', returnByValue: true, awaitPromise: true }, againSession)
+    if (stored.result.value?.draft !== 'persist') throw new Error('extension storage lost during reload')
+    console.log('PASS extension storage survives reload')
     pass = v2 === '1.0.1'
     console.log(`\n${pass ? 'PASS' : 'FAIL'} extension dev loop e2e`)
     process.exitCode = pass ? 0 : 1

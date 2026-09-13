@@ -9,7 +9,6 @@ const CONTROLLER_PATH = '/controller'
 
 interface ActiveCapture {
   targetId: string
-  origTitle: string
 }
 
 /**
@@ -26,6 +25,8 @@ interface ActiveCapture {
 export class CaptureKeepAlive {
   private timer: NodeJS.Timeout | null = null
   private ticking = false
+  private cdp: Cdp | null = null
+  private generation = 0
   private active: ActiveCapture | null = null
   private controller: { targetId: string; sessionId: string } | null = null
   private targetSessions = new Map<string, string>()
@@ -34,6 +35,7 @@ export class CaptureKeepAlive {
   private failures = 0
   private cooldownUntil = 0
   private disabled = false
+  private paused = false
   private getContext: () => { cdp: Cdp; controllerUrl: string } | null
   private getHealth: () => TargetHealth[]
 
@@ -51,14 +53,26 @@ export class CaptureKeepAlive {
   stop() {
     if (this.timer) clearInterval(this.timer)
     this.timer = null
+    this.generation++
   }
 
   activeTargetId(): string | null {
+    this.syncContext()
     return this.active?.targetId ?? null
   }
 
+  async setPaused(paused: boolean): Promise<void> {
+    this.paused = paused
+    if (paused) this.generation++
+    // Finish any in-flight setup before showing a user window. The flag also
+    // prevents that setup from re-minimizing or switching tabs during takeover.
+    const deadline = Date.now() + 2500
+    while (paused && this.ticking && Date.now() < deadline) await sleep(50)
+  }
+
   async tick(): Promise<void> {
-    if (this.ticking || this.disabled) return
+    this.syncContext()
+    if (this.ticking || this.disabled || this.paused) return
     const ctx = this.getContext()
     if (!ctx || !loadSettings().captureKeepAlive) return
     this.ticking = true
@@ -102,171 +116,184 @@ export class CaptureKeepAlive {
     }
   }
 
+  /** All state below belongs to one browser connection, even after failures. */
+  private syncContext() {
+    const cdp = this.getContext()?.cdp ?? null
+    if (cdp === this.cdp) return
+    this.cdp = cdp
+    this.generation++
+    this.active = null
+    this.controller = null
+    this.targetSessions.clear()
+    this.hiddenStreak.clear()
+    this.failures = 0
+    this.cooldownUntil = 0
+    this.disabled = false
+  }
+
+  private async send<T = any>(cdp: Cdp, method: string, params: Record<string, unknown> = {}, session?: string): Promise<T> {
+    return bounded(cdp.send<T>(method, method === 'Runtime.evaluate' ? { timeout: 1500, ...params } : params, session))
+  }
+
   private async engage(target: TargetHealth): Promise<void> {
     const ctx = this.getContext()
     if (!ctx) return
     const { cdp } = ctx
-    // pre-condition: the target must STILL be hidden right now — a visible
-    // target doesn't need the exemption and engaging it would waste CPU
+    const generation = this.generation
+    const current = () => this.getContext()?.cdp === cdp && !cdp.closed
+    const allowed = () => current() && !this.paused && this.generation === generation
+    const check = () => { if (!allowed()) throw new Error('capture setup aborted') }
     const cur = this.getHealth().find(t => t.targetId === target.targetId)
     if (!cur || cur.visibility === 'visible') return
-    const controllerSession = await this.ensureController(cdp)
-    if (!controllerSession) {
-      this.cooldownUntil = Date.now() + 10_000
-      return
-    }
-    // 1. magic title so the auto-select switch picks THIS tab
-    const targetSession = await this.sessionFor(cdp, target.targetId)
-    await cdp.send('Runtime.evaluate', {
-      expression: `(() => { if (window.__blOrigTitle === undefined) window.__blOrigTitle = String(document.title); document.title = ${JSON.stringify(CAPTURE_TITLE)}; return document.title })()`,
-      returnByValue: true,
-    }, targetSession)
-
-    // 2. the controller tab must be the ACTIVE, visible tab for
-    // getDisplayMedia to be allowed (hidden callers get InvalidStateError).
-    // If its window is minimized, restore it straight to the offscreen corner
-    // in ONE step (≈one frame flash at worst), capture, then re-minimize and
-    // put the original restored-position back so dock-clicks still work.
-    const win = await cdp.send<{ windowId?: number }>('Browser.getWindowForTarget', { targetId: this.controller!.targetId }).catch(() => ({ windowId: undefined }))
-    let reMinimizeAfter = false
-    let origLeft: number | undefined
-    let origTop: number | undefined
-    if (win.windowId !== undefined) {
-      const { bounds } = await cdp.send<{ bounds: any }>('Browser.getWindowBounds', { windowId: win.windowId })
-      if ((bounds.windowState ?? 'normal') === 'minimized') {
-        reMinimizeAfter = true
-        origLeft = bounds.left
-        origTop = bounds.top
-        const wa = await readWorkArea(cdp)
-        const left = wa.al - ((bounds.width ?? 1200) - OFFSCREEN_MARGIN)
-        const top = wa.at + wa.ah - OFFSCREEN_MARGIN
-        await cdp.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal', left, top } })
+    let controllerSession: string | null = null
+    let targetSession: string | undefined
+    let titleTouched = false
+    let switched = false
+    let started = false
+    let windowId: number | undefined
+    let original: any
+    let parked: { left: number; top: number } | undefined
+    try {
+      check()
+      controllerSession = await this.ensureController(cdp, check)
+      check()
+      if (!controllerSession) throw new Error('controller unavailable')
+      targetSession = await this.sessionFor(cdp, target.targetId)
+      check()
+      titleTouched = true
+      await this.send(cdp, 'Runtime.evaluate', {
+        expression: `(() => { if (window.__blOrigTitle === undefined) window.__blOrigTitle = String(document.title); document.title = ${JSON.stringify(CAPTURE_TITLE)} })()`,
+      }, targetSession)
+      check()
+      const win = await this.send(cdp, 'Browser.getWindowForTarget', { targetId: this.controller!.targetId })
+      check()
+      windowId = win.windowId
+      if (windowId !== undefined) {
+        const { bounds } = await this.send(cdp, 'Browser.getWindowBounds', { windowId })
+        check()
+        if (bounds.windowState === 'minimized') {
+          original = bounds
+          const wa = await bounded(readWorkArea(cdp))
+          check()
+          parked = { left: wa.al - ((bounds.width ?? 1200) - OFFSCREEN_MARGIN), top: wa.at + wa.ah - OFFSCREEN_MARGIN }
+          await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal', ...parked } })
+          check()
+        }
       }
-    }
-    await cdp.send('Target.activateTarget', { targetId: this.controller!.targetId })
-    await sleep(300)
-
-    // 3. controller: synthetic click (transient activation) + getDisplayMedia
-    await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: 5, y: 5, button: 'left', clickCount: 1 }, controllerSession)
-    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: 5, y: 5, button: 'left', clickCount: 1 }, controllerSession)
-    const res = await cdp.send<{ result?: { value?: string } }>('Runtime.evaluate', {
-      expression: 'window.startCapture(5)',
-      returnByValue: true,
-      awaitPromise: true,
-    }, controllerSession)
-    const started = res.result?.value
-    await sleep(1000)
-
-    // 4. hand focus back to the captured target; the stream persists
-    await cdp.send('Target.activateTarget', { targetId: target.targetId })
-    await sleep(500)
-
-    // 5. verify the exemption took effect (health samples every ~2s, so poll)
-    let engaged = false
-    for (let i = 0; i < 6; i++) {
-      const meV = this.getHealth().find(t => t.targetId === target.targetId)?.visibility
-      if (started === 'ok' && meV === 'visible') { engaged = true; break }
-      await sleep(700)
-    }
-    if (engaged) {
-      const origTitle = String(await this.readOrigTitle(cdp, target.targetId) ?? '')
-      this.active = { targetId: target.targetId, origTitle }
+      switched = true
+      await this.send(cdp, 'Target.activateTarget', { targetId: this.controller!.targetId })
+      await sleep(300)
+      check()
+      await this.send(cdp, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: 5, y: 5, button: 'left', clickCount: 1 }, controllerSession)
+      check()
+      await this.send(cdp, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: 5, y: 5, button: 'left', clickCount: 1 }, controllerSession)
+      check()
+      const res = await this.send(cdp, 'Runtime.evaluate', {
+        // A cancelled picker can resolve after the daemon timeout. Its own
+        // continuation must stop that late stream instead of leaking capture.
+        expression: `(async () => {
+          const attempt = {}; window.__blCaptureAttempt = attempt;
+          const result = await window.startCapture(5);
+          if (window.__blCaptureAttempt !== attempt) { window.stopCapture(); return 'aborted' }
+          return result;
+        })()`,
+        returnByValue: true, awaitPromise: true,
+      }, controllerSession)
+      check()
+      if (res.exceptionDetails || !['ok', 'already'].includes(res.result?.value)) throw new Error('capture did not start')
+      const live = await this.send(cdp, 'Runtime.evaluate', {
+        expression: `!!window.__stream?.getVideoTracks().some(t => t.readyState === 'live')`, returnByValue: true,
+      }, controllerSession)
+      check()
+      if (live.exceptionDetails || live.result?.value !== true) throw new Error('capture stream is not live')
+      started = true
+      this.active = { targetId: target.targetId }
       this.failures = 0
-      // freeze page-visible semantics while captured: some pages pause
-      // themselves on visibilitychange even though frames are flowing
-      await cdp.send('Runtime.evaluate', {
-        expression: `(() => {
-          if (window.__blVisFrozen) return
-          window.__blVisFrozen = true
-          try {
-            Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' })
-            Object.defineProperty(document, 'hidden', { configurable: true, get: () => false })
-          } catch {}
-        })()`,
-      }, targetSession).catch(() => {})
       log(`capture keep-alive engaged for ${target.targetId.slice(0, 8)} (native full speed while hidden)`)
-      // preserve the user's minimize + their original window position so
-      // dock-click still restores the window exactly where it was
-      if (reMinimizeAfter && win.windowId !== undefined) {
-        await cdp.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'minimized' } })
-        await cdp.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { left: origLeft, top: origTop } })
-        log(`window re-minimized after capture; original position preserved`)
+    } catch (err) {
+      if (allowed()) {
+        this.failures++
+        this.cooldownUntil = Date.now() + 15_000
+        this.disabled = this.failures >= 3
+        warn(`capture keep-alive failed: ${(err as Error).message}; failure #${this.failures}`)
       }
-    } else {
-      const meV = this.getHealth().find(t => t.targetId === target.targetId)?.visibility
-      this.failures++
-      warn(`capture keep-alive failed (started=${started}, vis=${meV}); failure #${this.failures}`)
-      await cdp.send('Runtime.evaluate', { expression: 'window.stopCapture()' }, controllerSession).catch(() => {})
-      // restore the tab title even on failure, or it stays BACKLIGHT_AGENT forever
-      await cdp.send('Runtime.evaluate', {
-        expression: `(() => { if (window.__blOrigTitle !== undefined) { document.title = String(window.__blOrigTitle); delete window.__blOrigTitle } })()`,
-      }, targetSession).catch(() => {})
-      if (this.failures >= 3) {
-        this.disabled = true
-        warn('capture keep-alive disabled for this session after repeated failures (pump/shim remain)')
+    } finally {
+      if (!started && controllerSession) await this.stopStream(cdp, controllerSession)
+      if (titleTouched && targetSession) await this.restoreTitle(cdp, targetSession)
+      if (switched && allowed()) {
+        await this.send(cdp, 'Target.activateTarget', { targetId: target.targetId }).catch(() => {})
       }
-      this.cooldownUntil = Date.now() + 15_000
+      if (parked && windowId !== undefined && current()) {
+        // Only undo our own offscreen move. A human may have restored/moved
+        // this window while setup or cleanup was awaiting CDP.
+        const now = await this.send(cdp, 'Browser.getWindowBounds', { windowId }).catch(() => null)
+        if (now?.bounds.windowState === 'normal' && now.bounds.left === parked.left && now.bounds.top === parked.top) {
+          if (allowed()) await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } }).catch(() => {})
+          // Recheck after the minimize await: takeover owns subsequent moves.
+          if (allowed()) await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { left: original.left, top: original.top } }).catch(() => {})
+          else if (this.paused && current()) {
+            const latest = await this.send(cdp, 'Browser.getWindowBounds', { windowId }).catch(() => null)
+            if (latest?.bounds.left === parked.left && latest.bounds.top === parked.top) {
+              await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { left: original.left, top: original.top } }).catch(() => {})
+            }
+          }
+        }
+      }
     }
   }
 
-  private async readOrigTitle(cdp: Cdp, targetId: string): Promise<string | null> {
-    try {
-      const session = await this.sessionFor(cdp, targetId)
-      const r = await cdp.send<{ result?: { value?: string } }>('Runtime.evaluate', {
-        expression: 'String(window.__blOrigTitle ?? "")',
-        returnByValue: true,
-      }, session)
-      return r.result?.value ?? null
-    } catch { return null }
+  private async restoreTitle(cdp: Cdp, session: string) {
+    await this.send(cdp, 'Runtime.evaluate', {
+      expression: `(() => { if (window.__blOrigTitle !== undefined) { if (document.title === ${JSON.stringify(CAPTURE_TITLE)}) document.title = String(window.__blOrigTitle); delete window.__blOrigTitle } })()`,
+    }, session).catch(() => {})
   }
+
+  private async stopStream(cdp: Cdp, session: string) {
+    await this.send(cdp, 'Runtime.evaluate', {
+      expression: 'window.__blCaptureAttempt = null; window.stopCapture()',
+    }, session).catch(() => {})
+  }
+
   private async release(reason: string): Promise<void> {
-    const ctx = this.getContext()
-    const active = this.active
+    const cdp = this.cdp
     this.active = null
-    if (!ctx || !active) return
-    const { cdp } = ctx
     debug(`capture keep-alive release (${reason})`)
-    if (this.controller) {
-      await cdp.send('Runtime.evaluate', { expression: 'window.stopCapture()' }, this.controller.sessionId).catch(() => {})
-    }
-    try {
-      const session = await this.sessionFor(cdp, active.targetId)
-      await cdp.send('Runtime.evaluate', {
-        expression: `(() => {
-          if (window.__blOrigTitle !== undefined) { document.title = String(window.__blOrigTitle); delete window.__blOrigTitle }
-          if (window.__blVisFrozen) { delete document.visibilityState; delete document.hidden; window.__blVisFrozen = false }
-        })()`,
-      }, session)
-    } catch { /* target gone */ }
+    if (cdp && this.controller) await this.stopStream(cdp, this.controller.sessionId)
   }
 
   private async sessionFor(cdp: Cdp, targetId: string): Promise<string> {
     const cached = this.targetSessions.get(targetId)
     if (cached) return cached
-    const sessionId = await cdp.attach(targetId)
-    this.targetSessions.set(targetId, sessionId)
+    const sessionId = await bounded(cdp.attach(targetId))
+    if (this.getContext()?.cdp === cdp) this.targetSessions.set(targetId, sessionId)
     return sessionId
   }
 
-  private async ensureController(cdp: Cdp): Promise<string | null> {
+  private async ensureController(cdp: Cdp, check: () => void): Promise<string | null> {
     const ctx = this.getContext()
     if (!ctx) return null
     if (this.controller) {
       // verify still alive
       const ctl = this.controller
-      const { targetInfos } = await cdp.send<{ targetInfos: any[] }>('Target.getTargets')
+      const { targetInfos } = await this.send<{ targetInfos: any[] }>(cdp, 'Target.getTargets')
       const alive = targetInfos.find(t => t.targetId === ctl.targetId && t.type === 'page')
+      check()
       if (alive) return ctl.sessionId
       this.controller = null
     }
     try {
-      const { targetId } = await cdp.send<{ targetId: string }>('Target.createTarget', {
+      check()
+      const { targetId } = await this.send<{ targetId: string }>(cdp, 'Target.createTarget', {
         url: ctx.controllerUrl,
         background: true,
       })
+      check()
       await sleep(800)
-      const sessionId = await cdp.attach(targetId)
-      await cdp.send('Page.enable', {}, sessionId)
+      check()
+      const sessionId = await bounded(cdp.attach(targetId))
+      check()
+      await this.send(cdp, 'Page.enable', {}, sessionId)
+      check()
       this.controller = { targetId, sessionId }
       debug(`controller tab created: ${targetId.slice(0, 8)}`)
       return sessionId
@@ -278,3 +305,12 @@ export class CaptureKeepAlive {
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+async function bounded<T>(promise: Promise<T>, ms = 1500): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('capture operation timed out')), ms)
+    })])
+  } finally { if (timer) clearTimeout(timer) }
+}

@@ -1,0 +1,112 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+import vm from 'node:vm'
+import { CaptureKeepAlive, CAPTURE_TITLE } from '../src/capture.ts'
+import type { Cdp } from '../src/cdp.ts'
+import type { TargetHealth } from '../src/inject.ts'
+
+function fixture(t: any) {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const page = { document: { title: 'Original' }, window: {} as any }
+  const calls: { method: string; params: any; session?: string }[] = []
+  let bounds = { windowState: 'minimized', left: 50, top: 60, width: 1200 }
+  let hook: (method: string, params: any) => any = () => undefined
+  const fake = {
+    closed: false,
+    attach: async (id: string) => `session-${id}`,
+    send: async (method: string, params: any = {}, session?: string) => {
+      calls.push({ method, params, session })
+      const intercepted = hook(method, params)
+      if (intercepted !== undefined) return intercepted
+      if (method === 'Target.createTarget') return { targetId: 'controller' }
+      if (method === 'Target.getTargets') return { targetInfos: [{ targetId: 'controller', type: 'page' }] }
+      if (method === 'Browser.getWindowForTarget') return { windowId: 1 }
+      if (method === 'Browser.getWindowBounds') return { bounds: { ...bounds } }
+      if (method === 'Browser.setWindowBounds') { Object.assign(bounds, params.bounds); return {} }
+      if (method === 'Runtime.evaluate') {
+        if (params.expression.includes('screen.avail')) return { result: { value: '{"al":0,"at":25,"ah":900}' } }
+        if (session === 'session-page') return { result: { value: vm.runInNewContext(params.expression, page) } }
+        return { result: { value: params.expression.includes('startCapture') ? 'ok' : true } }
+      }
+      return {}
+    },
+  }
+  let cdp = fake as unknown as Cdp
+  const capture = new CaptureKeepAlive(() => ({ cdp, controllerUrl: 'http://localhost/controller' }),
+    () => [{ targetId: 'page', title: 'Original', url: 'https://example.com', visibility: 'hidden' } as TargetHealth])
+  async function settle(promise: Promise<unknown>, limit = 30000) {
+    let done = false
+    promise.finally(() => { done = true })
+    for (let ms = 0; ms < limit && !done; ms += 50) {
+      await Promise.resolve(); await Promise.resolve()
+      t.mock.timers.tick(50)
+    }
+    assert.ok(done, 'operation must finish within bounded time')
+    await promise
+  }
+  return { capture, calls, page, bounds, settle, setHook: (h: typeof hook) => { hook = h }, restart: () => { cdp = { ...fake } as unknown as Cdp } }
+}
+
+test('hidden DOM can have a successful capture; title restored and visibility remains honest', async t => {
+  const f = fixture(t)
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.equal(f.capture.activeTargetId(), 'page')
+  assert.equal(f.page.document.title, 'Original')
+  assert.equal(Object.hasOwn(f.page.document, 'visibilityState'), false)
+  assert.equal(f.bounds.windowState, 'minimized')
+  assert.equal(f.bounds.left, 50)
+})
+
+for (const stage of ['Browser.getWindowForTarget', 'Target.activateTarget', 'Input.dispatchMouseEvent']) {
+  test(`takeover at ${stage} cleans title and preserves user window`, async t => {
+    const f = fixture(t)
+    let paused: Promise<void> | undefined
+    f.setHook(method => {
+      if (method === stage && !paused) {
+        paused = f.capture.setPaused(true)
+        Object.assign(f.bounds, { windowState: 'normal', left: 200, top: 250 })
+      }
+    })
+    await f.capture.tick(); await f.settle(f.capture.tick())
+    if (paused) await f.settle(paused)
+    assert.ok(paused)
+    assert.equal(f.page.document.title, 'Original')
+    assert.equal(f.bounds.windowState, 'normal')
+    assert.equal(f.bounds.left, 200)
+    assert.equal(f.calls.filter(c => c.method === 'Input.dispatchMouseEvent').length, stage === 'Input.dispatchMouseEvent' ? 1 : 0)
+  })
+}
+
+test('setup error restores title and minimized window position', async t => {
+  const f = fixture(t)
+  f.setHook(method => method === 'Input.dispatchMouseEvent' ? Promise.reject(new Error('input failed')) : undefined)
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.equal(f.page.document.title, 'Original')
+  assert.equal(f.bounds.windowState, 'minimized')
+  assert.equal(f.bounds.left, 50)
+})
+
+test('hanging Runtime promise cannot block takeover or later disrupt it', async t => {
+  const f = fixture(t)
+  let paused: Promise<void> | undefined
+  f.setHook((method, params) => {
+    if (method === 'Runtime.evaluate' && params.awaitPromise) {
+      paused = f.capture.setPaused(true)
+      Object.assign(f.bounds, { windowState: 'normal', left: 200 })
+      return new Promise(() => {})
+    }
+  })
+  await f.capture.tick(); const tick = f.capture.tick()
+  await f.settle(tick)
+  assert.ok(paused); await f.settle(paused)
+  assert.equal(f.bounds.windowState, 'normal')
+  assert.equal(f.page.document.title, 'Original')
+})
+
+test('new CDP resets active capture and controller sessions', async t => {
+  const f = fixture(t)
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  f.restart()
+  await f.settle(f.capture.tick()); await f.settle(f.capture.tick())
+  assert.equal(f.calls.filter(c => c.method === 'Target.createTarget').length, 2)
+})
