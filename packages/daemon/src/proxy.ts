@@ -13,7 +13,7 @@ import { listChromeProfiles, importProfile } from './import.ts'
 import { ensureChromiumForExtensions } from './browser.ts'
 import { brandBundle } from './brand.ts'
 import { paths } from './paths.ts'
-import { activateBrowser, hideBrowser } from './native.ts'
+import { activateBrowser, hideBrowser, browserAppState } from './native.ts'
 import type { FramePumpSupervisor } from './windows.ts'
 import { TapState, tapFrame } from './tap.ts'
 import { log, debug } from './log.ts'
@@ -259,7 +259,14 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     }
     case 'POST /api/bg': {
       await deps.capture.setPaused(false)
-      const n = deps.manager.running ? await deps.supervisor.collapseAll() : 0
+      // A hidden app needs the normal -> minimized cycle repeated for the
+      // miniaturize (and renderer visibility) to actually apply; the repeat is
+      // invisible there. A visible app minimizes on the first cycle.
+      let appHidden = false
+      if (deps.manager.current) {
+        try { appHidden = (await browserAppState(deps.manager.current.pid)).hidden } catch { /* unknown: single cycle */ }
+      }
+      const n = deps.manager.running ? await deps.supervisor.collapseAll(appHidden) : 0
       if (deps.manager.current) await hideBrowser(deps.manager.current.pid)
       json(res, 200, { ok: true, collapsed: n })
       return

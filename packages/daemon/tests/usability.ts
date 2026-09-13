@@ -1,6 +1,6 @@
 import { backlightFixture } from './backlight-fixture.ts'
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -46,6 +46,24 @@ try {
   const page = (await pages())[0]
   const session = await cdp.attach(page.targetId)
   const { windowId } = await cdp.send('Browser.getWindowForTarget', { targetId: page.targetId })
+  // Root-cause evidence for minimize issues: target, windowId, CDP bounds and
+  // the real NSRunningApplication hidden/active state.
+  const evidence = async (label: string): Promise<string> => {
+    const parts: string[] = [label]
+    const { pid } = (await api('status')).browser
+    for (const p of await pages()) {
+      const wid = await cdp!.send<{ windowId: number }>('Browser.getWindowForTarget', { targetId: p.targetId }).catch(() => ({ windowId: -1 }))
+      const bounds = wid.windowId >= 0
+        ? (await cdp!.send<{ bounds: unknown }>('Browser.getWindowBounds', { windowId: wid.windowId }).catch(() => null))?.bounds
+        : null
+      parts.push(`target=${p.targetId.slice(0, 8)} window=${wid.windowId} bounds=${JSON.stringify(bounds)}`)
+    }
+    const native = path.join(tmp, 'bin', 'app-control')
+    if (fs.existsSync(native)) {
+      try { parts.push(`native=${execFileSync(native, ['state', String(pid)], { encoding: 'utf8' }).trim()}`) } catch { /* ignore */ }
+    }
+    return parts.join('; ')
+  }
   await api('show', { maximize: true, activate: false })
   let { bounds } = await cdp.send('Browser.getWindowBounds', { windowId })
   assert.ok(bounds.left >= 0 && bounds.top < 900, 'show brings startup window onscreen')
@@ -57,14 +75,32 @@ try {
   assert.equal((await api('status')).control, 'human')
   console.log('PASS human takeover: maximize, open without moving window, preserve draft')
   await api('bg', {})
-  await waitFor(async () => (await cdp!.send('Browser.getWindowBounds', { windowId })).bounds.windowState === 'minimized', 'native minimize completes')
+  let minimized = false
+  const minimizeDeadline = Date.now() + 15000
+  while (Date.now() < minimizeDeadline) {
+    const bounds = (await cdp.send('Browser.getWindowBounds', { windowId })).bounds
+    if (bounds.windowState === 'minimized') { minimized = true; break }
+    await sleep(250)
+  }
+  if (!minimized) {
+    console.error(`MINIMIZE EVIDENCE: ${await evidence('native minimize did not complete')}`)
+    throw new Error('native minimize completes')
+  }
+  console.log(`PASS native minimize: ${await evidence('background state')}`)
   await api('open', { url: siteUrl + '/three' })
   assert.equal((await cdp.send('Browser.getWindowBounds', { windowId })).bounds.windowState, 'minimized', 'opening while minimized stays minimized')
   await waitFor(async () => (await pages()).length === 3, 'three pages')
   for (const p of await pages()) {
     const sid = await cdp.attach(p.targetId)
+    const wid: { windowId: number } = await cdp.send<{ windowId: number }>('Browser.getWindowForTarget', { targetId: p.targetId })
+    assert.equal((await cdp.send('Browser.getWindowBounds', { windowId: wid.windowId })).bounds.windowState, 'minimized', `page ${p.targetId.slice(0, 8)} window stays minimized`)
     await waitFor(async () => await cdp!.evaluateOnSession(sid, 'window.polls > 3'), 'background network polling')
-    assert.equal(await cdp.evaluateOnSession(sid, 'document.hidden'), true)
+    const hidden: boolean = await cdp.evaluateOnSession(sid, 'document.hidden')
+    const polls: number = await cdp.evaluateOnSession(sid, 'window.polls')
+    if (hidden !== true) {
+      console.error(`HIDDEN EVIDENCE: target=${p.targetId} window=${wid.windowId} hidden=${hidden} polls=${polls}; ${await evidence('document.hidden was false')}`)
+    }
+    assert.equal(hidden, true, `page ${p.targetId.slice(0, 8)} stays hidden while minimized`)
   }
   console.log('PASS three minimized pages load and poll fresh network data')
 } catch (e) {

@@ -31,6 +31,18 @@ export async function hideBrowser(pid: number): Promise<void> {
   await run(await nativeControl(), ['hide', String(pid)])
 }
 
+/** NSRunningApplication state, used to pick the reliable minimize sequence. */
+export async function browserAppState(pid: number): Promise<{ active: boolean; hidden: boolean }> {
+  if (pid <= 0) throw new Error('managed browser PID is unavailable')
+  const binary = await nativeControl()
+  return new Promise((resolve, reject) => {
+    execFile(binary, ['state', String(pid)], { timeout: 10_000 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr || err.message))
+      try { resolve(JSON.parse(stdout)) } catch { reject(new Error(`unexpected app state output: ${stdout.trim()}`)) }
+    })
+  })
+}
+
 export async function startTray(): Promise<void> {
   // Isolated tests/development daemons do not install a desktop-wide observer.
   if (process.env.BACKLIGHT_TRAY === '0' || (process.env.BACKLIGHT_HOME && process.env.BACKLIGHT_TRAY !== '1')) return

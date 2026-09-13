@@ -3,6 +3,8 @@ import type { TargetHealth } from './inject.ts'
 import { loadSettings } from './store.ts'
 import { debug, log } from './log.ts'
 
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
 export interface WindowStateInfo {
   windowId: number
   state: string
@@ -156,7 +158,7 @@ export class FramePumpSupervisor {
 
   /** Collapse: 'minimize' mode (default) = native minimize (dock-click restores
    * natively; capture keep-alive keeps pages fast). 'corner' = 2px sliver. */
-  async collapseAll(): Promise<number> {
+  async collapseAll(appHidden = false): Promise<number> {
     this.humanMode = false
     const ctx = this.getContext()
     if (!ctx) return 0
@@ -164,20 +166,67 @@ export class FramePumpSupervisor {
     const mode = this.settings().collapseMode
     for (const windowId of await this.collectWindowIds()) {
       try {
-        if (mode === 'minimize') {
-          const { bounds } = await ctx.cdp.send<{ bounds: { windowState?: string } }>('Browser.getWindowBounds', { windowId })
-          if (bounds.windowState === 'maximized' || bounds.windowState === 'fullscreen') {
-            await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
-          }
-          await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } })
-        } else {
-          await this.cornerWindow(ctx.cdp, windowId)
-        }
-        n++
+        const ok = mode === 'minimize' ? await this.minimizeWindow(ctx.cdp, windowId, appHidden) : await this.cornerWindow(ctx.cdp, windowId)
+        if (ok) n++
       } catch { /* gone */ }
     }
     log(`collapsed ${n} window(s) (${mode}); pages keep running at full speed`)
     return n
+  }
+
+  /**
+   * Native minimize, verified. macOS quirks measured on Chrome for Testing 153:
+   * - a minimize request issued while the window leaves maximized/fullscreen is
+   *   dropped, so settle to normal and wait for that state first;
+   * - when the app is hidden (`open -g -j` background launches), a single
+   *   request updates the reported window state while AppKit never really
+   *   miniaturizes: the active tab keeps `document.hidden === false`. The full
+   *   normal -> minimized cycle has to run twice (measured: one cycle fails,
+   *   two succeed). Pass `settleRepeat` for hidden apps — the repeat is
+   *   invisible because the app is hidden anyway.
+   * Returns false if the window never reaches the minimized state.
+   */
+  async minimizeWindow(cdp: Cdp, windowId: number, settleRepeat = false): Promise<boolean> {
+    const cycles = settleRepeat ? 2 : 1
+    for (let cycle = 0; cycle < cycles; cycle++) {
+      if (cycle > 0) {
+        await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } }).catch(() => {})
+        await sleep(300)
+      }
+      const initial = await this.windowBounds(cdp, windowId)
+      if (initial === null) return false
+      if (initial.windowState === 'minimized') return true
+      if (initial.windowState === 'maximized' || initial.windowState === 'fullscreen') {
+        await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } }).catch(() => {})
+        for (let i = 0; i < 20; i++) {
+          const b = await this.windowBounds(cdp, windowId)
+          if (b === null) return false
+          if (b.windowState === 'normal') break
+          await sleep(50)
+        }
+        await sleep(300)
+      }
+      await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } }).catch(() => {})
+      for (let i = 0; i < 20; i++) {
+        const b = await this.windowBounds(cdp, windowId)
+        if (b === null) return false
+        if (b.windowState === 'minimized') break
+        await sleep(50)
+      }
+      if (cycle + 1 < cycles) await sleep(500)
+    }
+    const final = await this.windowBounds(cdp, windowId)
+    if (final?.windowState !== 'minimized') debug(`window ${windowId}: minimize did not stick`)
+    return final?.windowState === 'minimized'
+  }
+
+  private async windowBounds(cdp: Cdp, windowId: number): Promise<{ windowState?: string } | null> {
+    try {
+      const { bounds } = await cdp.send<{ bounds: { windowState?: string } }>('Browser.getWindowBounds', { windowId })
+      return bounds
+    } catch {
+      return null
+    }
   }
 
   /** Move one window to the offscreen corner. Returns true if moved. */
