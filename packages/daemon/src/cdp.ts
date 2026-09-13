@@ -64,9 +64,17 @@ export class Cdp {
     const id = ++this.nextId
     const payload: Params = { id, method, params }
     if (sessionId) payload.sessionId = sessionId
-    this.ws.send(JSON.stringify(payload))
     return new Promise<T>((resolve, reject) => {
+      // Register before sending: a fast response can be handled while ws.send
+      // is still on the stack (proxies, local endpoints, synchronous test
+      // sockets), and a dropped response would hang the caller forever.
       this.waiters.set(id, { resolve, reject })
+      try {
+        this.ws.send(JSON.stringify(payload))
+      } catch (err) {
+        this.waiters.delete(id)
+        reject(err instanceof Error ? err : new Error(String(err)))
+      }
       // no per-call timeout by design: CDP responses can legitimately be slow (screenshots)
     })
   }

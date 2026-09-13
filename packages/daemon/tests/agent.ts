@@ -19,6 +19,25 @@ backlightFixture(TMP)
 const PORT = 9439
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
+// A lost response must fail this test instead of hanging it forever. Long
+// legitimate operations (screenshots) still get a generous bound.
+const CDP_TIMEOUT = 15_000
+async function bounded<T>(work: Promise<T>, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`CDP timeout after ${CDP_TIMEOUT}ms: ${label}`)), CDP_TIMEOUT)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+const send = <T = any>(cdp: Cdp, method: string, params: Record<string, unknown> = {}, sessionId?: string): Promise<T> =>
+  bounded(cdp.send<T>(method, params, sessionId), method)
+
 const PAGE = `data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html>
 <html><head><meta charset="utf-8"><title>BL Agent</title></head>
 <body style="font:40px monospace;background:#101418;color:#39d98a">
@@ -70,13 +89,13 @@ async function main() {
     console.log(`proxy rewrite ok: ${meta.webSocketDebuggerUrl}`)
     const cdp = await Cdp.connect(meta.webSocketDebuggerUrl)
 
-    const { targetInfos } = await cdp.send<{ targetInfos: any[] }>('Target.getTargets')
+    const { targetInfos } = await send<{ targetInfos: any[] }>(cdp, 'Target.getTargets')
     const page = targetInfos.find(t => t.type === 'page' && t.title === 'BL Agent')!
-    const sessionId = await cdp.attach(page.targetId)
-    await cdp.send('Page.enable', {}, sessionId)
+    const sessionId = await bounded(cdp.attach(page.targetId), 'Target.attachToTarget')
+    await send(cdp, 'Page.enable', {}, sessionId)
 
     // instrument the halo so we can count pulses (proxy calls it via the daemon session)
-    await cdp.send('Runtime.evaluate', {
+    await send(cdp, 'Runtime.evaluate', {
       expression: `(() => { const orig = window.__backlightPulse; window.__pulses = 0;
         window.__backlightPulse = () => { window.__pulses++; orig && orig() } })()`,
     }, sessionId)
@@ -85,18 +104,18 @@ async function main() {
     await sleep(2500)
 
     // ---- AI does things through the proxy ----
-    const evalRes = await cdp.send<{ result: { value: any } }>('Runtime.evaluate', {
+    const evalRes = await send<{ result: { value: any } }>(cdp, 'Runtime.evaluate', {
       expression: 'document.getElementById("b").textContent', returnByValue: true,
     }, sessionId)
     const click = { type: 'mousePressed', x: 30, y: 30, button: 'left', clickCount: 1 } as const
-    await cdp.send('Input.dispatchMouseEvent', click, sessionId)
-    await cdp.send('Input.dispatchMouseEvent', { ...click, type: 'mouseReleased' }, sessionId)
-    const afterClick = await cdp.send<{ result: { value: any } }>('Runtime.evaluate', {
+    await send(cdp, 'Input.dispatchMouseEvent', click, sessionId)
+    await send(cdp, 'Input.dispatchMouseEvent', { ...click, type: 'mouseReleased' }, sessionId)
+    const afterClick = await send<{ result: { value: any } }>(cdp, 'Runtime.evaluate', {
       expression: 'document.getElementById("b").textContent', returnByValue: true,
     }, sessionId)
 
     // transparency: captureScreenshot + navigation event stream work
-    const shot = await cdp.send<{ data: string }>('Page.captureScreenshot', { format: 'png' }, sessionId)
+    const shot = await send<{ data: string }>(cdp, 'Page.captureScreenshot', { format: 'png' }, sessionId)
     console.log(`through proxy: evaluate="${evalRes.result.value}" afterClick="${afterClick.result.value}" shotBytes=${shot.data?.length ?? 0}`)
     await sleep(1200)
 
@@ -110,7 +129,7 @@ async function main() {
     console.log(`activity: ${evs.length} ai-command events, evaluate=${hasEval}, input=${hasInput}, attributedToPage=${attributed}`)
 
     // ---- halo fired? ----
-    const pulses = await cdp.send<{ result: { value: number } }>('Runtime.evaluate', {
+    const pulses = await send<{ result: { value: number } }>(cdp, 'Runtime.evaluate', {
       expression: 'window.__pulses ?? -1', returnByValue: true,
     }, sessionId).then(r => r.result.value)
     console.log(`halo pulses observed in page: ${pulses}`)
