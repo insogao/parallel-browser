@@ -15,15 +15,19 @@
 
 - 图标：已替换运行时 app.icns，移除覆盖图标的 CFBundleIconName；用户已确认图标正确。运行中图标证据见 artifacts/backlight-running-icon.png。
 - Dock 恢复：修复托盘忽略 dev.backlight.browser，以及同一品牌另一实例截获激活的问题；监听 activate/unhide，恢复被贴角或最小化的受管窗口。已在已安装 Backlight 上用 macOS open -a 重开路径验证恢复成功；未声称完成物理鼠标点击验收。
-- 人工接手：show 暂停 capture 的窗口操作，支持最大化；后台打开新页不移动当前人工窗口；capture 增加取消和超时保护。
-- 扩展：原生 sidePanel 调试、指定扩展热重载、面板与网页通信、持久化示例；DevTools 通过 CDP 代理连接，修复初始消息丢失。
+- 人工接手：show 暂停 capture 的窗口操作，支持最大化；后台打开新页不移动当前人工窗口；capture 增加取消和超时保护。人工接手与 capture setup 竞态时，controller 不再停留在前台；用户竞态中选择的新标签保持不变（`tests/capture-unit.ts`）。
+- 扩展：原生 sidePanel 调试、指定扩展热重载、面板与网页通信、持久化示例；DevTools 通过 CDP 代理连接，修复初始消息丢失。侧栏显式绑定请求网页的 windowId，双窗口同扩展 3/3 无串窗（`tests/extension-dev-unit.ts` + `tests/extensions.ts`）。
 - 观测：修复多条 rAF 调度链；区分原生帧率与补偿回调，不伪造 document.hidden。
-- **验证状态：此前混用 Chrome/CfT 的全套测试虽通过，但不作为用户最新要求下的验收。Backlight 专用全套测试正在重跑，最终结果见开发记录。**
-- 源码尚有本轮未提交改动。现有日常 daemon 不会自动加载源码修改，完整更新需要后续重启；不要在用户使用期间擅自终止其浏览器。
+- 最小化：查清“CDP 报告 minimized 但 AppKit 未真正最小化”的根因；应用隐藏时执行两次 normal→minimized 循环，`document.hidden === true`、三页持续轮询（`tests/usability.ts` 连续通过，证据含 target/windowId/bounds/native 状态）。
+- CDP：`Cdp.send` 先注册 waiter 再发送，修复快速响应被丢弃导致的永久挂起；`tests/cdp-unit.ts` 3 个确定性测试。
+- **验证状态（2026-09-13 18:50，品牌化 Backlight）：`pnpm --filter @backlight/daemon test` 通过 —— 单元 20/20 + brand 11 项 + spike/supervisor/extensions/agent/background/usability 全部 PASS；6 条 `[Backlight acceptance]` 路径均为 `.../Backlight.app/...`，sha256 一致，无临时进程遗留。**
+- 本轮修复已全部提交（HEAD `f5e9651`）。日常 daemon 不会自动加载源码，需用户下次安全重启后生效；不要在用户使用期间擅自终止其浏览器。
 
 ## 测试规范
 
 入口：`pnpm --filter @backlight/daemon test`，类型检查：`pnpm -r --if-present run check`。
+
+单元测试为 `tests/*-unit.ts`（capture、windows、extension-dev、cdp、proxy、targets 等）加 `tests/brand.ts`。集成入口 `tests/agent.ts` 的每次 CDP 调用有 15s 上限，回归失败快速报错而非无限挂起；生产代码不设短超时。
 
 所有会启动浏览器的测试（含 probe）使用 `packages/daemon/tests/backlight-fixture.ts`：
 
@@ -54,15 +58,17 @@ node packages/cli/bin/backlight.js inspect <targetId>
 - windows.ts、capture.ts、inject.ts：窗口、捕获保活、健康状态。
 - extension-dev.ts、extensions.ts：原生侧栏与热重载。
 - proxy.ts、cdp.ts：API、Dashboard、DevTools 代理。
-- packages/daemon/tests/：单元与 Backlight 集成验收。
+- packages/daemon/tests/：单元与 Backlight 集成验收（capture-unit、windows-unit、extension-dev-unit、cdp-unit 覆盖本轮修复）。
 - docs/development/2026-09-13.md：本轮开发记录。
 
 ## 能力边界与未完成项
 
 - 普通后台网络轮询与单目标捕获保活是不同能力。当前 capture 同时只保活一个目标，不保证所有后台标签原生 60fps；页面自身也可依据隐藏状态停工。
-- 捕获建立需要短暂操作窗口；人工接手时暂停。仍需持续检查取消时标签选择是否自然。
-- sidePanel 调试会关闭并重新打开当前窗口面板，以准确定位目标；面板临时状态可能丢失，storage 数据保留。
+- 角落（corner）模式下窗口几乎完全离屏，Chromium 不产生合成帧：默认 `Page.captureScreenshot` 可能永久等待，`fromSurface:false` 也不保证成功。后台截图请使用 capture keep-alive（spike 实测 57–78ms）或可见窗口；AI 客户端在后台截屏前应先恢复窗口或依赖捕获保活。
+- 人工接手中断 capture setup（含 controller 已激活、或成功后暂停的竞态）时回到原网页；若用户已切换其它标签则保留用户选择。
+- 应用隐藏时窗口需要两次 normal→minimized 循环才会真正隐藏（AppKit 与 CDP 状态语义差异）；应用可见时一次即可。
+- sidePanel 调试会关闭并重新打开当前窗口面板，以准确定位目标；面板临时状态可能丢失，storage 数据保留。隐藏面板的 WebContents 会被复用，归属用 `chrome.windows.getCurrent()` 验证。
 - 原始 CDP 客户端仍可操作窗口；AI 应尊重 status.control 的人工接手状态。
-- Dock 真鼠标点击、多窗口同扩展面板归属、复杂登录站点兼容性仍需补充验收。
+- Dock 真鼠标点击、复杂登录站点兼容性仍需补充验收；多窗口同扩展面板归属已由双窗口集成测试覆盖（3/3）。
 - 不对 Chromium 重签名，避免破坏 JIT 权限。可执行文件内部保留引擎原名，应用品牌为 Backlight。
 - Node 25 原生 TypeScript，禁止 enum/构造函数参数属性等需转换语法。
