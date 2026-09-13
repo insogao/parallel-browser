@@ -11,7 +11,7 @@ import { createServer } from './proxy.ts'
 import { loadSettings } from './store.ts'
 import { error, initFileLogging, log } from './log.ts'
 import { FramePumpSupervisor } from './windows.ts'
-import { browserAppState, hideBrowser, startTray } from './native.ts'
+import { activateBrowser, browserAppState, hideBrowser, startTray, unhideBrowser } from './native.ts'
 
 export const VERSION = '0.1.0'
 
@@ -73,6 +73,8 @@ async function main() {
     pulse,
     appState: browserAppState,
     hideBrowser,
+    unhideBrowser,
+    activateBrowser,
   })
 
   extensions.startWatching((files) => {

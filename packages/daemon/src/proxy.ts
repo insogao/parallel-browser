@@ -13,7 +13,7 @@ import { listChromeProfiles, importProfile } from './import.ts'
 import { ensureChromiumForExtensions } from './browser.ts'
 import { brandBundle } from './brand.ts'
 import { paths } from './paths.ts'
-import { activateBrowser } from './native.ts'
+
 import type { FramePumpSupervisor } from './windows.ts'
 import { TapState, tapFrame } from './tap.ts'
 import { log, debug } from './log.ts'
@@ -32,6 +32,8 @@ export interface ServerDeps {
   /** native app helpers, injectable so unit tests never touch the OS */
   appState: (pid: number) => Promise<{ active: boolean; hidden: boolean }>
   hideBrowser: (pid: number) => Promise<void>
+  unhideBrowser: (pid: number) => Promise<void>
+  activateBrowser: (pid: number) => Promise<void>
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
@@ -71,6 +73,36 @@ export function createServer(deps: ServerDeps): http.Server {
   const upstream = () => deps.manager.current?.upstreamPort ?? null
   const httpServer = http.createServer()
 
+  // Native app-visibility operations (hide/unhide/activate) are serialized in
+  // arrival order. Each op rechecks its control generation inside the critical
+  // section, so if bg entered native hide first a later show's unhide runs
+  // after it, and if show entered first a stale bg skips hiding entirely.
+  let nativeQueue: Promise<unknown> = Promise.resolve()
+  const nativeControl: NativeControl = {
+    op<T>(gen: number, work: () => Promise<T>): Promise<T | undefined> {
+      debug(`native op gen=${gen} current=${deps.supervisor.isControlCurrent(gen)}`)
+      const run = nativeQueue.catch(() => {}).then(async () => {
+        if (!deps.supervisor.isControlCurrent(gen)) {
+          debug(`native op gen=${gen} skipped (superseded)`)
+          return undefined
+        }
+        debug(`native op gen=${gen} running`)
+        return work()
+      })
+      nativeQueue = run.catch(() => {})
+      return run
+    },
+    /** Persist the visibility of the newest intent without forcing focus. */
+    async persist(gen: number, activate: boolean): Promise<void> {
+      const cur = deps.manager.current
+      if (!cur) return
+      await nativeControl.op(gen, async () => {
+        if (activate) await deps.activateBrowser(cur.pid)
+        else await deps.unhideBrowser(cur.pid)
+      })
+    },
+  }
+
   // ---- normal HTTP requests -------------------------------------------------
   httpServer.on('request', async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -91,7 +123,7 @@ export function createServer(deps: ServerDeps): http.Server {
         return
       }
       if (url.pathname.startsWith('/api/')) {
-        await handleApi(req, res, url, deps)
+        await handleApi(req, res, url, deps, nativeControl)
         return
       }
       if (url.pathname === '/json' || url.pathname === '/json/list' || url.pathname === '/json/new'
@@ -200,7 +232,13 @@ function pipeCdpSocket(req: http.IncomingMessage, socket: import('node:stream').
 
 // ---- API --------------------------------------------------------------------
 
-async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, url: URL, deps: ServerDeps) {
+/** Per-server serialization of native app-visibility operations. */
+interface NativeControl {
+  op<T>(gen: number, work: () => Promise<T>): Promise<T | undefined>
+  persist(gen: number, activate: boolean): Promise<void>
+}
+
+async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, url: URL, deps: ServerDeps, native: NativeControl) {
   const body = req.method === 'POST' || req.method === 'PUT' ? await readBody(req) : ''
   const payload = body ? (() => { try { return JSON.parse(body) } catch { return {} } })() : {}
   const route = `${req.method} ${url.pathname}`
@@ -250,6 +288,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return
     }
     case 'POST /api/stop': {
+      deps.supervisor.beginControl() // stop outranks any settling collapse
       deps.supervisor.stop()
       await deps.manager.stop()
       json(res, 200, { ok: true })
@@ -257,16 +296,18 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     }
     case 'POST /api/restart': {
       if (!deps.manager.running) return json(res, 409, { error: 'browser not running' })
+      deps.supervisor.beginControl() // restart outranks any settling collapse
       await deps.manager.restart(payload.reason ?? 'manual restart')
       json(res, 200, { ok: true })
       return
     }
     case 'POST /api/bg': {
-      await deps.capture.setPaused(false)
-      // Last user intent wins: this generation is superseded the moment a
-      // newer show/restore/launch arrives. Checked before every delayed step
-      // and again before hiding, so an old bg can never steal the window back.
+      // Last user intent wins: allocate the generation on route entry, before
+      // any await, so a show arriving while this request is parked cannot be
+      // outranked by a later allocation. Every delayed step and the native
+      // hide (in its own critical section) recheck it.
       const gen = deps.supervisor.beginControl()
+      await deps.capture.setPaused(false)
       // A hidden app needs the normal -> minimized cycle repeated for the
       // miniaturize (and renderer visibility) to actually apply; the repeat is
       // invisible there. A visible app minimizes on the first cycle.
@@ -275,18 +316,21 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         try { appHidden = (await deps.appState(deps.manager.current.pid)).hidden } catch { /* unknown: single cycle */ }
       }
       const n = deps.manager.running ? await deps.supervisor.collapseAll(appHidden, gen) : 0
+      if (deps.manager.current) {
+        const pid = deps.manager.current.pid
+        await native.op(gen, () => deps.hideBrowser(pid))
+      }
       const superseded = !deps.supervisor.isControlCurrent(gen)
-      if (deps.manager.current && !superseded) await deps.hideBrowser(deps.manager.current.pid)
       json(res, 200, { ok: true, collapsed: n, superseded })
       return
     }
     case 'POST /api/show':
     case 'POST /api/restore': {
-      deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
+      const gen = deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
       deps.supervisor.humanMode = true
       await deps.capture.setPaused(true)
-      const n = deps.manager.running ? await deps.supervisor.restoreAll(payload.maximize === true) : 0
-      if (deps.manager.current && payload.activate !== false) await activateBrowser(deps.manager.current.pid)
+      const n = deps.manager.running ? await deps.supervisor.restoreAll(payload.maximize === true, gen) : 0
+      await native.persist(gen, payload.activate !== false)
       json(res, 200, { ok: true, restored: n })
       return
     }
@@ -330,7 +374,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return
     }
     case 'POST /api/extensions/dev': {
-      deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
+      const gen = deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
       const name = String(payload.name ?? '')
       deps.extensionDev.entry(name)
       if (!deps.manager.running) {
@@ -346,8 +390,8 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         if (!targetId) targetId = (await cur.cdp.send('Target.createTarget', { url: payload.url, background: true })).targetId
       }
       if (!targetId) return json(res, 400, { error: 'select a website targetId or url' })
-      await deps.supervisor.restoreAll(payload.maximize === true)
-      if (payload.activate !== false) await activateBrowser(cur.pid)
+      await deps.supervisor.restoreAll(payload.maximize === true, gen)
+      await native.persist(gen, payload.activate !== false)
       const result = await deps.extensionDev.openPanel(name, targetId)
       json(res, 200, { ok: true, ...result })
       return
@@ -361,15 +405,15 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       if (!cur) return json(res, 409, { error: 'browser not running' })
       const target = (await deps.manager.listTabs()).find(t => t.targetId === payload.targetId)
       if (!target) return json(res, 404, { error: 'target is no longer available; refresh the target list' })
-      deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
+      const gen = deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
       deps.supervisor.humanMode = true
       await deps.capture.setPaused(true)
       // Go through our loopback proxy: Chromium rejects the frontend's
       // devtools:// Origin at its raw remote-debugging socket.
       const inspectorUrl = `devtools://devtools/bundled/inspector.html?ws=127.0.0.1:${req.socket.localPort}/devtools/page/${target.targetId}`
       const { targetId } = await cur.cdp.send('Target.createTarget', { url: inspectorUrl, newWindow: true })
-      await deps.supervisor.restoreAll()
-      if (payload.activate !== false) await activateBrowser(cur.pid)
+      await deps.supervisor.restoreAll(false, gen)
+      await native.persist(gen, payload.activate !== false)
       json(res, 200, { ok: true, targetId })
       return
     }

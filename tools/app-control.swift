@@ -11,6 +11,9 @@ case "state":
   print("{\"active\":\(app.isActive),\"hidden\":\(app.isHidden)}")
 case "hide":
   if !app.isHidden { _ = app.hide() }
+case "unhide":
+  // Show the app without activating/focusing it.
+  if app.isHidden { _ = app.unhide() }
 case "activate":
   app.unhide()
   guard app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps]) else { exit(1) }

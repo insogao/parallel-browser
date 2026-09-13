@@ -277,14 +277,15 @@ export class FramePumpSupervisor {
 
   /** Bring collapsed windows back: 'minimize' mode un-minimizes everything
    * (native dock-click semantics); 'corner' mode restores cornered positions. */
-  async restoreAll(maximize = false): Promise<number> {
-    this.beginControl() // newer intent: any in-flight collapse must stop
+  async restoreAll(maximize = false, gen: number = this.beginControl()): Promise<number> {
+    if (!this.isControlCurrent(gen)) return 0
     const ctx = this.getContext()
     if (!ctx) return 0
     this.humanMode = true
     const wa = await readWorkArea(ctx.cdp)
     let n = 0
     for (const windowId of await this.collectWindowIds()) {
+      if (!this.isControlCurrent(gen)) break
       try {
         const { bounds } = await ctx.cdp.send<{ bounds: any }>('Browser.getWindowBounds', { windowId })
         const orig = this.collapsed.get(windowId)
