@@ -1,6 +1,6 @@
 # Backlight 项目索引与交接
 
-更新时间：2026-09-13。此文件是当前状态入口；PLAN.md、DISCUSSION.md 中的早期结论仅作历史参考。
+更新时间：2026-09-15。项目地址：<https://github.com/insogao/parallel-browser>。此文件是当前状态入口；PLAN.md、DISCUSSION.md 中的早期结论仅作历史参考。
 
 ## 用户要求（后续开发必须遵守）
 

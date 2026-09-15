@@ -1,88 +1,199 @@
-# Backlight · 后台浏览器
+# Backlight · AI 与人协作的后台浏览器
 
-Backlight 是 macOS 上的 Chromium 浏览器监督器：AI 可通过本机 CDP 接口静默创建网页，用户可以从 Dock 或菜单栏展开窗口，辅助登录、扫码和插件调试。浏览器使用独立 profile，不修改用户平常使用的 Chrome。
+Backlight 是一个面向 AI Agent 与人类共同使用的 macOS 浏览器。AI 可以低干扰地创建和操作网页；需要登录、扫码或人工判断时，用户可以从 Dock 或菜单栏接手同一个浏览器窗口。
 
-## 使用
+项目地址：<https://github.com/insogao/parallel-browser>
 
-需要 pnpm、支持原生 TypeScript 的 Node（本机验证版本 25）以及 macOS Swift 编译工具。
+![Backlight 图标](artifacts/backlight-running-icon.png)
+
+## 开发理念
+
+Backlight 关注的是建立清楚的人机控制边界：
+
+- AI 的后台操作不应随意抢焦点、移动用户窗口或覆盖正在输入的内容。
+- 人工接手是正常流程。用户应该能直接打开、最大化浏览器，完成登录、扫码和交互，再交还给 Agent。
+- 浏览器自动化、扩展开发和人工操作使用同一个受管实例，避免测试环境与真实环境行为不一致。
+- 状态应当诚实可观测。健康面板区分原生帧率、逻辑调度和定时器，不伪造 `document.visibilityState`。
+- 能力边界必须写清楚。当前原生捕获保活同时覆盖一个目标，不宣称所有后台标签都能保持原生 60fps。
+
+## 功能特点
+
+- **静默打开网页**：默认通过后台 target 创建页面，不展开或移动人工窗口。
+- **后台持续加载**：最小化后，多标签页的网络请求和定时轮询可以继续；单个捕获目标可保持原生渲染。
+- **人工接手**：`show`、`show --maximize`、Dock 和菜单栏均可恢复受管窗口，用于登录或扫码。
+- **最后意图生效**：当 `bg` 与 `show` 并发时，较新的人工操作不会被较早的延迟最小化覆盖。
+- **原生扩展侧栏开发**：使用 Chromium `sidePanel`，可以在真实网页旁调试，而不是只查看孤立的扩展页面。
+- **定向热重载**：只重载指定的 unpacked 扩展，不重启浏览器，不清空网页草稿和扩展 storage。
+- **目标级 DevTools**：网页、原生侧栏和 Service Worker 都可以选择 target 后单独调试。
+- **AI 活动可见**：本地 Dashboard 展示运行状态、健康数据、扩展状态和 Agent 指令活动。
+- **独立品牌**：应用名称、bundle ID 和图标均与 Google Chrome 区分，使用独立 profile。
+
+## 它不是 Electron 套壳
+
+Backlight 没有使用 Electron，也没有把网页嵌入 Electron `BrowserWindow`。
+
+运行时由三部分组成：
+
+1. **品牌化 Chromium 应用**负责真实网页、登录态、扩展和 DevTools。
+2. **Node.js/TypeScript 监督器**负责启动 Chromium、CDP 代理、后台 target、窗口状态、捕获保活和开发 API。
+3. **Swift/AppKit 原生组件**负责菜单栏、应用隐藏/恢复、激活和 Dock 重开路由。
+
+```text
+AI / Playwright / CLI
+          │
+          ▼
+Node.js 监督器与 CDP 代理（127.0.0.1:9333）
+          │
+          ├── Chromium DevTools Protocol
+          ▼
+品牌化 Backlight.app（Chromium）
+          ▲
+          │
+Swift/AppKit 托盘与原生窗口控制
+```
+
+这种方案保留 Chromium 原生扩展、登录、sidePanel 和 DevTools 行为，同时允许监督器约束 AI 对窗口的干扰。项目不会对 Chromium 深度重签名，以免破坏 macOS 上的 JIT 权限。
+
+## 快速开始
+
+当前支持 macOS。开发环境需要 pnpm、支持原生 TypeScript 的 Node.js（当前验证 Node 25）和 Xcode/Swift 命令行工具。
 
 ```bash
+git clone https://github.com/insogao/parallel-browser.git
+cd parallel-browser
 pnpm install
-alias bl="node /Users/gaoshizai/work/ego/packages/cli/bin/backlight.js"
-bl launch https://example.com    # 后台启动，自动启动菜单栏托盘
-bl open https://example.org      # 开新页，保持已有窗口位置
-bl show                         # 展开窗口、进入人工接管
-bl show --maximize              # 展开并最大化
-bl bg                           # 最小化、隐藏应用，继续后台运行
+
+alias bl="node $PWD/packages/cli/bin/backlight.js"
+bl brand --name Backlight
+bl launch https://example.com
+```
+
+常用命令：
+
+```bash
+bl open https://example.org      # 静默创建后台页面
+bl show                          # 进入人工接手
+bl show --maximize               # 恢复并最大化
+bl bg                            # 最小化并隐藏，继续后台任务
 bl status
 bl health
+bl windows
 bl stop
 ```
 
-也可以点击 Backlight 的 Dock 图标，或使用菜单栏的“恢复窗口显示”。点击会路由到受管浏览器：即使 macOS 激活了同一品牌应用的另一个实例，也会将真正运行网页的窗口显示出来。用户自己的 Google Chrome 不参与此路由。
-
-控制台默认地址：[本机 Backlight 控制台](http://127.0.0.1:9333/)。包含窗口控制、扩展注册、侧栏开发、调试目标列表、后台健康度和活动记录。
-
-## 真实侧栏开发
-
-扩展需要在 manifest 中声明 `side_panel.default_path` 和 `sidePanel` 权限。示例位于 `examples/side-panel/`，支持读取网页、高亮标题和保存笔记。
-
-```bash
-bl ext add /Users/gaoshizai/work/ego/examples/side-panel --name demo
-bl ext dev demo http://127.0.0.1:9333/demo
-bl targets                     # 网页、扩展侧栏和后台脚本的 targetId
-bl inspect <targetId>          # 在独立窗口调试所选目标
-bl ext reload demo             # 只重载扩展
-bl ext ls
-bl ext rm demo
-```
-
-保存扩展文件后，Backlight 使用 Chromium 的 `Extensions.loadUnpacked` 更新该扩展，不重启浏览器、不刷新网页，保留网页中的未提交输入和扩展本地存储。内容脚本修改后需要手动刷新目标网页；侧栏重载后可再次执行 `ext dev`。错误会显示在控制台及活动记录中，不会偷偷改为重启浏览器。
-
-`ext dev` 会重新打开指定窗口的原生侧栏，并使用一个短暂的后台扩展页面发起打开操作。因此扩展页面代码可能额外初始化一次；临时页面随后关闭。侧栏临时内存状态可能随重新打开丢失，持久笔记应放入 `chrome.storage`。
-
-这些开发接口需要近期 Chromium / Chrome for Testing；已有 Google Chrome 实例不支持时会返回错误，请关闭后带扩展重新启动，或使用品牌化 CfT 引擎。
-
-## AI 接入与后台边界
+本地 Dashboard 默认位于 <http://127.0.0.1:9333/>。Playwright 等客户端可以连接：
 
 ```js
 const browser = await chromium.connectOverCDP('http://127.0.0.1:9333')
 ```
 
-- 默认后台启动；REST `/api/open` 使用后台标签，不移动或展开用户正在使用的窗口。
-- 最小化后的多标签网络加载、定时器轮询已通过本地端到端测试。
-- 原生渲染捕获保活目前同时覆盖 **一个目标**。其他页面使用定时器与 rAF 逻辑调度兜底，不能保证所有标签的原生渲染都为 60fps。
-- 健康面板分别报告逻辑帧率、原生帧率和定时器频率，不伪造 `document.visibilityState`。
-- 人工接管会暂停新的捕获设置，避免后台控制器切换标签；现有捕获可继续。`GET /api/status` 的 `control` 字段为 `human` 或 `background`，Agent 应尊重该状态。CDP 通道仍是调试接口，不会自动阻止所有第三方 Agent 输入。
-- 系统睡眠期间不承诺继续运行。网站自身的后台暂停逻辑、CSP 和认证行为也可能影响任务。
+## 扩展侧栏开发
 
-## 独立品牌
+扩展需要在 manifest 中声明 `side_panel.default_path` 和 `sidePanel` 权限。仓库中的 `examples/side-panel/` 演示了读取网页标题、高亮网页元素和保存笔记。
 
 ```bash
-bl stop
-bl brand --name Backlight                # 使用内置 B 图标
-bl brand --name Backlight --icon logo.png # 自定义 PNG
-bl launch https://example.com
+bl ext add "$PWD/examples/side-panel" --name demo
+bl ext dev demo http://127.0.0.1:9333/demo
+bl targets
+bl inspect <targetId>
+bl ext reload demo
+bl ext ls
+bl ext rm demo
 ```
 
-品牌化复制 Chrome for Testing，替换应用图标、名称和 bundle id。移除 `CFBundleIconName` 对原有 Assets.car 图标的覆盖，并替换运行时 `app.icns`。不会重签浏览器或重启系统 Dock。
+`ext dev` 将侧栏显式绑定到目标网页所在的 Chromium window ID。双窗口打开同一个扩展时，开发接口也不会把另一个窗口的侧栏误认为目标侧栏。
 
-品牌浏览器有自己的登录存储，需要手动登录一次。`bl import --list` / `bl import` 是可选的本地 Chrome profile 导入；跨浏览器品牌的加密 cookie 不能保证可解密。
+保存扩展文件后，Backlight 使用 Chromium 的 `Extensions.loadUnpacked` 定向重载。内容脚本改动后仍需刷新目标网页；面板重开可能丢失内存状态，持久状态应写入 `chrome.storage`。
 
-## 验证与结构
+## 技术方案与代码路径
+
+| 模块 | 技术选择 | 作用与代码路径 |
+| --- | --- | --- |
+| 浏览器生命周期 | Node.js、Chromium、CDP | 启动、停止、profile、后台 target：`packages/daemon/src/browser.ts` |
+| 品牌化 | Chromium app bundle、plist、icns | 独立名称、bundle ID、运行时图标：`packages/daemon/src/brand.ts` |
+| CDP 客户端与代理 | TypeScript、WebSocket | 协议连接、target 标准化、首帧缓冲：`packages/daemon/src/cdp.ts`、`packages/daemon/src/proxy.ts` |
+| 后台保活 | tab capture、定时器/rAF 调度 | 单目标原生捕获与回退策略：`packages/daemon/src/capture.ts`、`packages/daemon/src/inject.ts` |
+| 窗口控制 | CDP Browser domain | 最小化、贴角、恢复、控制代际：`packages/daemon/src/windows.ts` |
+| 原生应用控制 | Swift、AppKit | hide/unhide/activate/state：`tools/app-control.swift`、`packages/daemon/src/native.ts` |
+| Dock 与菜单栏 | Swift、NSWorkspace | 激活监听、受管实例路由：`packages/tray/main.swift` |
+| 扩展开发 | Chromium Extensions CDP、sidePanel API | 注册、监听、定向重载、侧栏归属：`packages/daemon/src/extensions.ts`、`packages/daemon/src/extension-dev.ts` |
+| 用户入口 | Node.js CLI、HTML Dashboard | `packages/cli/`、`packages/daemon/src/proxy.ts`、`demo.html` |
+| 验收 | Node test、真实 Backlight.app | `packages/daemon/tests/`、`tests/backlight-fixture.ts` |
+
+完整状态、已验证结论和剩余边界见 [PROJECT_INDEX.md](PROJECT_INDEX.md)。按日期记录的测试证据见 [docs/development/2026-09-13.md](docs/development/2026-09-13.md)。
+
+## 开发规范
+
+### 1. 用便宜的 CLI 模型执行，用主控 Agent 把关
+
+复杂任务先写成 `docs/plans/YYYY-MM-DD-*.md`，至少包含目标、已完成项、TODO、禁止事项、验收条件和精确测试命令。主控 Agent 再把独立实现任务交给成本较低的 CLI 子代理，例如：
+
+```bash
+opencode run \
+  "阅读任务文档，按 TODO 顺序实现、测试、记录并提交；遇到阻塞要留下证据。" \
+  --file docs/plans/YYYY-MM-DD-task.md \
+  --model opencode-go/deepseek-v4.1-flash \
+  --variant max \
+  --auto
+```
+
+模型名称只是当前可用示例。派发前应使用 `opencode models` 确认实际标识；不要把密钥、cookie 或用户 profile 写入 prompt、日志或仓库。
+
+### 2. 子代理必须在隔离分支和 worktree 工作
+
+- 主控先保存当前检查点，再创建 `codex/` 前缀分支和独立 worktree。
+- 子代理不得直接改 `master`/`main`，不得触碰用户正在使用的默认 Backlight daemon。
+- 每个逻辑修复单独提交；实验脚本、临时 profile、浏览器副本和 `/tmp` 日志不提交。
+- 主控在合并前检查 diff、提交历史、测试证据和残留进程，不能仅接受子代理的“已完成”报告。
+
+### 3. 采用低频定时巡查，不持续消耗主控资源
+
+推荐每 10 分钟检查一次，而不是持续轮询。每次巡查只做四件事：
+
+1. 查看子代理会话、`git status` 和最新提交。
+2. 检查测试是否仍在运行、是否卡死、是否启动了错误的浏览器。
+3. 对照任务文档判断方向是否偏离；正常则保持安静。
+4. 只有在卡死、证据不足或方向错误时发送具体校准指令；全部完成后停止定时任务。
+
+定时巡查不能替代代码复查。本项目曾通过巡查发现并修复：快速 CDP 响应丢失造成的永久等待、原生 hide/show 竞态，以及隐藏窗口“报告已最小化但实际上仍可见”的 macOS 状态差异。
+
+### 4. 浏览器验收只能使用 Backlight
+
+这是项目的硬规则：
+
+- 所有会启动浏览器的测试必须经过 `packages/daemon/tests/backlight-fixture.ts`。
+- 夹具只接受已品牌化的 `Backlight.app`，核验 bundle 名称、ID、图标和 executable 摘要；不存在 Google Chrome 或裸 Chrome for Testing 回退。
+- 测试使用独立应用副本和临时 profile，不能操作用户标签页、登录态或默认端口 9333。
+- GUI 集成测试串行运行并使用 `caffeinate`；日志必须出现 `[Backlight acceptance]` 和实际 `Backlight.app` 路径。
+- 物理 Dock 点击没有被自动化时，文档必须明确写“待人工验收”，不能用 API 或 `open -a` 的结果代替。
+
+### 5. 测试、记录、复查后才能交付
 
 ```bash
 pnpm -r --if-present run check
-pnpm --filter @backlight/daemon test       # 单元测试 + 串行原生浏览器集成测试
 bash packages/tray/build.sh
+pnpm --filter @backlight/daemon test:unit
+pnpm --filter @backlight/daemon test:integration
+pnpm --filter @backlight/daemon test
+git diff --check
 ```
 
-所有浏览器测试仅使用已安装品牌化 Backlight.app 的相同构建副本（校验程序与图标 SHA256），不允许回退到 Google Chrome 或独立 Chrome for Testing。使用临时 profile 和独立应用路径隔离日常窗口；窗口测试由 caffeinate 包裹，部分阶段会短暂显示 Backlight 窗口。详细验收记录见 `docs/development/2026-09-13.md`。
+行为修复先写能复现问题的测试。完成后更新 `PROJECT_INDEX.md` 和当日 `docs/development/` 记录，写明测试环境、结果、失败过程和未完成项。外部子代理的修改还必须由主控独立复查。
 
-- `packages/daemon/`：浏览器生命周期、CDP 代理、窗口恢复、捕获、健康度与开发接口。
-- `packages/cli/`：`backlight` / `bl` 命令。
-- `packages/tray/`：原生菜单栏与 Dock 激活处理。
-- `tools/app-control.swift`：按受管 PID 激活、隐藏应用及读取运行图标。
-- `PROJECT_INDEX.md`：交接入口、已验证状态与剩余边界。
+## 当前能力边界
 
-实现参考：[Chromium Extensions CDP 接口](https://chromedevtools.github.io/devtools-protocol/tot/Extensions/)、[原生 sidePanel API](https://developer.chrome.com/docs/extensions/reference/api/sidePanel)。
+- 原生捕获保活同时只覆盖一个目标。其他标签可以继续网络与定时器任务，但不保证全部维持原生 60fps 渲染。
+- 角落模式几乎完全离屏时可能没有合成帧，默认 `Page.captureScreenshot` 可能等待；后台截图应依赖 capture keep-alive 或先恢复窗口。
+- 系统睡眠、网站自身的后台策略、CSP 和认证流程仍会影响任务。
+- 品牌浏览器使用独立登录存储；跨浏览器品牌复制的加密 cookie 不保证可解密。
+- 物理鼠标点击 Dock、复杂登录网站与二维码流程仍需要人工体验测试。
+- 当前实现面向 macOS；Swift/AppKit 窗口层需要针对其他操作系统重新实现。
+
+## 进一步阅读
+
+- [项目交接索引](PROJECT_INDEX.md)
+- [侧栏扩展示例](examples/side-panel/README.md)
+- [开发计划](docs/plans/2026-09-13-opencode-completion.md)
+- [首次公开发布记录](docs/development/2026-09-15.md)
+- [Chromium Extensions CDP](https://chromedevtools.github.io/devtools-protocol/tot/Extensions/)
+- [Chrome sidePanel API](https://developer.chrome.com/docs/extensions/reference/api/sidePanel)
