@@ -158,14 +158,14 @@ async function main() {
 
     case 'show': {
       const info = readDaemonInfo(); if (!info) throw new Error('daemon not running')
-      const res = await api(info, '/api/show', { method: 'POST', body: JSON.stringify({ maximize: args.flags.has('maximize') }) })
+      const res = await api(info, '/api/show', { method: 'POST', body: JSON.stringify({ maximize: args.flags.has('maximize'), source: 'cli.show' }) })
       console.log(`restored ${res.restored} window(s) to screen`)
       return
     }
 
     case 'login': {
       const info = await ensureDaemon()
-      const res = await api(info, '/api/login', { method: 'POST', body: '{}' }, 180_000)
+      const res = await api(info, '/api/login', { method: 'POST', body: JSON.stringify({ source: 'cli.login' }) }, 180_000)
       if (res.mismatchedEngine) {
         console.log(`not taking over: ${res.note ?? 'managed browser is running with a different engine'}`)
         if (res.currentEngine) console.log(`current engine: ${res.currentEngine}`)
@@ -189,14 +189,14 @@ async function main() {
 
     case 'bg': {
       const info = readDaemonInfo(); if (!info) throw new Error('daemon not running')
-      const res = await api(info, '/api/bg', { method: 'POST', body: '{}' })
+      const res = await api(info, '/api/bg', { method: 'POST', body: JSON.stringify({ source: 'cli.bg' }) })
       console.log(`collapsed ${res.collapsed} window(s) to background (pages keep full speed)`)
       return
     }
 
     case 'restore': {
       const info = readDaemonInfo(); if (!info) throw new Error('daemon not running')
-      const res = await api(info, '/api/restore', { method: 'POST', body: '{}' })
+      const res = await api(info, '/api/restore', { method: 'POST', body: JSON.stringify({ source: 'cli.restore' }) })
       console.log(`restored ${res.restored} window(s)`)
       return
     }

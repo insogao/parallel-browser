@@ -33,6 +33,57 @@ func apiPost(_ path: String, body: String = "{}") {
   URLSession.shared.dataTask(with: req) { _, _, _ in }.resume()
 }
 
+/// JSON body carrying the request provenance the daemon logs: a source label
+/// (explicit menu action vs auto reconciliation) and, for auto reactions, the
+/// notification timestamp so an internal capture activation can be attributed.
+func requestBody(_ source: String, extra: [String: Any] = [:]) -> String {
+  var body: [String: Any] = ["source": source]
+  for (key, value) in extra { body[key] = value }
+  guard let data = try? JSONSerialization.data(withJSONObject: body) else { return "{\"source\":\"\(source)\"}" }
+  return String(data: data, encoding: .utf8) ?? "{}"
+}
+
+/// True when the daemon's status reports a daemon-internal native activation
+/// around `observedAt` (capture picker). Such an activation is not a user
+/// Dock/launcher request and must not restore a background-collapsed session.
+func internalActivation(_ obj: [String: Any]?, observedAt: Double) -> Bool {
+  guard let info = obj?["internal"] as? [String: Any] else { return false }
+  if info["active"] as? Bool == true { return true }
+  guard let from = info["from"] as? Double else { return false }
+  let to = info["to"] as? Double ?? Date().timeIntervalSince1970 * 1000
+  return observedAt >= from - 250 && observedAt <= to + 250
+}
+
+/// Brand artwork first (matches the app/Dock icon), SF Symbol as fallback if
+/// the managed engine is not installed under this data root.
+func brandImage() -> NSImage? {
+  let candidates = [
+    dataRoot + "/apps/Backlight.app/Contents/Resources/backlight.icns",
+    dataRoot + "/apps/Backlight.app/Contents/Resources/app.icns",
+  ]
+  for path in candidates {
+    if let image = NSImage(contentsOfFile: path) {
+      image.size = NSSize(width: 18, height: 18)
+      return image
+    }
+  }
+  return nil
+}
+
+/// Activity marker on top of the brand artwork (small accent dot), so the
+/// menu bar stays brand-consistent while still blinking for AI commands.
+func activeBrandImage(_ base: NSImage?) -> NSImage? {
+  guard let base else { return NSImage(systemSymbolName: "bolt.circle.fill", accessibilityDescription: "Backlight activity") }
+  let size = NSSize(width: 18, height: 18)
+  let image = NSImage(size: size)
+  image.lockFocus()
+  base.draw(in: NSRect(origin: .zero, size: size))
+  NSColor.systemBlue.setFill()
+  NSBezierPath(ovalIn: NSRect(x: 10, y: 10, width: 7, height: 7)).fill()
+  image.unlockFocus()
+  return image
+}
+
 func isManagedApp(_ app: NSRunningApplication, browser: [String: Any]) -> Bool {
   if let pid = browser["pid"] as? Int, Int(app.processIdentifier) == pid { return true }
   // A Dock launch can select a second instance of our branded .app. Route
@@ -57,8 +108,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   var checkingWindow = false
   var restoringUntil = Date.distantPast
 
-  let idleIcon = NSImage(systemSymbolName: "circle.dashed", accessibilityDescription: "Backlight idle")
-  let activeIcon = NSImage(systemSymbolName: "bolt.circle.fill", accessibilityDescription: "Backlight activity")
+  let idleIcon = brandImage() ?? NSImage(systemSymbolName: "circle.dashed", accessibilityDescription: "Backlight idle")
+  lazy var activeIcon = activeBrandImage(brandImage())
 
   func applicationDidFinishLaunching(_ note: Notification) {
     statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -85,10 +136,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 让"辅助登录/查看进度"像普通浏览器一样自然。按 PID 精确匹配我们的实例，
     // 用户自己的 Chrome 被激活时不会误触发。
     for event in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didUnhideApplicationNotification] {
+      let autoSource = event == NSWorkspace.didUnhideApplicationNotification ? "tray.auto.unhide" : "tray.auto.activate"
       NSWorkspace.shared.notificationCenter.addObserver(
         forName: event, object: nil, queue: .main
       ) { [weak self] note in
       guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+      let observedAt = Date().timeIntervalSince1970 * 1000
       apiGet("/api/status") { data in
         guard let data,
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -97,8 +150,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let pid = browser["pid"] as? Int else { return }
         if isManagedApp(app, browser: browser) {
           DispatchQueue.main.async {
+            // Capture/daemon-internal activation is not a user request: keep a
+            // recently collapsed background session collapsed.
+            if internalActivation(obj, observedAt: observedAt) { return }
             self?.restoringUntil = Date().addingTimeInterval(3)
-            apiPost("/api/show", body: Int(app.processIdentifier) == pid ? "{\"activate\":false}" : "{}")
+            let activate = Int(app.processIdentifier) == pid
+            apiPost("/api/show", body: requestBody(autoSource, extra: [
+              "activate": !activate,
+              "observedAt": observedAt,
+            ]))
           }
         }
       }
@@ -113,12 +173,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     return item
   }
 
-  @objc func collapseAll(_ sender: Any) { apiPost("/api/bg") }
-  @objc func restoreAll(_ sender: Any) { apiPost("/api/show") }
+  @objc func collapseAll(_ sender: Any) { apiPost("/api/bg", body: requestBody("tray.menu.bg")) }
+  @objc func restoreAll(_ sender: Any) { apiPost("/api/show", body: requestBody("tray.menu.show")) }
   @objc func openDashboard(_ sender: Any) {
-    if let url = URL(string: "http://127.0.0.1:\(daemonPort())") {
-      NSWorkspace.shared.open(url)
-    }
+    // Open the dashboard in the managed Backlight browser via the daemon
+    // (never the macOS default browser). Explicit action: may show a window
+    // even in background mode, and launches the managed profile if stopped.
+    apiPost("/api/console", body: requestBody("tray.menu.console"))
   }
   @objc func quit(_ sender: Any) { NSApp.terminate(self) }
 
@@ -142,9 +203,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               Date() > self.restoringUntil,
               let frontmost = NSWorkspace.shared.frontmostApplication,
               isManagedApp(frontmost, browser: browser) else { return }
+        let observedAt = Date().timeIntervalSince1970 * 1000
         if Int(frontmost.processIdentifier) != pid {
+          // Never let this reconciliation override a recent explicit bg when
+          // the activation was daemon-internal (capture picker).
+          if internalActivation(obj, observedAt: observedAt) { return }
           self.restoringUntil = Date().addingTimeInterval(3)
-          apiPost("/api/show")
+          apiPost("/api/show", body: requestBody("tray.auto.poll", extra: ["observedAt": observedAt]))
           return
         }
         self.checkingWindow = true
@@ -158,7 +223,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self, Date() > self.restoringUntil else { return }
             if needsRestore {
               self.restoringUntil = Date().addingTimeInterval(3)
-              apiPost("/api/show", body: "{\"activate\":false}")
+              apiPost("/api/show", body: requestBody("tray.auto.poll", extra: ["activate": false]))
             } else if allMinimized {
               // --no-startup-window can suppress Chromium's ordinary reopen.
               // Hiding after the last minimize guarantees a later Dock click
