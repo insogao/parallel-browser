@@ -13,6 +13,7 @@ import { listChromeProfiles, importProfile } from './import.ts'
 import { ensureChromiumForExtensions } from './browser.ts'
 import { brandBundle } from './brand.ts'
 import { paths } from './paths.ts'
+import { selectBrandedEngineSetting, type LoginResult } from './launcher.ts'
 
 import type { FramePumpSupervisor } from './windows.ts'
 import { TapState, tapFrame } from './tap.ts'
@@ -103,6 +104,16 @@ export function createServer(deps: ServerDeps): http.Server {
     },
   }
 
+  // Repeated clicks (Launchpad) share one in-flight login: the browser is
+  // launched/reused once and every click resolves with the same result.
+  let loginInFlight: Promise<LoginResult> | null = null
+  const login = (): Promise<LoginResult> => {
+    if (!loginInFlight) {
+      loginInFlight = runLogin(deps, nativeControl).finally(() => { loginInFlight = null })
+    }
+    return loginInFlight
+  }
+
   // ---- normal HTTP requests -------------------------------------------------
   httpServer.on('request', async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -123,7 +134,7 @@ export function createServer(deps: ServerDeps): http.Server {
         return
       }
       if (url.pathname.startsWith('/api/')) {
-        await handleApi(req, res, url, deps, nativeControl)
+        await handleApi(req, res, url, deps, nativeControl, login)
         return
       }
       if (url.pathname === '/json' || url.pathname === '/json/list' || url.pathname === '/json/new'
@@ -238,7 +249,47 @@ interface NativeControl {
   persist(gen: number, activate: boolean): Promise<void>
 }
 
-async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, url: URL, deps: ServerDeps, native: NativeControl) {
+/**
+ * Launchpad/`bl login` click path: select the branded engine when the managed
+ * browser is not running yet, launch the configured (default) space visibly,
+ * then show + maximize + activate for assisted login. A live session is never
+ * killed or switched; repeated/concurrent calls are idempotent.
+ */
+async function runLogin(deps: ServerDeps, native: NativeControl): Promise<LoginResult> {
+  const selection = selectBrandedEngineSetting()
+  const before = deps.manager.current
+  let note: string | undefined
+  let engine = selection.engine?.binPath ?? loadSettings().browser
+  if (!selection.engine) {
+    note = `branded engine not found under ${path.join(paths.root, 'apps')}; using configured engine`
+  } else if (before && path.resolve(before.binary) !== path.resolve(selection.engine.binPath)) {
+    note = `managed browser is already running with a different engine (${before.binary}); run backlight stop, then click again to switch`
+  } else if (selection.changed) {
+    note = 'selected the branded Backlight engine for the managed space'
+  }
+  const gen = deps.supervisor.beginControl()
+  deps.supervisor.humanMode = true
+  await deps.capture.setPaused(true)
+  let launched = false
+  if (!deps.manager.running) {
+    deps.supervisor.start()
+    const instance = await deps.manager.launch({ focus: true })
+    launched = true
+    engine = instance.binary
+  }
+  const restored = deps.manager.running ? await deps.supervisor.restoreAll(true, gen) : 0
+  await native.persist(gen, true)
+  return { ok: true, launched, restored, engine, note }
+}
+
+async function handleApi(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  url: URL,
+  deps: ServerDeps,
+  native: NativeControl,
+  login: () => Promise<LoginResult>,
+) {
   const body = req.method === 'POST' || req.method === 'PUT' ? await readBody(req) : ''
   const payload = body ? (() => { try { return JSON.parse(body) } catch { return {} } })() : {}
   const route = `${req.method} ${url.pathname}`
@@ -285,6 +336,10 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         keepVisible: payload.keepVisible === true,
       })
       json(res, 200, { ok: true, pid: inst.pid, upstreamPort: inst.upstreamPort, version: inst.version })
+      return
+    }
+    case 'POST /api/login': {
+      json(res, 200, await login())
       return
     }
     case 'POST /api/stop': {

@@ -65,6 +65,7 @@ pnpm install
 
 alias bl="node $PWD/packages/cli/bin/backlight.js"
 bl brand --name Backlight
+bl launcher install              # 安装/刷新 Launchpad 入口 ~/Applications/Backlight.app
 bl launch https://example.com
 ```
 
@@ -74,12 +75,27 @@ bl launch https://example.com
 bl open https://example.org      # 静默创建后台页面
 bl show                          # 进入人工接手
 bl show --maximize               # 恢复并最大化
+bl login                         # 启动台入口的同一路径：确保 daemon/品牌引擎并最大化接管
 bl bg                            # 最小化并隐藏，继续后台任务
 bl status
 bl health
 bl windows
 bl stop
 ```
+
+## 启动台入口与人工登录
+
+`bl launcher install` 会安装一个独立的 `~/Applications/Backlight.app`（bundle id `dev.backlight.launcher`，Launchpad 可直接发现），并把运行所需的最小快照安装到 `~/Library/Application Support/Backlight/runtime/`。它**不是**隐藏引擎 app 的副本：点击后执行 `bl login` 的同一路径，确保 daemon 运行、选中品牌化 Backlight 引擎（bundle id `dev.backlight.browser`，位于 `~/Library/Application Support/Backlight/apps/Backlight.app`），启动或复用受管默认 space/profile，然后显示、最大化并激活受管浏览器。重复点击幂等：已在运行时只 focus/show/maximize，不会产生未受管实例或第二个 daemon；已在运行的异引擎会话不会被终止。
+
+```bash
+bl launcher install              # 构建 + 原子替换 + 注册 LaunchServices + 校验
+bl launcher status               # 结构/plist/codesign/目标/引擎逐项校验
+bl launcher uninstall            # 仅移除入口（--purge 同时删除 runtime 快照）
+```
+
+点击日志：`~/Library/Application Support/Backlight/logs/launcher.log`（daemon 日志同目录 `daemon.log`）。源码更新后需要重新执行 `bl launcher install` 刷新 runtime 快照。启动器不依赖当前仓库/worktree 路径，分支合并或 worktree 删除后仍然可用。
+
+> 物理 Launchpad 点击与真实登录体验属于人工验收项；非 GUI 的结构、签名、LaunchServices 索引和单元测试已由项目自检覆盖。
 
 本地 Dashboard 默认位于 <http://127.0.0.1:9333/>。Playwright 等客户端可以连接：
 
@@ -116,6 +132,7 @@ bl ext rm demo
 | 窗口控制 | CDP Browser domain | 最小化、贴角、恢复、控制代际：`packages/daemon/src/windows.ts` |
 | 原生应用控制 | Swift、AppKit | hide/unhide/activate/state：`tools/app-control.swift`、`packages/daemon/src/native.ts` |
 | Dock 与菜单栏 | Swift、NSWorkspace | 激活监听、受管实例路由：`packages/tray/main.swift` |
+| 启动台入口 | Swift、LaunchServices | 点击经 daemon login 接管、runtime 快照、安装/校验：`packages/launcher/main.swift`、`packages/daemon/src/launcher.ts` |
 | 扩展开发 | Chromium Extensions CDP、sidePanel API | 注册、监听、定向重载、侧栏归属：`packages/daemon/src/extensions.ts`、`packages/daemon/src/extension-dev.ts` |
 | 用户入口 | Node.js CLI、HTML Dashboard | `packages/cli/`、`packages/daemon/src/proxy.ts`、`demo.html` |
 | 验收 | Node test、真实 Backlight.app | `packages/daemon/tests/`、`tests/backlight-fixture.ts` |

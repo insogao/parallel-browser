@@ -12,12 +12,20 @@ import { loadSettings } from './store.ts'
 import { error, initFileLogging, log } from './log.ts'
 import { FramePumpSupervisor } from './windows.ts'
 import { activateBrowser, browserAppState, hideBrowser, startTray, unhideBrowser } from './native.ts'
+import { readLiveDaemon } from './single-instance.ts'
 
 export const VERSION = '0.1.0'
 
 async function main() {
   ensureDirs()
   initFileLogging(paths.logs)
+  // Single instance per data dir: a second daemon (e.g. from a double click)
+  // must exit instead of writing daemon.json and stealing the default port.
+  const alreadyRunning = readLiveDaemon()
+  if (alreadyRunning) {
+    log(`another backlight daemon is already running (pid=${alreadyRunning.pid} port=${alreadyRunning.port}); exiting`)
+    process.exit(0)
+  }
   const settings = loadSettings()
 
   // single public port: CDP proxy + API + dashboard

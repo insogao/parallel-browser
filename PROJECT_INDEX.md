@@ -23,6 +23,7 @@
 - 原生可见性：新增 `app-control unhide`（不抢焦点）；AppKit hide/unhide 异步生效，改为发出请求后用新进程校验状态并有界重试，show(activate:false) 与 bg 连续切换不再出现状态漂移。2026-09-16 新增只读 `app-control windows`（CGWindowList：窗口总数、on-screen layer-0 窗口数），用于真实验收交叉验证原生最小化。
 - 窗口状态验收（2026-09-16）：opt-in `test:window-state` 已一次性真机通过（退出码 0，隔离品牌化 Backlight.app，capture 保活开启）。单序列 `可见/最大化 → 最小化 → 恢复/最大化` 全通道证据：最大化基线 timer 10.0/s、网络 3.9/s、shim rAF 100.2/s、原生 100.2/s；`/api/bg` 4.00s → CDP minimized 4.95s / DOM hidden 4.95s / WindowServer on-screen=0 4.95s / AppKit hidden 5.84s；最小化观测窗口 timer 10.1/s、网络 4.0/s、shim 100.0/s、原生 100.0/s（`captureTargetId` 命中目标）、截图 17092B/27ms；`show --maximize` 22.66s → 23.05s DOM/native 可见 → 24.08s CDP maximized/AppKit unhidden，恢复原生 100.2/s。最小化+capture 时 DOM `visibilityState` 由 Chromium 报 visible（capturer 语义，只读上报、不伪造）。Phase A（capture 关闭，同日更早一次）另有原生 rAF=0.0/s、timer 10.0/s、网络 4.0/s、shim 58.5/s 对照。运行后无残留进程/临时目录，未触碰 9333。纯单元守卫“不伪造 visibilityState”与速率阈值区分（当前单元全部通过）。
 - 窗口/捕获修复（2026-09-16）：`show --maximize` 在最小化窗口上先有界等待 `normal`（超时直接失败、不发 maximize）再 maximize 并校验结果，未验证成功或中途被更新的意图 supersede 都不计入 `restored`；capture 保活 setup 在 `normal` 生效后才发 park 位置，并有界校验位置实际生效后才记录 parked；cleanup 不再信任单次严格等值探针，按“恢复原位置 → 最小化”修复并有界验证，失败 warn。新增 pid 绑定的 `appHidden`/`hideApp`/`unhideApp` 依赖（`index.ts` 注入 `browserAppState`/`hideBrowser`/`unhideBrowser`）：picker 解除隐藏后恢复 `bg` 语义，若延迟 hide 期间发生 takeover 则补 unhide，人工接管最终可见。上述行为均有确定性单元覆盖，capture 真机复验已由 `test:window-state` 一次性通过。
+- 启动台入口（2026-09-16）：新增 `bl launcher install|status|uninstall` 与 `bl login`。启动器 `~/Applications/Backlight.app`（稳定 bundle id `dev.backlight.launcher`）点击后执行 runtime 快照里的 `backlight.js login`：确保 daemon → 选品牌引擎 `dev.backlight.browser`（隐藏于 `.../apps/Backlight.app`）→ 可见启动/复用默认 space → `restoreAll(maximize)` + activate，无终端窗口；日志在 `.../logs/launcher.log`。幂等：在途 login 共享 promise、CLI mkdir 启动锁 + daemon 单实例检查防双 daemon、已在运行的异引擎会话不终止；`--selftest/--print-config` 不启动 daemon/浏览器。runtime 快照（`.../runtime`，保留 pnpm 相对 symlink、裁剪 typescript/@types 后 2.7MB）使入口不依赖 worktree 路径；`launcher-unit.ts` 12 项确定性测试。已实测安装+替换三次、plutil/codesign/lsregister/mdfind/`--selftest` 全通过；物理点击+登录仍待人工验收（2026-09-16 观测到一次外部真实点击成功：daemon 启动、品牌引擎可见、窗口最大化）。
 - CDP：`Cdp.send` 先注册 waiter 再发送，修复快速响应被丢弃导致的永久挂起；`tests/cdp-unit.ts` 3 个确定性测试。
 - **验证状态（2026-09-13 19:47 CST，品牌化 Backlight）：`pnpm --filter @backlight/daemon test` 通过 —— 单元 25/25 + brand 11 项 + spike/supervisor/extensions/agent/background/usability 全部 PASS（32 条 PASS，无 FAIL）；6 条 `[Backlight acceptance]` 路径均为 `.../Backlight.app/...`，sha256 一致，无临时进程/目录遗留。**
 - 本轮修复已全部提交（自 `6a4b097` capture 修复起，至本文档更新）。日常 daemon 不会自动加载源码，需用户下次安全重启后生效；不要在用户使用期间擅自终止其浏览器。
@@ -31,7 +32,7 @@
 
 入口：`pnpm --filter @backlight/daemon test`，类型检查：`pnpm -r --if-present run check`。
 
-单元测试为 `tests/*-unit.ts`（capture、windows、extension-dev、cdp、proxy、proxy-race、targets、raf、window-state 等）加 `tests/brand.ts`；当前 38/38 单元 + brand 通过。集成入口 `tests/agent.ts` 的每次 CDP 调用有 15s 上限，回归失败快速报错而非无限挂起；生产代码不设短超时。
+单元测试为 `tests/*-unit.ts`（capture、windows、extension-dev、cdp、proxy、proxy-race、targets、raf、window-state、launcher、single-instance 等）加 `tests/brand.ts`；当前 56/56 单元 + brand 11 项通过。集成入口 `tests/agent.ts` 的每次 CDP 调用有 15s 上限，回归失败快速报错而非无限挂起；生产代码不设短超时。
 
 窗口状态 + 全通道后台限流验收是**手工 opt-in**：`pnpm --filter @backlight/daemon test:window-state`。它只跑一个 `maximize → minimize → restore` 序列，会短暂操作隔离测试 Backlight 窗口，**不在** `test`/`test:integration` 默认链；2026-09-16 已按用户授权跑一次并通过（结果见开发记录与上方进度）。
 
@@ -48,11 +49,13 @@
 ```sh
 node packages/cli/bin/backlight.js launch https://example.com
 node packages/cli/bin/backlight.js show --maximize
+node packages/cli/bin/backlight.js login          # 启动台点击的同路径
 node packages/cli/bin/backlight.js bg
 node packages/cli/bin/backlight.js ext add examples/side-panel --name demo
 node packages/cli/bin/backlight.js ext dev demo http://127.0.0.1:9333/demo
 node packages/cli/bin/backlight.js targets
 node packages/cli/bin/backlight.js inspect <targetId>
+node packages/cli/bin/backlight.js launcher install|status|uninstall
 ```
 
 扩展名称以 `ext ls` 输出为准。Dashboard：http://127.0.0.1:9333/；用法详见 README.md 和 examples/side-panel/README.md。
@@ -60,6 +63,8 @@ node packages/cli/bin/backlight.js inspect <targetId>
 ## 关键文件
 
 - packages/daemon/src/browser.ts、brand.ts：生命周期、品牌化。
+- packages/daemon/src/launcher.ts、packages/launcher/main.swift：Launchpad 入口的安装/校验、runtime 快照与点击目标。
+- packages/daemon/src/single-instance.ts：daemon 单实例与启动锁。
 - native.ts、tools/app-control.swift、packages/tray/main.swift：应用激活与 Dock 恢复。
 - windows.ts、capture.ts、inject.ts：窗口、捕获保活、健康状态。
 - extension-dev.ts、extensions.ts：原生侧栏与热重载。
@@ -79,5 +84,7 @@ node packages/cli/bin/backlight.js inspect <targetId>
 - sidePanel 调试会关闭并重新打开当前窗口面板，以准确定位目标；面板临时状态可能丢失，storage 数据保留。隐藏面板的 WebContents 会被复用，归属用 `chrome.windows.getCurrent()` 验证。
 - 原始 CDP 客户端仍可操作窗口；AI 应尊重 status.control 的人工接手状态。
 - Dock 真鼠标点击、复杂登录站点兼容性仍需补充验收；多窗口同扩展面板归属已由双窗口集成测试覆盖（3/3）。
+- Launchpad 入口需 `bl launcher install` 安装/刷新（runtime 快照随源码更新）；物理点击与真实登录为人工验收项（2026-09-16 观测到一次外部真实点击成功进入最大化接管，未由实现会话执行）。已在运行的异引擎受管会话不会被 `login` 强制切换，需先 `bl stop` 再点击。
+- runtime 快照内的 Node 路径在安装时记录并带 Homebrew 回退；Node/引擎被移动后重跑 `bl launcher install` 即可修复。
 - 不对 Chromium 重签名，避免破坏 JIT 权限。可执行文件内部保留引擎原名，应用品牌为 Backlight。
 - Node 25 原生 TypeScript，禁止 enum/构造函数参数属性等需转换语法。

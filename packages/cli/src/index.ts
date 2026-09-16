@@ -7,23 +7,14 @@ import { spawn, execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { acquireStartLock, readLiveDaemon, releaseStartLock, type DaemonInfo } from '../../daemon/src/single-instance.ts'
 
 const daemonEntry = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'daemon', 'src', 'index.ts')
 const home = process.env.BACKLIGHT_HOME
   ?? path.join(process.env.HOME ?? '', 'Library', 'Application Support', 'Backlight')
 const daemonFile = path.join(home, 'daemon.json')
 
-interface DaemonInfo { pid: number; port: number }
-
-function readDaemonInfo(): DaemonInfo | null {
-  try {
-    const info = JSON.parse(fs.readFileSync(daemonFile, 'utf8')) as DaemonInfo
-    try {
-      process.kill(info.pid, 0)
-      return info
-    } catch { return null }
-  } catch { return null }
-}
+const readDaemonInfo = (): DaemonInfo | null => readLiveDaemon(daemonFile)
 
 async function api<T = any>(info: DaemonInfo, pathname: string, init?: RequestInit, timeoutMs = 120_000): Promise<T> {
   const res = await fetch(`http://127.0.0.1:${info.port}${pathname}`, {
@@ -42,19 +33,28 @@ async function ensureDaemon(env: Record<string, string> = {}): Promise<DaemonInf
   const existing = readDaemonInfo()
   if (existing) return existing
   fs.mkdirSync(home, { recursive: true })
-  const child = spawn(process.execPath, [daemonEntry], {
-    detached: true,
-    stdio: 'ignore',
-    env: { ...process.env, ...env },
-  })
-  child.unref()
-  const deadline = Date.now() + 8000
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 200))
-    const info = readDaemonInfo()
-    if (info) return info
+  // Two rapid clicks (launcher -> CLI) must not spawn two daemons: only the
+  // lock holder starts one, the loser waits for daemon.json from the winner.
+  const holdsLock = acquireStartLock(home)
+  if (holdsLock) {
+    const child = spawn(process.execPath, [daemonEntry], {
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, ...env },
+    })
+    child.unref()
   }
-  throw new Error('daemon did not start; run BACKLIGHT_VERBOSE=1 node packages/daemon/src/index.ts to see logs')
+  try {
+    const deadline = Date.now() + 15_000
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 200))
+      const info = readDaemonInfo()
+      if (info) return info
+    }
+    throw new Error('daemon did not start; see ~/Library/Application Support/Backlight/logs/daemon.log')
+  } finally {
+    if (holdsLock) releaseStartLock(home)
+  }
 }
 
 // ---- tiny arg parser ----------------------------------------------------------
@@ -91,6 +91,7 @@ function usage(): string {
   backlight open <url>          在运行中的浏览器开新标签页（可 --with 扩展名）
   backlight bg                  最小化窗口并交回后台运行
   backlight show [--maximize]   显示浏览器并进入人工接管，可最大化
+  backlight login               启动台点击行为：确保 daemon/品牌引擎，启动或复用默认 space 并最大化接管
   backlight restore             恢复收起的窗口
   backlight status              查看 daemon / 浏览器状态
   backlight health              各标签页后台健康度（rAF/定时器速率）
@@ -106,6 +107,9 @@ function usage(): string {
   backlight inspect <targetId>  为选定目标打开独立 DevTools 窗口
   backlight import              从本机 Chrome 导入 cookie/登录态（--profile 目录名 --space 名称，--list 列出）
   backlight brand               品牌化浏览器（--name 名称 --icon logo.png）
+  backlight launcher install    安装/刷新 ~/Applications/Backlight.app（启动台入口，--apps-dir 目录）
+  backlight launcher status     校验启动台入口（结构/签名/目标/引擎）
+  backlight launcher uninstall  移除启动台入口（--purge 同时删除运行时副本）
   backlight doctor              环境体检
 
 环境变量:
@@ -162,6 +166,15 @@ async function main() {
       const info = readDaemonInfo(); if (!info) throw new Error('daemon not running')
       const res = await api(info, '/api/show', { method: 'POST', body: JSON.stringify({ maximize: args.flags.has('maximize') }) })
       console.log(`restored ${res.restored} window(s) to screen`)
+      return
+    }
+
+    case 'login': {
+      const info = await ensureDaemon()
+      const res = await api(info, '/api/login', { method: 'POST', body: '{}' }, 180_000)
+      console.log(`managed browser ${res.launched ? 'launched' : 'reused'} · restored ${res.restored} window(s) maximized for login`)
+      if (res.engine) console.log(`engine: ${res.engine}`)
+      if (res.note) console.log(`note: ${res.note}`)
       return
     }
 
@@ -338,6 +351,41 @@ async function main() {
       spawn('open', ['-a', appPath], { detached: true, stdio: 'ignore' }).unref()
       console.log('tray launched — menu bar icon appears (bolt = AI activity, menu: 收起/恢复/控制台)')
       return
+    }
+
+    case 'launcher': {
+      const sub = args._[1] ?? 'status'
+      const appsDir = args.flags.get('apps-dir') ? path.resolve(String(args.flags.get('apps-dir'))) : undefined
+      const { installLauncher, verifyLauncher, uninstallLauncher, launcherPaths } = await import('../../daemon/src/launcher.ts')
+      const p = launcherPaths({ applicationsDir: appsDir })
+      if (sub === 'install' || sub === 'refresh') {
+        const res = await installLauncher({ applicationsDir: appsDir, log: (m) => console.log(m) })
+        console.log(`\nlauncher: ${res.appPath}`)
+        console.log(`runtime:  ${res.runtimeDir}`)
+        console.log(`engine:   ${res.engine ?? '(none branded found)'}`)
+        console.log(`settings: ${res.settingsChanged ? 'selected branded engine' : 'already selected'}`)
+        const failed = res.checks.filter(c => !c.ok)
+        for (const c of res.checks) console.log(`${c.ok ? '✓' : '✗'} ${c.name} — ${c.detail}`)
+        if (failed.length) { console.error(`\n${failed.length} check(s) failed`); process.exitCode = 1 }
+        else console.log('\nclick it from Launchpad: it ensures daemon, branded engine, default space, then shows + maximizes the managed browser')
+        return
+      }
+      if (sub === 'status') {
+        const checks = await verifyLauncher({ applicationsDir: appsDir })
+        console.log(`path: ${p.launcherApp}`)
+        for (const c of checks) console.log(`${c.ok ? '✓' : '✗'} ${c.name} — ${c.detail}`)
+        const failed = checks.filter(c => !c.ok)
+        if (failed.length) { console.error(`\n${failed.length} check(s) failed`); process.exitCode = 1 }
+        else console.log('\ninstalled and structurally valid (physical Launchpad click still requires manual acceptance)')
+        return
+      }
+      if (sub === 'uninstall') {
+        const res = await uninstallLauncher({ applicationsDir: appsDir, purgeRuntime: args.flags.has('purge') })
+        console.log(res.removed ? `removed: ${p.launcherApp}` : `nothing to remove (${res.note})`)
+        if (res.removed && args.flags.has('purge')) console.log(`purged runtime: ${p.runtimeDir}`)
+        return
+      }
+      throw new Error('usage: backlight launcher install|status|uninstall [--apps-dir 目录] [--purge]')
     }
 
     case 'brand': {
