@@ -219,6 +219,29 @@ try {
   assert.ok(bgHide.length > 0 && bgHide.every(e => e.token === bgMinimize[0].token),
     'native hide must share the bg token')
 
+  // ---- a synthetic/delayed tray.auto can never rebound the hidden window ----
+  // The original release blocker: the tray observer posts /api/show with
+  // source=tray.auto.*; an NSWorkspace activation is not a verified physical
+  // click, so the daemon must keep the window hidden and log the provenance.
+  const auto = await api('show', { source: 'tray.auto.activate', observedAt: Date.now(), activate: false })
+  assert.equal(auto.restored, 0, `auto show must not restore: ${JSON.stringify(auto)}`)
+  assert.equal(auto.ignored, 'unverified-activation', JSON.stringify(auto))
+  for (let i = 0; i < 12; i++) {
+    const probe = await nativeVisibility(pid).catch(() => null)
+    assert.ok(!!probe && isInvisibleProbe(probe), `auto show exposed the app: ${JSON.stringify(probe)}`)
+    assert.equal((await api('windows')).windows?.[0]?.state, 'minimized', 'auto show must not unminimize')
+    await sleep(150)
+  }
+  const autoEntries = (await api('state-log?limit=200')).entries as any[]
+  const autoSkips = autoEntries.filter(e => e.event === 'show-skip' && e.origin === 'auto')
+  assert.ok(autoSkips.length > 0, 'auto show refusal must be logged with direct provenance')
+  assert.ok(autoSkips.every(e => e.source === 'tray.auto.activate' && e.branch === 'unverified-activation' && e.route === 'POST /api/show'),
+    `auto show-skip provenance must be direct: ${JSON.stringify(autoSkips)}`)
+  assert.ok(!autoEntries.some(e => e.origin === 'auto' && (e.event === 'window-restore' || e.event === 'native-unhide')),
+    'no auto-origin restore/unhide transition may exist after bg')
+  const bgMinimizeAfterAuto = autoEntries.filter(e => e.event === 'window-minimize' && e.source === 'probe.explicit.bg')
+  assert.equal(bgMinimizeAfterAuto.length, bgMinimize.length, 'auto show must not add window transitions')
+
   // ---- an explicit show still works (login/show contract preserved) ---------
   await api('show', { maximize: true, activate: false, source: 'probe.explicit.show' })
   await waitFor(async () => {

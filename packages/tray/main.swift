@@ -121,9 +121,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     pollTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { _ in self.poll() }
     iconTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { _ in self.updateIcon() }
 
-    // 用户点击 Dock 里的浏览器图标（应用被激活）→ 自动还原被收起的窗口，
-    // 让"辅助登录/查看进度"像普通浏览器一样自然。按 PID 精确匹配我们的实例，
-    // 用户自己的 Chrome 被激活时不会误触发。
+    // User clicks the Dock icon of the managed browser → the daemon records
+    // the OS observation as `tray.auto.*`, but an NSWorkspace activation does
+    // not prove a physical click, so the daemon keeps the window hidden. The
+    // explicit show paths are the tray menu, `bl show` and the launcher/login.
     for event in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didUnhideApplicationNotification] {
       let autoSource = event == NSWorkspace.didUnhideApplicationNotification ? "tray.auto.unhide" : "tray.auto.activate"
       NSWorkspace.shared.notificationCenter.addObserver(
@@ -140,9 +141,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if isManagedApp(app, browser: browser) {
           DispatchQueue.main.async {
             // The daemon owns attribution and logs every auto request
-            // (accepted or ignored:internal-activation/explicit-in-flight);
-            // posting unconditionally keeps every OS-observed activation
-            // directly traceable instead of silently dropped here.
+            // (accepted or skipped: internal-activation / explicit-in-flight /
+            // unverified-activation); posting unconditionally keeps every
+            // OS-observed activation directly traceable instead of silently
+            // dropped here.
             self?.restoringUntil = Date().addingTimeInterval(3)
             let activate = Int(app.processIdentifier) == pid
             apiPost("/api/show", body: requestBody(autoSource, extra: [
@@ -179,8 +181,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   func poll() {
     // Status comes from the browser lifecycle, not the presence of AI events.
-    // A click on an already-active application may emit no activation event.
-    // Recover only cornered normal windows in that case; respect minimization.
+    // The daemon refuses auto show (an OS observation is not a verified click),
+    // so the poll only re-hides a managed app whose windows are all minimized:
+    // that keeps the app hidden so a later Dock click still emits
+    // didUnhide/didActivate and stays traceable. Showing a window is an
+    // explicit action via the tray menu / `bl show` / the launcher.
     apiGet("/api/status") { [weak self] data in
       guard let self else { return }
       let obj = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
@@ -193,28 +198,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               Date() > self.restoringUntil,
               let frontmost = NSWorkspace.shared.frontmostApplication,
               isManagedApp(frontmost, browser: browser) else { return }
-        let observedAt = Date().timeIntervalSince1970 * 1000
-        if Int(frontmost.processIdentifier) != pid {
-          // Daemon-owned gate: the request is always posted and the daemon
-          // logs whether it applied or was ignored (internal-activation /
-          // explicit-in-flight), so every OS-observed activation is traceable.
-          self.restoringUntil = Date().addingTimeInterval(3)
-          apiPost("/api/show", body: requestBody("tray.auto.poll", extra: ["observedAt": observedAt]))
-          return
-        }
+        guard Int(frontmost.processIdentifier) == pid else { return }
         self.checkingWindow = true
         apiGet("/api/windows") { [weak self] data in
           let result = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
           let windows = result?["windows"] as? [[String: Any]] ?? []
-          let needsRestore = windows.contains { $0["cornered"] as? Bool == true && $0["state"] as? String != "minimized" }
           let allMinimized = !windows.isEmpty && windows.allSatisfy { $0["state"] as? String == "minimized" }
           DispatchQueue.main.async {
             self?.checkingWindow = false
             guard let self, Date() > self.restoringUntil else { return }
-            if needsRestore {
-              self.restoringUntil = Date().addingTimeInterval(3)
-              apiPost("/api/show", body: requestBody("tray.auto.poll", extra: ["activate": false]))
-            } else if allMinimized {
+            if allMinimized {
               // --no-startup-window can suppress Chromium's ordinary reopen.
               // Hiding after the last minimize guarantees a later Dock click
               // emits didUnhide/didActivate, even if this app was already active.

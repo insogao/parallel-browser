@@ -78,7 +78,7 @@ async function main() {
       fetch(`http://127.0.0.1:${PORT}${p}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json())
 
     // 1. register extension
-    const added = await post('/api/extensions/add', { path: path.join(TMP, 'ext') })
+    const added = await post('/api/extensions/add', { path: path.join(TMP, 'ext'), source: 'test.extensions.add' })
     if (!added.ok) throw new Error(`ext add failed: ${JSON.stringify(added)}`)
     console.log(`extension registered: ${added.extension.name}`)
 
@@ -120,7 +120,7 @@ async function main() {
 
     const siteTarget = (await conn.cdp.send('Target.getTargets')).targetInfos.find((t: any) => t.url.startsWith(`http://127.0.0.1:${SITE_PORT}`))
     await conn.cdp.send('Runtime.evaluate', { expression: 'window.unsavedDraft = "keep me"' }, conn.sessionId)
-    const dev = await post('/api/extensions/dev', { name: added.extension.name, targetId: siteTarget.targetId, activate: false })
+    const dev = await post('/api/extensions/dev', { name: added.extension.name, targetId: siteTarget.targetId, activate: false, source: 'test.extensions.dev' })
     if (!dev.ok || !dev.panelTargetId) throw new Error(`side panel failed: ${JSON.stringify(dev)}`)
     const panelSession = await conn.cdp.attach(dev.panelTargetId)
     const panelType = await conn.cdp.send('Runtime.evaluate', { expression: 'chrome.runtime.getContexts({contextTypes:["SIDE_PANEL"]})', awaitPromise: true, returnByValue: true }, panelSession)
@@ -132,7 +132,7 @@ async function main() {
     await conn.cdp.evaluateOnSession(panelSession, 'document.querySelector("#highlight").click()')
     await waitFor(async () => !!(await conn.cdp.evaluateOnSession(conn.sessionId, 'document.querySelector("h1").style.background')), 5000, 'sample side panel changes website heading')
     console.log('PASS side panel ↔ website messaging')
-    const inspector = await post('/api/inspect', { targetId: dev.panelTargetId, activate: false })
+    const inspector = await post('/api/inspect', { targetId: dev.panelTargetId, activate: false, source: 'test.extensions.inspect' })
     if (!inspector.ok) throw new Error(`inspector failed: ${JSON.stringify(inspector)}`)
     const inspectorSession = await conn.cdp.attach(inspector.targetId)
     await waitFor(async () => {
@@ -161,7 +161,7 @@ async function main() {
     conn = await connectPage()
     const v2 = await readVersion(conn.cdp, conn.sessionId)
     console.log(`content script version after hot reload: ${v2}`)
-    const devAgain = await post('/api/extensions/dev', { name: added.extension.name, targetId: siteTarget.targetId, activate: false })
+    const devAgain = await post('/api/extensions/dev', { name: added.extension.name, targetId: siteTarget.targetId, activate: false, source: 'test.extensions.dev' })
     if (!devAgain.ok) throw new Error(JSON.stringify(devAgain))
     const againSession = await conn.cdp.attach(devAgain.panelTargetId)
     const stored = await conn.cdp.send('Runtime.evaluate', { expression: 'chrome.storage.local.get("draft")', returnByValue: true, awaitPromise: true }, againSession)
@@ -191,7 +191,7 @@ async function main() {
     for (let attempt = 1; attempt <= 3; attempt++) {
       await conn.cdp.send('Page.bringToFront', {}, secondSession)
       await sleep(250)
-      const openA = await post('/api/extensions/dev', { name: added.extension.name, targetId: siteTarget.targetId, activate: false })
+      const openA = await post('/api/extensions/dev', { name: added.extension.name, targetId: siteTarget.targetId, activate: false, source: 'test.extensions.dev' })
       if (!openA.ok || !openA.panelTargetId) throw new Error(`two-window side panel failed: ${JSON.stringify(openA)}`)
       const owner = await panelHost(openA.panelTargetId)
       if (owner !== winA) throw new Error(`attempt ${attempt}: panel opened in window ${owner}, expected ${winA}`)

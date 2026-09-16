@@ -357,7 +357,7 @@ export class BrowserManager {
   }
 
   /** Restart preserving http(s) tabs (used by extension hot reload). */
-  async restart(reason: string): Promise<void> {
+  async restart(reason: string, launchOpts: Pick<LaunchOptions, 'focus' | 'keepVisible'> = {}): Promise<void> {
     if (!this.running || !this.current) return
     const cur = this.current
     const tabs = (await this.listTabs())
@@ -371,7 +371,7 @@ export class BrowserManager {
     log(`restarting browser (${reason}); restoring ${tabs.length} tab(s), ${withNames.length} extension(s)`)
     const first = tabs.shift()
     await this.stop()
-    await this.launch({ url: first ?? 'about:blank', space: cur.space, with: withNames })
+    await this.launch({ url: first ?? 'about:blank', space: cur.space, with: withNames, ...launchOpts })
     const opened = this.current
     if (opened) {
       for (const url of tabs) {
@@ -381,7 +381,8 @@ export class BrowserManager {
   }
 
   async restartIfRunning(reason: string): Promise<void> {
-    if (this.running) await this.restart(reason)
+    // Internal/automatic restart helper: never relaunch into a visible window.
+    if (this.running) await this.restart(reason, { focus: false })
   }
 }
 

@@ -183,7 +183,7 @@ async function main() {
       const info = await ensureDaemon()
       const url = args._[1]
       if (!url) throw new Error('usage: backlight open <url> [--with 扩展名]')
-      await api(info, '/api/open', { method: 'POST', body: JSON.stringify({ url, with: withList }) })
+      await api(info, '/api/open', { method: 'POST', body: JSON.stringify({ url, with: withList, source: 'cli.open' }) })
       console.log(`opened: ${url}`)
       return
     }
