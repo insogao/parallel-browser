@@ -50,7 +50,7 @@
 - 转移时间戳：`/api/bg` 4.00s → CDP minimized 4.96s / DOM hidden 4.96s / native offscreen 4.96s / AppKit hidden 5.84s；`show --maximize` 15.95s → DOM visible 16.29s → CDP maximized 17.37s；恢复后 `nativeRaf=100.5/s`。
 - 该轮随后在 Phase B 失败：capture 保活 setup 后窗口停在 `normal` 且前台可见。由此定位并修复第 4 项缺口；修复后的定向诊断（非验收）显示窗口能回到 `minimized/offscreen`，但 AppKit 仍被 picker 解除隐藏，于是补上 `hideApp` 再隐藏与单元测试。
 
-红绿记录：`app-control windows` 未实现时真实验收在 “baseline must have a native on-screen window” 失败；实现后该断言通过。`show --maximize` 修复前，对应单元测试失败；修复后通过。Reviewer 加固的 4 项新单元在旧源码上全部失败（capture 异步 normal/延迟位置、hide 被 takeover 竞态；windows normal 超时不发 maximize、supersede 不计恢复），加固后全绿。
+红绿记录：`app-control windows` 未实现时真实验收在 “baseline must have a native on-screen window” 失败；实现后该断言通过。`show --maximize` 修复前，对应单元测试失败；修复后通过。Reviewer 加固的 4 项新单元在旧源码上全部失败（capture 异步 normal/延迟位置、hide 被 takeover 竞态；windows normal 超时不发 maximize、supersede 不计恢复），加固后全绿。第二轮 P1 的 2 项新单元（normal 后探针 reject/瞬时 reject）同样先红后绿；`windowTouched` 保证即使 park 未记录也会修复窗口。
 
 ## 待人工验收（pending，只跑一次）
 

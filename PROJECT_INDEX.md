@@ -73,6 +73,7 @@ node packages/cli/bin/backlight.js inspect <targetId>
 - 角落（corner）模式下窗口几乎完全离屏，Chromium 不产生合成帧：默认 `Page.captureScreenshot` 可能永久等待，`fromSurface:false` 也不保证成功。后台截图请使用 capture keep-alive（spike 实测 57–78ms）或可见窗口；AI 客户端在后台截屏前应先恢复窗口或依赖捕获保活。
 - 人工接手中断 capture setup（含 controller 已激活、或成功后暂停的竞态）时回到原网页；若用户已切换其它标签则保留用户选择。
 - 应用隐藏时窗口需要两次 normal→minimized 循环才会真正隐藏（AppKit 与 CDP 状态语义差异）；应用可见时一次即可。
+- capture 的 hide/unhide 不共享 proxy 的 native 可见性队列（该队列只串行化 API 触发的 hide/unhide/activate）。`setPaused(true)` 会等待进行中的 capture tick，cleanup 在 hide 完成后重查控制代际，若接管已开始则补 unhide，因此 `/api/show` 接管最终可见；但 capture 的 native 操作与 API 的 native 操作并发时没有全局串行保证。手动移动窗口或物理 Dock 点击恢复也建议经 `show` 路由（`restoreAll` + `native.persist`），不要与 capture setup 并发操作同一窗口。
 - capture 保活 setup 会短暂 park/取消最小化窗口，macOS picker 也可能取消 AppKit 隐藏；已修复为恢复位置后再最小化并用 `hideApp` 再隐藏，但该修复的**真机 capture 最终验收尚未复跑**（pending：`test:window-state`）。最小化且无 capture 时原生 compositor rAF=0 已由 2026-09-16 一次真实运行证明。
 - `document.visibilityState` 不做断言也不改写：capture 豁免下显示值由 Chromium 决定；补偿 rAF 只代表页面逻辑帧。
 - sidePanel 调试会关闭并重新打开当前窗口面板，以准确定位目标；面板临时状态可能丢失，storage 数据保留。隐藏面板的 WebContents 会被复用，归属用 `chrome.windows.getCurrent()` 验证。

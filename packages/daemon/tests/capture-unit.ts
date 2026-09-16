@@ -251,6 +251,52 @@ test('takeover during a delayed hide ends with the app visible (hide undone)', a
   assert.equal(f.bounds.left, 50)
 })
 
+test('probe failures after normal fail setup but cleanup still restores the window', async t => {
+  // The bug this guards: the first getWindowBounds after sending normal
+  // rejects; the wait used to return null immediately and engage returned
+  // with parked unset, leaving the window normal/foreground forever.
+  let hides = 0
+  let failProbes = false
+  const f = fixture(t, { appHidden: true, onHide: () => { hides++ } })
+  f.setHook((method, params) => {
+    if (method === 'Browser.setWindowBounds' && params.bounds.windowState === 'normal') failProbes = true
+    if (method === 'Browser.getWindowBounds' && failProbes) return Promise.reject(new Error('cdp probe timeout'))
+    return undefined
+  })
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.equal(f.capture.activeTargetId(), null, 'setup must not be counted as successful')
+  const setBounds = f.calls.filter(c => c.method === 'Browser.setWindowBounds').map(c => c.params.bounds)
+  assert.equal(setBounds.at(-2)?.left, 50, 'cleanup still sends the original position')
+  assert.equal(setBounds.at(-2)?.top, 60)
+  assert.deepEqual(setBounds.at(-1), { windowState: 'minimized' }, 'cleanup still sends minimize last')
+  assert.equal(f.bounds.windowState, 'minimized')
+  assert.equal(f.bounds.left, 50)
+  assert.equal(hides, 1, 'a hidden background app must be re-hidden exactly once')
+  assert.equal(f.page.document.title, 'Original', 'no title residue')
+  assert.equal(f.calls.filter(c => c.method === 'Input.dispatchMouseEvent').length, 0, 'no controller interaction')
+  assert.equal(
+    f.calls.filter(c => c.method === 'Runtime.evaluate' && String((c.params as any).expression).includes('startCapture')).length,
+    0, 'capture must not start')
+})
+
+test('a single transient probe failure after normal is retried and setup still succeeds', async t => {
+  let hides = 0
+  let probes = 0
+  const f = fixture(t, { appHidden: true, onHide: () => { hides++ } })
+  f.setHook(method => {
+    if (method !== 'Browser.getWindowBounds') return undefined
+    probes++
+    if (probes === 2) return Promise.reject(new Error('transient cdp timeout'))
+    return undefined
+  })
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.equal(f.capture.activeTargetId(), 'page', 'a single failed probe must not abort setup')
+  assert.equal(hides, 1)
+  assert.equal(f.bounds.windowState, 'minimized')
+  assert.equal(f.bounds.left, 50)
+  assert.equal(f.page.document.title, 'Original')
+})
+
 test('hanging Runtime promise cannot block takeover or later disrupt it', async t => {
   const f = fixture(t)
   let paused: Promise<void> | undefined
