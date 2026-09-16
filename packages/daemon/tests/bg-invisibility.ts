@@ -136,14 +136,14 @@ try {
   await api('settings', { captureKeepAlive: true, backgroundMode: true, collapseMode: 'minimize', pumpFps: 1 })
   await api('launch', { url: siteUrl, keepVisible: true, source: 'probe.bg-invisibility.launch' })
   const status = await api('status')
-  const pid = status.browser.pid as number
+  let pid = status.browser.pid as number
   assert.ok(pid > 0, 'managed browser pid unavailable')
   cdp = await Cdp.connect((await fetchVersion(status.browser.upstreamPort)).webSocketDebuggerUrl)
   const { targetInfos } = await cdp.send<{ targetInfos: Array<{ type: string; url: string; targetId: string }> }>('Target.getTargets')
   const page = targetInfos.find(t => t.type === 'page' && t.url.startsWith(siteUrl))
   assert.ok(page, 'probe page not found')
   const targetId = page.targetId
-  const session = await cdp.attach(targetId)
+  let session = await cdp.attach(targetId)
   const { windowId } = await cdp.send<{ windowId: number }>('Browser.getWindowForTarget', { targetId })
 
   const readNativeRaf = () => cdp!.evaluateOnSession<number>(session, 'window.__h ? window.__h.raf : 0')
@@ -241,6 +241,83 @@ try {
     'no auto-origin restore/unhide transition may exist after bg')
   const bgMinimizeAfterAuto = autoEntries.filter(e => e.event === 'window-minimize' && e.source === 'probe.explicit.bg')
   assert.equal(bgMinimizeAfterAuto.length, bgMinimize.length, 'auto show must not add window transitions')
+
+  // ---- a hidden restart must stay hidden -------------------------------------
+  // `manager.restart` stops and relaunches the browser, then recreates the
+  // saved http(s) tabs. Even with an allowlisted source, no visibility flag is
+  // requested: the relaunch must end natively hidden (a warm macOS reopen can
+  // otherwise relaunch the app unhidden) and no recreated tab may focus or
+  // un-park a window. The strict invisibility contract therefore applies to
+  // the whole post-restart window, not just the corner baseline.
+  await api('open', { url: `${siteUrl}/?extra=restart`, source: 'probe.explicit.restart.prepare' })
+  await sleep(500)
+  const preRestartPid = pid
+  await api('restart', { reason: 'probe hidden restart', source: 'probe.explicit.restart' })
+  const restarted = await api('status')
+  pid = restarted.browser?.pid as number
+  assert.ok(pid > 0 && pid !== preRestartPid, `restart must relaunch: ${JSON.stringify(restarted.browser)}`)
+  const restartEntries = (await api('state-log?limit=200')).entries as any[]
+  const restartEntry = restartEntries.find(e => e.event === 'restart' && e.source === 'probe.explicit.restart')
+  assert.ok(restartEntry, `restart provenance missing: ${JSON.stringify(restartEntries.slice(-8))}`)
+  assert.equal(restartEntry.branch, 'forced-background', JSON.stringify(restartEntry))
+  assert.equal(restartEntry.after, 'background')
+  assert.equal(typeof restartEntry.token, 'string', 'restart must correlate with a control intent')
+  assert.ok(!restartEntries.some(e => e.event === 'restart' && e.branch === 'visible-request'),
+    'a plain restart must never take the visible-request branch')
+
+  const restartCdp = await Cdp.connect((await fetchVersion(restarted.browser.upstreamPort)).webSocketDebuggerUrl)
+  const pageTargetCount = async () => {
+    const { targetInfos } = await restartCdp.send<{ targetInfos: Array<{ type: string }> }>('Target.getTargets')
+    return targetInfos.filter(t => t.type === 'page').length
+  }
+  // WindowServer + AppKit are the ground truth for visibility. CDP windowState
+  // is not usable while the app is hidden (bounds can report a normal on-screen
+  // position even though no window is visible), so the strict contract is
+  // native: app hidden, inactive, zero on-screen windows, with restored pages
+  // present in the CDP target list.
+  type RestartSample = { hidden: boolean; active: boolean; onScreen: number; pages: number }
+  const restartSamples: RestartSample[] = []
+  const sampleRestart = async (): Promise<RestartSample> => {
+    const probe = await nativeVisibility(pid).catch(() => null)
+    return {
+      hidden: probe?.hidden ?? false,
+      active: probe?.active ?? true,
+      onScreen: probe?.onScreenWindowCount ?? -1,
+      pages: await pageTargetCount().catch(() => 0),
+    }
+  }
+  const settledAt = Date.now() + 25_000
+  let restartSettledIndex = -1
+  while (Date.now() < settledAt) {
+    restartSamples.push(await sampleRestart())
+    const s = restartSamples.at(-1)!
+    if (!s.active && s.hidden && s.onScreen === 0 && s.pages > 0) {
+      restartSettledIndex = restartSamples.length - 1
+      break
+    }
+    await sleep(150)
+  }
+  assert.ok(restartSettledIndex >= 0,
+    `restarted browser never settled natively hidden with no on-screen window: ${JSON.stringify(restartSamples.slice(-8))}`)
+  // Hold the invisible contract for a bounded observation window after settling.
+  const lateSamples: RestartSample[] = []
+  for (let i = 0; i < 15; i++) {
+    lateSamples.push(await sampleRestart())
+    await sleep(200)
+  }
+  const exposed = lateSamples.filter(s => s.active || !s.hidden || s.onScreen > 0)
+  assert.deepEqual(exposed, [], `a plain restart became visible after settling: ${JSON.stringify(exposed.slice(0, 5))}`)
+  assert.ok(lateSamples.every(s => s.pages > 0), 'restored pages must stay present')
+  console.log(`hidden restart: settled natively hidden after ${((restartSettledIndex + 1) * 0.15).toFixed(1)}s of sampling, ${lateSamples.length} further samples inactive/hidden/onScreen=0 with restored pages present`)
+
+  // Rebind to the restarted browser: the old CDP connection died with the
+  // restart, and the explicit-show section below measures the restored page.
+  cdp = restartCdp
+  const { targetInfos: restartedTargets } = await restartCdp.send<{ targetInfos: Array<{ targetId: string; type: string; url: string }> }>('Target.getTargets')
+  const restartedPage = restartedTargets.find(t => t.type === 'page' && t.url.startsWith(siteUrl))
+  assert.ok(restartedPage, 'restored probe page not found after restart')
+  session = await restartCdp.attach(restartedPage.targetId)
+  await waitFor(async () => (await readNativeRaf().catch(() => 0)) > 0, 'rAF counter after restart', 15_000)
 
   // ---- an explicit show still works (login/show contract preserved) ---------
   await api('show', { maximize: true, activate: false, source: 'probe.explicit.show' })

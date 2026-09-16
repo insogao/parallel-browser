@@ -19,9 +19,10 @@ export interface Settings {
   /** 'auto' or an absolute browser binary path */
   browser: string
   /**
-   * 'background' (default): launch without stealing focus; the first window is
-   * born at the offscreen corner (2px sliver) so pages run at native full speed.
-   * 'visible': launch focused/on screen like a normal browser.
+   * @deprecated Kept only so existing settings.json files keep loading. Launch
+   * visibility now requires an explicit focus/keepVisible request from an
+   * explicit control surface; this value can no longer make a plain launch
+   * (CLI/AI/probe/restart) visible. 'background' remains the effective default.
    */
   launchMode: 'background' | 'visible'
   /**

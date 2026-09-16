@@ -66,10 +66,23 @@ export interface LaunchOptions {
   with?: string[]
   /** launch without any dev extensions */
   bare?: boolean
-  /** override settings.launchMode for this launch */
+  /**
+   * request an on-screen launch. `focus` and `keepVisible` are the only
+   * visibility switches: a plain launch is always background, even when
+   * `settings.launchMode` is 'visible'.
+   */
   focus?: boolean
-  /** internal: skip auto-collapse after launch (tests that measure visible baseline) */
+  /** request a visible launch (login / acceptance baselines); never a default */
   keepVisible?: boolean
+}
+
+/**
+ * The only switch that may create on-screen state. Kept as a pure function so
+ * the invariant is unit-tested without spawning a browser: `settings.launchMode`
+ * is deliberately not an input.
+ */
+export function launchRequestsVisibility(opts: Pick<LaunchOptions, 'focus' | 'keepVisible'>): boolean {
+  return opts.focus === true || opts.keepVisible === true
 }
 
 export interface BrowserInstance {
@@ -93,6 +106,13 @@ export interface ManagerDeps {
   extensions: ExtensionManager
   /** hook that records/manages collapsed windows (set by the daemon wiring) */
   cornerWindow?: (cdp: Cdp, windowId: number) => Promise<boolean>
+  /**
+   * Verified native app hide (native.ts hideBrowser). Background launches
+   * re-assert it because macOS can relaunch a previously-visible app unhidden
+   * even with `open -g -j`; without it a plain launch could leave windows on
+   * screen. Optional so unit tests can stub the manager without the OS.
+   */
+  hideApp?: (pid: number) => Promise<void>
 }
 
 export class BrowserManager {
@@ -141,7 +161,11 @@ export class BrowserManager {
     }
     const loadedExtensions = captureExtension ? [captureExtension.dir, ...extensionPaths] : extensionPaths
 
-    const backgroundLaunch = opts.keepVisible ? false : !(opts.focus ?? settings.launchMode === 'visible')
+    // Only an explicit visibility request can create an on-screen window.
+    // `settings.launchMode` is legacy and intentionally not consulted: plain
+    // launches (CLI/AI/probe/restart) are always background, so neither a
+    // caller label nor a stale setting can inherit visible state.
+    const backgroundLaunch = !launchRequestsVisibility(opts)
     const upstreamPort = await findFreePort()
     const args = [
       `--user-data-dir=${profileDir}`,
@@ -229,6 +253,11 @@ export class BrowserManager {
           warn(`background target failed: ${e.message}`))
       }
       await this.autoCollapse(cdp)
+      // A background launch must also be natively hidden: macOS may relaunch a
+      // previously-visible app unhidden (warm reopen) despite `open -g -j`.
+      // Verified by native.ts; a hide failure fails the launch, never silently
+      // leaves a cornered-but-unhidden window.
+      if (this.deps.hideApp) await this.deps.hideApp(realPid)
     } else if (opts.url) {
       // visible mode: open the initial url(s) in the startup window
       const cur = this.current
@@ -375,7 +404,15 @@ export class BrowserManager {
     const opened = this.current
     if (opened) {
       for (const url of tabs) {
-        await opened.cdp.send('Target.createTarget', { url }).catch((e) => warn(`tab restore failed: ${e.message}`))
+        // Recreated tabs are background targets: the hidden-restart contract
+        // is that restoring a session may never focus or unveil a window.
+        await opened.cdp.send('Target.createTarget', { url, background: true }).catch((e) => warn(`tab restore failed: ${e.message}`))
+      }
+      // Chrome unhides a hidden app when a tab is created in its window
+      // (measured on macOS), so a background restart re-asserts the invisible
+      // state after the session is fully recreated.
+      if (!launchRequestsVisibility(launchOpts) && this.deps.hideApp) {
+        await this.deps.hideApp(opened.pid)
       }
     }
   }

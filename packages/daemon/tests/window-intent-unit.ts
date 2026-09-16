@@ -455,7 +455,7 @@ test('explicit show maximizes and foregrounds with correlated attribution', { ti
 
 // ---- launch / open / restart provenance ------------------------------------
 
-test('non-explicit launch never inherits launchMode=visible; explicit launch still does', { timeout: 20_000 }, async () => {
+test('no launch inherits launchMode=visible: plain launches are background, only explicit visibility flags may show', { timeout: 20_000 }, async () => {
   await withLaunchMode('visible', async () => {
     const h = harness({ running: false })
     const base = await h.listen()
@@ -469,18 +469,38 @@ test('non-explicit launch never inherits launchMode=visible; explicit launch sti
       assert.equal(launchIntent.origin, 'unknown')
       assert.equal(launchIntent.branch, 'background')
 
-      const explicit = await post(base, '/api/launch', { url: 'about:blank', source: 'cli.launch' })
-      assert.equal(explicit.body.ok, true)
-      assert.equal(h.track.launchOpts.focus, undefined, 'an explicit plain launch may honor launchMode')
-      assert.equal(h.track.launchOpts.keepVisible, undefined)
+      // `bl launch` without --focus/--keep-visible promises background even
+      // though cli.launch is an allowlisted explicit source.
+      const explicitPlain = await post(base, '/api/launch', { url: 'about:blank', source: 'cli.launch' })
+      assert.equal(explicitPlain.body.ok, true)
+      assert.equal(h.track.launchOpts.focus, false, 'a plain explicit launch must not honor launchMode')
+      assert.equal(h.track.launchOpts.keepVisible, false)
+      const plainEntry = h.stateLog.recent(40).find(e => e.event === 'launch' && e.source === 'cli.launch')
+      assert.ok(plainEntry)
+      assert.equal(plainEntry.origin, 'explicit')
+      assert.equal(plainEntry.branch, 'background')
+      assert.ok(!h.stateLog.recent(40).some(e => e.event === 'policy-downgrade'
+        && e.detail === 'non-explicit-visible-launch'), 'a plain launch requested nothing, so nothing is downgraded')
 
       const foreground = await post(base, '/api/launch', { url: 'about:blank', source: 'cli.launch', focus: true })
       assert.equal(foreground.body.ok, true)
       assert.equal(h.track.launchOpts.focus, true)
+      assert.equal(h.track.launchOpts.keepVisible, false)
 
-      const downgraded = await post(base, '/api/launch', { url: 'about:blank', focus: true })
-      assert.equal(h.track.launchOpts.focus, false, 'a non-explicit focus request is downgraded')
-      assert.ok(h.stateLog.recent(40).some(e => e.event === 'policy-downgrade' && e.branch === 'foreground' && e.origin === 'unknown'))
+      const keepVisible = await post(base, '/api/launch', { url: 'about:blank', source: 'dashboard.launch', keepVisible: true })
+      assert.equal(keepVisible.body.ok, true)
+      assert.equal(h.track.launchOpts.focus, false)
+      assert.equal(h.track.launchOpts.keepVisible, true)
+
+      const backgroundFalse = await post(base, '/api/launch', { url: 'about:blank', source: 'cli.launch', background: false })
+      assert.equal(backgroundFalse.body.ok, true)
+      assert.equal(h.track.launchOpts.focus, true)
+
+      const downgraded = await post(base, '/api/launch', { url: 'about:blank', focus: true, keepVisible: true })
+      assert.equal(h.track.launchOpts.focus, false, 'a non-explicit visibility request is downgraded')
+      assert.equal(h.track.launchOpts.keepVisible, false)
+      assert.ok(h.stateLog.recent(40).some(e => e.event === 'policy-downgrade' && e.branch === 'foreground'
+        && e.origin === 'unknown' && e.detail === 'non-explicit-visible-launch'))
     } finally {
       h.server.close()
     }
@@ -511,7 +531,7 @@ test('open first launch is background even with launchMode=visible; running open
   })
 })
 
-test('non-explicit restart is forced background even with launchMode=visible', { timeout: 20_000 }, async () => {
+test('restart never inherits launchMode=visible: plain restarts are background, explicit visibility flags required', { timeout: 20_000 }, async () => {
   await withLaunchMode('visible', async () => {
     const h = harness()
     const base = await h.listen()
@@ -520,13 +540,44 @@ test('non-explicit restart is forced background even with launchMode=visible', {
       assert.equal(unknown.body.ok, true)
       assert.equal(h.track.restarts.length, 1)
       assert.equal(h.track.restarts[0].opts.focus, false, 'unknown restart must be forced background')
-      const restartEntry = h.stateLog.recent(20).find(e => e.event === 'restart')
-      assert.ok(restartEntry)
-      assert.equal(restartEntry.origin, 'unknown')
-      assert.equal(restartEntry.branch, 'forced-background')
+      assert.equal(h.track.restarts[0].opts.keepVisible, false)
+      const unknownEntry = h.stateLog.recent(20).find(e => e.event === 'restart')
+      assert.ok(unknownEntry)
+      assert.equal(unknownEntry.origin, 'unknown')
+      assert.equal(unknownEntry.branch, 'forced-background')
+      assert.equal(typeof unknownEntry.token, 'string', 'restart transitions must be token-correlated')
 
+      // Explicit but plain restart also stays background (CLI contract).
       await post(base, '/api/restart', { reason: 'probe', source: 'cli.restart' })
-      assert.equal(h.track.restarts[1].opts.focus, undefined, 'explicit restart keeps launchMode behavior')
+      assert.equal(h.track.restarts[1].opts.focus, false, 'a plain explicit restart must not honor launchMode')
+      assert.equal(h.track.restarts[1].opts.keepVisible, false)
+      const plainEntry = h.stateLog.recent(20).find(e => e.event === 'restart' && e.source === 'cli.restart')
+      assert.ok(plainEntry)
+      assert.equal(plainEntry.origin, 'explicit')
+      assert.equal(plainEntry.branch, 'forced-background')
+      assert.equal(plainEntry.after, 'background')
+
+      await post(base, '/api/restart', { reason: 'probe', source: 'cli.restart', focus: true })
+      assert.equal(h.track.restarts[2].opts.focus, true)
+      assert.equal(h.track.restarts[2].opts.keepVisible, false)
+      const visibleEntry = h.stateLog.recent(20).find(e => e.event === 'restart' && e.source === 'cli.restart'
+        && e.branch === 'visible-request')
+      assert.ok(visibleEntry, 'explicit focus request may relaunch visible')
+      assert.equal(visibleEntry.after, 'visible')
+      const visibleIntent = h.stateLog.recent(20).find(e => e.event === 'control-intent'
+        && e.source === 'cli.restart' && e.branch === 'show')
+      assert.ok(visibleIntent)
+      assert.equal(visibleEntry.token, visibleIntent.token, 'the restart transition must correlate with its control intent')
+
+      await post(base, '/api/restart', { reason: 'probe', source: 'cli.restart', keepVisible: true })
+      assert.equal(h.track.restarts[3].opts.focus, false)
+      assert.equal(h.track.restarts[3].opts.keepVisible, true)
+
+      await post(base, '/api/restart', { reason: 'probe', focus: true, keepVisible: true })
+      assert.equal(h.track.restarts[4].opts.focus, false, 'a non-explicit visibility request is downgraded')
+      assert.equal(h.track.restarts[4].opts.keepVisible, false)
+      assert.ok(h.stateLog.recent(20).some(e => e.event === 'policy-downgrade' && e.branch === 'foreground'
+        && e.detail === 'non-explicit-visible-restart'), 'the downgrade must be logged, never silent')
     } finally {
       h.server.close()
     }

@@ -505,10 +505,11 @@ async function handleApi(
     }
     case 'POST /api/launch': {
       const requestedForeground = payload.focus === true || payload.keepVisible === true || payload.background === false
-      // Showing a window (`focus`/`keepVisible`) is foreground state: only an
-      // explicit intent may request it. A non-explicit launch is always forced
-      // to background and never inherits settings.launchMode, so an automatic
-      // or unknown caller can never create on-screen state.
+      // Showing a window (`focus`/`keepVisible`/`background:false`) is
+      // foreground state: it requires BOTH an explicit control-surface source
+      // AND an actual visibility flag. A plain launch — even `cli.launch`, as
+      // the CLI itself promises — is forced background and never inherits
+      // settings.launchMode.
       const explicitLaunch = meta.origin === 'explicit'
       const foreground = requestedForeground && explicitLaunch
       const gen = deps.supervisor.beginControl() // a new launch outranks any settling collapse
@@ -525,12 +526,8 @@ async function handleApi(
           space: payload.space,
           with: payload.with,
           bare: payload.bare === true,
-          focus: foreground ? (payload.focus === true || payload.background === false ? true : undefined)
-            : requestedForeground ? false
-            : explicitLaunch ? undefined : false,
-          keepVisible: foreground ? payload.keepVisible === true
-            : requestedForeground ? false
-            : explicitLaunch ? undefined : false,
+          focus: foreground && (payload.focus === true || payload.background === false),
+          keepVisible: foreground && payload.keepVisible === true,
         })
         transition(deps, {
           event: 'launch', ...intentFields(intent), pid: inst.pid,
@@ -620,16 +617,35 @@ async function handleApi(
     }
     case 'POST /api/restart': {
       if (!deps.manager.running) return json(res, 409, { error: 'browser not running' })
-      const foreground = meta.origin === 'explicit'
-      deps.supervisor.beginControl() // restart outranks any settling collapse
-      // Non-explicit restarts relaunch hidden/background: settings.launchMode
-      // may not turn an automatic restart into a visible window.
-      await deps.manager.restart(payload.reason ?? 'manual restart', foreground ? {} : { focus: false })
-      transition(deps, {
-        event: 'restart', origin: meta.origin, source: meta.source, route, requestId,
-        branch: foreground ? 'launch-mode' : 'forced-background',
-      })
-      json(res, 200, { ok: true })
+      const requestedForeground = payload.focus === true || payload.keepVisible === true || payload.background === false
+      // Conservative visibility contract, identical to /api/launch: a restart
+      // may only come back on screen when an explicit control surface requests
+      // it with an actual visibility flag. A plain restart — even `cli.restart`
+      // — is forced background and never inherits settings.launchMode.
+      const foreground = requestedForeground && meta.origin === 'explicit'
+      const gen = deps.supervisor.beginControl() // restart outranks any settling collapse
+      const intent = deps.supervisor.noteIntent(meta.origin, foreground ? 'show' : 'bg', { source: meta.source, route, requestId, gen })
+      if (requestedForeground && !foreground) {
+        transition(deps, { event: 'policy-downgrade', ...intentFields(intent), branch: 'foreground', detail: 'non-explicit-visible-restart' })
+      }
+      deps.supervisor.humanMode = foreground
+      try {
+        await deps.manager.restart(payload.reason ?? 'manual restart', {
+          focus: foreground && (payload.focus === true || payload.background === false),
+          keepVisible: foreground && payload.keepVisible === true,
+        })
+        transition(deps, {
+          event: 'restart', ...intentFields(intent),
+          branch: foreground ? 'visible-request' : 'forced-background',
+          after: foreground ? 'visible' : 'background',
+        })
+        deps.supervisor.completeIntent(intent.token, 'applied')
+        json(res, 200, { ok: true })
+      } catch (err) {
+        transition(deps, { event: 'restart', ...intentFields(intent), branch: 'failed', detail: (err as Error).message })
+        deps.supervisor.completeIntent(intent.token, 'failed')
+        throw err
+      }
       return
     }
     case 'POST /api/bg': {

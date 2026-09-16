@@ -56,6 +56,9 @@ async function main() {
   const manager: BrowserManager = new BrowserManager({
     extensions,
     cornerWindow: (cdp, windowId) => supervisor.cornerWindow(cdp, windowId),
+    // Background launches re-assert native hidden (macOS warm reopen can
+    // otherwise relaunch a previously-visible app unhidden).
+    hideApp: hideBrowser,
   })
   const health = new HealthMonitor(() => (manager.current ? { cdp: manager.current.cdp } : null))
   const supervisor: FramePumpSupervisor = new FramePumpSupervisor(
