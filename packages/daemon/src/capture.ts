@@ -76,6 +76,10 @@ export class CaptureKeepAlive {
     return this.active?.targetId ?? null
   }
 
+  isPaused(): boolean {
+    return this.paused
+  }
+
   async setPaused(paused: boolean): Promise<void> {
     this.paused = paused
     if (paused) this.generation++

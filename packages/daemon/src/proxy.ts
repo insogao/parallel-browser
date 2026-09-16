@@ -13,7 +13,7 @@ import { listChromeProfiles, importProfile } from './import.ts'
 import { ensureChromiumForExtensions } from './browser.ts'
 import { brandBundle } from './brand.ts'
 import { paths } from './paths.ts'
-import { selectBrandedEngineSetting, type LoginResult } from './launcher.ts'
+import { resolveBrandedEngineSelection, selectBrandedEngineSetting, type LoginResult } from './launcher.ts'
 
 import type { FramePumpSupervisor } from './windows.ts'
 import { TapState, tapFrame } from './tap.ts'
@@ -256,30 +256,56 @@ interface NativeControl {
  * killed or switched; repeated/concurrent calls are idempotent.
  */
 async function runLogin(deps: ServerDeps, native: NativeControl): Promise<LoginResult> {
-  const selection = selectBrandedEngineSetting()
+  // Resolve read-only first: a live managed session on another engine must be
+  // refused before any side effect (settings write, humanMode, capture pause,
+  // restore/maximize, activate or launch).
+  const resolution = resolveBrandedEngineSelection()
   const before = deps.manager.current
+  if (deps.manager.running && before && resolution.engine
+    && path.resolve(before.binary) !== path.resolve(resolution.engine.binPath)) {
+    return {
+      ok: false,
+      launched: false,
+      restored: 0,
+      engine: resolution.engine.binPath,
+      mismatchedEngine: true,
+      currentEngine: before.binary,
+      note: `managed browser is already running with a different engine (${before.binary}); run backlight stop, then click again to switch`,
+    }
+  }
+  const selection = resolution.wouldChange
+    ? selectBrandedEngineSetting()
+    : { engine: resolution.engine, changed: false }
   let note: string | undefined
   let engine = selection.engine?.binPath ?? loadSettings().browser
   if (!selection.engine) {
     note = `branded engine not found under ${path.join(paths.root, 'apps')}; using configured engine`
-  } else if (before && path.resolve(before.binary) !== path.resolve(selection.engine.binPath)) {
-    note = `managed browser is already running with a different engine (${before.binary}); run backlight stop, then click again to switch`
   } else if (selection.changed) {
     note = 'selected the branded Backlight engine for the managed space'
   }
+  const previousHumanMode = deps.supervisor.humanMode
+  const previousPaused = deps.capture.isPaused?.() ?? false
   const gen = deps.supervisor.beginControl()
   deps.supervisor.humanMode = true
   await deps.capture.setPaused(true)
   let launched = false
-  if (!deps.manager.running) {
-    deps.supervisor.start()
-    const instance = await deps.manager.launch({ focus: true })
-    launched = true
-    engine = instance.binary
+  try {
+    if (!deps.manager.running) {
+      deps.supervisor.start()
+      const instance = await deps.manager.launch({ focus: true })
+      launched = true
+      engine = instance.binary
+    }
+    const restored = deps.manager.running ? await deps.supervisor.restoreAll(true, gen) : 0
+    await native.persist(gen, true)
+    return { ok: true, launched, restored, engine, note }
+  } catch (err) {
+    // Launch failed: restore the prior control/capture intent as far as the
+    // architecture allows (the bumped control generation deliberately stays).
+    deps.supervisor.humanMode = previousHumanMode
+    try { await deps.capture.setPaused(previousPaused) } catch { /* keep the original error */ }
+    throw err
   }
-  const restored = deps.manager.running ? await deps.supervisor.restoreAll(true, gen) : 0
-  await native.persist(gen, true)
-  return { ok: true, launched, restored, engine, note }
 }
 
 async function handleApi(

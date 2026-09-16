@@ -28,8 +28,9 @@
 
 ```bash
 pnpm -r --if-present run check
-pnpm --filter @backlight/daemon test:unit            # 56/56 + brand 11 项
-node --test packages/daemon/tests/launcher-unit.ts   # 12 项确定性测试
+pnpm --filter @backlight/daemon test:unit                          # 62/62 + brand 11 项
+node --test packages/daemon/tests/launcher-unit.ts \
+  packages/daemon/tests/single-instance-unit.ts                    # 18 项确定性测试
 git diff --check
 
 node packages/cli/bin/backlight.js launcher install   # 安装/刷新（重复执行验证替换安全）
@@ -49,6 +50,18 @@ mdfind "kMDItemCFBundleIdentifier == 'dev.backlight.launcher'"
 - 引擎/运行时不重签名（避免破坏 JIT）；启动器 ad-hoc 签名。
 - runtime 快照随源码更新需重跑 `bl launcher install`；Node 路径在安装时记录（含 `/opt/homebrew/bin/node`、`/usr/local/bin/node` 回退）。
 - 不覆盖任何非本启动器的 `~/Applications/Backlight.app`；replacement 前先读取并核验 bundle id。
+
+## Reviewer 加固（follow-up）
+
+独立复查确认设计后提出三项中等加固，逐项落实：
+
+1. **异引擎不产生副作用**：`runLogin` 先只读解析（`resolveBrandedEngineSelection`，不写 settings.json）；若受管会话正在运行且引擎不同，立即返回 `{ok:false, mismatchedEngine:true, currentEngine, restored:0}`，不改 settings、不改 `humanMode`、不 pause capture、不 restore/maximize、不 activate、不 launch、不 kill。启动失败时回滚 `humanMode` 与 capture 暂停状态（在架构允许范围内；已 bump 的控制代际有意保留）。`tests/launcher-unit.ts` 断言上述每一条副作用均未发生，以及失败回滚到调用前状态。
+2. **安装锁**：`installLauncher`/`installRuntime` 共用 `~/Library/Application Support/Backlight/launcher-install.lock`（owner.json 记录 pid/token/startedAt）；并发安装者串行等待（120s 上限），陈旧锁（owner 已死或 3s 内未写入元数据）通过原子 rename 到唯一 tombstone 后接管，只有 rename 胜者可重建锁；release 校验 token，绝不删除他人锁；**不抢占仍存活的 owner**，避免两个安装进程交错 staging/backup/rename。测试覆盖 live 争用、dead-owner 恢复、token 保护、并发两次安装收敛、无关文件/无关 app 保留。
+3. **daemon 单实例**：daemon 自己持锁（不再是 CLI 持锁），锁从 `findFreePort` 之前一直持有到 `daemon.json` 原子写入（tmp+rename）后释放；拿不到锁或拿到锁后发现存活实例/发布前发现竞态，均直接退出而不是退回随机端口或覆盖 daemon.json。`readLiveDaemon` + owner pid 存活检查替代按时间猜测。`tests/single-instance-unit.ts` 含真实竞态：同时启动两个 daemon（临时 home、随机端口、`BACKLIGHT_TRAY=0`），断言恰好一个存活、daemon.json 指向它且端口为配置端口、另一个退出、关停后 daemon.json/lock 清理干净。
+
+附带修复：`isOurLauncher` 只认精确 bundle id `dev.backlight.launcher`（存在 launcher.json 但 bundle id 不同的仿冒 app 既不能被覆盖也不能被卸载）；runtime 快照测试新增 canonical realpath 必须留在快照内、无 dangling symlink、裁剪 `.pnpm/node_modules` 下 typescript/@types/.bin 悬空 hoist、删除源树后 runtime 仍可 `import('ws')`/`import('chokidar')` 的独立可用性断言。
+
+安装刷新在 live 会话运行期间完成且原子：刷新前后 daemon/browser/tray pid、daemon.json、9333 端口、窗口状态（maximized）均一致；runtime 已含加固代码。**残余风险**：正在运行的 daemon 仍是加固前进程，其 `/api/login` 与单实例逻辑要等 daemon 下次启动生效（未重启以避免打扰会话）。
 
 ## 禁止事项
 

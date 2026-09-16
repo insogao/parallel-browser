@@ -20,10 +20,11 @@ const { createServer } = await import('../src/proxy.ts')
 
 const {
   LAUNCHER_BUNDLE_ID, ENGINE_BUNDLE_ID,
-  findBrandedEngine, findBrandedEngines, selectBrandedEngineSetting,
+  findBrandedEngine, findBrandedEngines, resolveBrandedEngineSelection, selectBrandedEngineSetting,
   buildLauncherApp, installRuntime, installLauncher, verifyLauncher, uninstallLauncher,
-  readBundleInfo, launcherPaths,
+  readBundleInfo, launcherPaths, isOurLauncher,
 } = launcher
+const { acquireFileLock, releaseFileLock, tryAcquireFileLock } = await import('../src/single-instance.ts')
 
 const sha256 = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 
@@ -31,6 +32,41 @@ function write(file: string, content: string, mode?: number) {
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, content)
   if (mode) fs.chmodSync(file, mode)
+}
+
+function collectSymlinks(root: string): string[] {
+  const links: string[] = []
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const candidate = path.join(dir, entry.name)
+      const stat = fs.lstatSync(candidate)
+      if (stat.isSymbolicLink()) links.push(candidate)
+      else if (stat.isDirectory()) walk(candidate)
+    }
+  }
+  walk(root)
+  return links
+}
+
+/** Every copied pnpm symlink must resolve inside the snapshot (no link back
+ * into a worktree/source tree) and none may dangle after dev-dep pruning. */
+function assertSymlinksStayInside(runtimeDir: string) {
+  // /var is a symlink to /private/var on macOS; compare canonical paths only.
+  const canonical = fs.realpathSync(runtimeDir)
+  const links = collectSymlinks(runtimeDir)
+  assert.ok(links.length > 0, 'snapshot should contain pnpm symlinks')
+  for (const link of links) {
+    let real: string
+    try {
+      real = fs.realpathSync(link)
+    } catch {
+      assert.fail(`dangling symlink in snapshot: ${link}`)
+    }
+    assert.ok(
+      real === canonical || real.startsWith(canonical + path.sep),
+      `symlink escapes the snapshot: ${link} -> ${real}`,
+    )
+  }
 }
 
 function makeEngineFixture(root: string, name = 'Backlight.app', bundleId = ENGINE_BUNDLE_ID) {
@@ -92,6 +128,15 @@ function makeSourceFixture(root: string) {
   link('../../../../node_modules/.pnpm/@puppeteer+browsers@3.2.2/node_modules/@puppeteer/browsers', '@puppeteer/browsers')
   link('../../../node_modules/.pnpm/typescript@5.9.3/node_modules/typescript', 'typescript')
   write(path.join(daemonModules, '@types', 'node', 'index.d.ts'), '// dev only\n')
+
+  // pnpm hoists a few packages into .pnpm/node_modules; the dev ones must be
+  // pruned so they do not become dangling symlinks after the snapshot copy.
+  const hoist = path.join(pnpm, 'node_modules')
+  link('../typescript@5.9.3/node_modules/typescript', path.relative(daemonModules, path.join(hoist, 'typescript')))
+  link('../ws@8.21.3/node_modules/ws', path.relative(daemonModules, path.join(hoist, 'ws')))
+  link('../../@types+node@24.13.4/node_modules/@types/node', path.relative(daemonModules, path.join(hoist, '@types', 'node')))
+  write(path.join(hoist, '.bin', 'tsc'), '#!/bin/sh\n')
+  link('../../../../packages/cli', path.relative(daemonModules, path.join(hoist, '@backlight', 'cli')))
 }
 makeSourceFixture(sourceRoot)
 
@@ -102,7 +147,7 @@ const fakeCompile = async (_source: string, out: string) => {
 
 const repoLauncherSource = new URL('../../launcher/main.swift', import.meta.url).pathname
 
-test('branded engine discovery ignores unbranded apps and selects the branded engine setting', () => {
+test('branded engine discovery ignores unbranded apps and resolves the setting read-only', () => {
   const engines = findBrandedEngines(home)
   assert.equal(engines.length, 1, 'only bundle id dev.backlight.browser counts')
   assert.equal(engines[0]!.bundleId, ENGINE_BUNDLE_ID)
@@ -111,37 +156,17 @@ test('branded engine discovery ignores unbranded apps and selects the branded en
 
   fs.rmSync(path.join(home, 'settings.json'), { force: true })
   invalidateSettings()
+  const readOnly = resolveBrandedEngineSelection(home)
+  assert.equal(readOnly.engine?.binPath, engine.bin)
+  assert.equal(readOnly.wouldChange, true)
+  assert.ok(!fs.existsSync(path.join(home, 'settings.json')), 'resolve must not write settings.json')
+
   const first = selectBrandedEngineSetting(home)
   assert.equal(first.changed, true)
   assert.equal(first.engine?.binPath, engine.bin)
   assert.equal(JSON.parse(fs.readFileSync(path.join(home, 'settings.json'), 'utf8')).browser, engine.bin)
   const second = selectBrandedEngineSetting(home)
   assert.equal(second.changed, false, 'already selected engine is a no-op')
-})
-
-test('single-instance helpers detect live daemons and serialize rapid starts', async () => {
-  const { readLiveDaemon, acquireStartLock, releaseStartLock } = await import('../src/single-instance.ts')
-  const file = path.join(base, 'daemon.json')
-  fs.rmSync(file, { force: true })
-  assert.equal(readLiveDaemon(file), null)
-  fs.writeFileSync(file, JSON.stringify({ pid: 2 ** 30, port: 1 }))
-  assert.equal(readLiveDaemon(file), null, 'dead pid is not a live daemon')
-  fs.writeFileSync(file, JSON.stringify({ pid: process.pid, port: 123 }))
-  assert.deepEqual(readLiveDaemon(file), { pid: process.pid, port: 123 })
-
-  const lockDir = path.join(base, 'lock home')
-  fs.mkdirSync(lockDir, { recursive: true })
-  assert.equal(acquireStartLock(lockDir), true)
-  assert.equal(acquireStartLock(lockDir), false, 'second starter must not start another daemon')
-  releaseStartLock(lockDir)
-  assert.equal(acquireStartLock(lockDir), true)
-  releaseStartLock(lockDir)
-  const lock = path.join(lockDir, 'daemon.lock')
-  fs.mkdirSync(lock)
-  const old = new Date(Date.now() - 60_000)
-  fs.utimesSync(lock, old, old)
-  assert.equal(acquireStartLock(lockDir, 15_000), true, 'stale lock is taken over')
-  releaseStartLock(lockDir)
 })
 
 test('buildLauncherApp constructs a distinct launcher bundle targeting the login command (paths with spaces)', async () => {
@@ -177,7 +202,11 @@ test('installRuntime snapshots the project (relative symlinks, dev deps pruned) 
   assert.ok(fs.existsSync(path.join(first.runtimeDir, 'manifest.json')))
   assert.ok(!fs.existsSync(path.join(first.runtimeDir, 'node_modules', '.pnpm', 'typescript@5.9.3')), 'typescript is pruned')
   assert.ok(!fs.existsSync(path.join(first.runtimeDir, 'packages', 'daemon', 'node_modules', 'typescript')), 'dangling dev symlinks are pruned')
+  assert.ok(!fs.existsSync(path.join(first.runtimeDir, 'node_modules', '.pnpm', 'node_modules', 'typescript')), 'dev hoist symlinks are pruned')
+  assert.ok(!fs.existsSync(path.join(first.runtimeDir, 'node_modules', '.pnpm', 'node_modules', '@types')), 'dev @types hoist is pruned')
+  assert.ok(!fs.existsSync(path.join(first.runtimeDir, 'node_modules', '.pnpm', 'node_modules', '.bin')), 'dev .bin hoist is pruned')
   assert.ok(fs.existsSync(fs.realpathSync(path.join(first.runtimeDir, 'packages', 'daemon', 'node_modules', 'ws'))), 'ws symlink resolves inside the snapshot')
+  assertSymlinksStayInside(first.runtimeDir)
 
   const checkFile = path.join(first.runtimeDir, 'packages', 'daemon', '__import-check.mjs')
   fs.writeFileSync(checkFile, "await Promise.all([import('ws'), import('chokidar'), import('@puppeteer/browsers')]);\nconsole.log('deps-ok')\n")
@@ -195,11 +224,65 @@ test('installRuntime snapshots the project (relative symlinks, dev deps pruned) 
   assert.ok(!fs.existsSync(path.join(p.runtimeDir, 'node_modules', '.pnpm', 'typescript@5.9.3')), 'reinstall stays pruned')
 })
 
+test('runtime snapshot stays functional after the source tree is removed', async () => {
+  const removableSource = path.join(base, 'removable source tree')
+  const independentRuntime = path.join(base, 'independent runtime dir')
+  makeSourceFixture(removableSource)
+  await installRuntime({ sourceRoot: removableSource, runtimeDir: independentRuntime })
+  const manifest = JSON.parse(fs.readFileSync(path.join(independentRuntime, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.sourceRoot, removableSource, 'manifest records provenance only')
+
+  fs.rmSync(removableSource, { recursive: true, force: true })
+  assert.ok(!fs.existsSync(removableSource), 'source tree is gone')
+  assertSymlinksStayInside(independentRuntime)
+
+  const checkFile = path.join(independentRuntime, 'packages', 'daemon', '__import-check.mjs')
+  fs.writeFileSync(checkFile, "await Promise.all([import('ws'), import('chokidar')]);\nconsole.log('deps-ok')\n")
+  try {
+    assert.match(execFileSync(process.execPath, [checkFile], { encoding: 'utf8' }), /deps-ok/)
+  } finally {
+    fs.rmSync(checkFile, { force: true })
+  }
+  assert.ok(fs.existsSync(path.join(independentRuntime, 'packages', 'cli', 'bin', 'backlight.js')))
+})
+
+test('install lock serializes concurrent installs, recovers stale owners and never deletes unrelated state', async () => {
+  const lockDir = path.join(home, 'launcher-install.lock')
+  fs.rmSync(lockDir, { recursive: true, force: true })
+  fs.mkdirSync(lockDir, { recursive: true })
+  fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, token: 'held-by-test', startedAt: Date.now() }))
+  assert.equal(await acquireFileLock(lockDir, { waitMs: 250, pollMs: 50 }), null, 'a live owner blocks contenders')
+  assert.ok(fs.existsSync(path.join(lockDir, 'owner.json')), 'a blocked contender must not delete the lock')
+  fs.rmSync(lockDir, { recursive: true, force: true })
+
+  fs.mkdirSync(lockDir, { recursive: true })
+  fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: 2 ** 30, token: 'dead', startedAt: Date.now() - 60_000 }))
+  const recovered = await acquireFileLock(lockDir, { waitMs: 1000, pollMs: 50 })
+  assert.ok(recovered, 'a dead owner lock is recoverable')
+  const owner = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf8'))
+  assert.equal(owner.token, recovered!.token)
+  releaseFileLock(lockDir, 'not-my-token')
+  assert.ok(fs.existsSync(lockDir), 'release must never remove a lock owned by someone else')
+  recovered!.release()
+  assert.ok(!fs.existsSync(lockDir))
+
+  write(path.join(home, 'keep.txt'), 'KEEP')
+  write(path.join(applicationsDir, 'Unrelated.app', 'marker'), 'KEEP')
+  const opts = { applicationsDir, sourceRoot, nodePath: process.execPath, compile: fakeCompile, register: false }
+  const [a, b] = await Promise.all([installLauncher(opts), installLauncher(opts)])
+  assert.equal(a.appPath, b.appPath, 'both concurrent installers converge on the same app')
+  assert.ok(fs.existsSync(path.join(home, 'keep.txt')), 'unrelated files survive installs')
+  assert.ok(fs.existsSync(path.join(applicationsDir, 'Unrelated.app', 'marker')), 'unrelated apps survive installs')
+  assert.ok(fs.existsSync(path.join(a.appPath, 'Contents', 'MacOS', 'Backlight')))
+})
+
 test('installLauncher is idempotent, leaves the engine untouched and verifies cleanly', async () => {
   const engineBinDigest = sha256(engine.bin)
   const enginePlistDigest = sha256(path.join(engine.app, 'Contents', 'Info.plist'))
   const opts = { applicationsDir, sourceRoot, nodePath: process.execPath, compile: fakeCompile, register: false }
 
+  write(path.join(applicationsDir, 'Unrelated.app', 'marker'), 'KEEP')
+  write(path.join(home, 'keep.txt'), 'KEEP')
   const first = await installLauncher(opts)
   assert.equal(first.appPath, path.join(applicationsDir, 'Backlight.app'))
   assert.equal(first.engine, engine.bin)
@@ -221,6 +304,21 @@ test('installLauncher is idempotent, leaves the engine untouched and verifies cl
 
   const leftovers = fs.readdirSync(applicationsDir).filter(n => n.startsWith('.backlight-launcher-build-') || n.endsWith('.old-' + process.pid))
   assert.deepEqual(leftovers, [], 'no build or backup leftovers')
+  assert.ok(fs.existsSync(path.join(applicationsDir, 'Unrelated.app', 'marker')), 'unrelated apps survive replacement')
+  assert.ok(fs.existsSync(path.join(home, 'keep.txt')), 'unrelated files survive replacement')
+})
+
+test('ownership requires the exact launcher bundle id, not just launcher.json', async () => {
+  const fakeDir = path.join(base, 'lookalike applications')
+  const fakeApp = path.join(fakeDir, 'Backlight.app')
+  write(path.join(fakeApp, 'Contents', 'Info.plist'), `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.example.lookalike</string></dict></plist>`)
+  write(path.join(fakeApp, 'Contents', 'Resources', 'launcher.json'), '{"bundleId":"com.example.lookalike"}')
+  assert.equal(isOurLauncher(fakeApp), false, 'launcher.json alone must not imply ownership')
+  const opts = { applicationsDir: fakeDir, sourceRoot, nodePath: process.execPath, compile: fakeCompile, register: false }
+  await assert.rejects(installLauncher(opts), /refusing to overwrite/)
+  await assert.rejects(uninstallLauncher({ applicationsDir: fakeDir, register: false }), /refusing to remove/)
+  assert.ok(fs.existsSync(fakeApp), 'lookalike app must survive')
 })
 
 test('installLauncher refuses to overwrite a foreign ~/Applications/Backlight.app', async () => {
@@ -296,11 +394,16 @@ function loginHarness() {
     async restoreAll(maximize: boolean) { state.restores.push(maximize); return 3 },
     isControlCurrent: () => true,
   }
+  const capture = {
+    paused: false,
+    async setPaused(paused: boolean) { state.paused.push(paused); capture.paused = paused },
+    isPaused() { return capture.paused },
+  }
   const deps = {
     manager,
     supervisor,
     health: {},
-    capture: { setPaused: async (paused: boolean) => { state.paused.push(paused) } },
+    capture,
     extensions: {},
     extensionDev: {},
     bus: {},
@@ -313,7 +416,7 @@ function loginHarness() {
     activateBrowser: async () => { state.activated++ },
   }
   const server = createServer(deps as any)
-  return { state, manager, server }
+  return { state, manager, supervisor, capture, server }
 }
 
 const harness = loginHarness()
@@ -383,16 +486,53 @@ test('concurrent clicks share one launch', { timeout: 20_000 }, async () => {
   }
 })
 
-test('login never kills a live session that runs a different engine', async () => {
+test('a mismatched live engine is refused with zero side effects', async () => {
   setSettingsBrowser('auto')
   harness.state.running = true
   harness.state.current = { binary: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', pid: 111, upstreamPort: 1 }
-  const before = harness.state.launches.length
+  harness.supervisor.humanMode = false
+  harness.capture.paused = true
+  const launches = harness.state.launches.length
+  const restores = harness.state.restores.length
+  const paused = harness.state.paused.length
+  const activated = harness.state.activated
+
   const res = await login()
+
+  assert.equal(res.body.ok, false)
+  assert.equal(res.body.mismatchedEngine, true)
   assert.equal(res.body.launched, false)
-  assert.equal(harness.state.launches.length, before)
-  assert.match(res.body.note, /different engine/)
+  assert.equal(res.body.restored, 0)
   assert.equal(res.body.engine, engine.bin, 'the selected setting is still the branded engine')
+  assert.equal(res.body.currentEngine, '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+  assert.match(res.body.note, /different engine/)
+  assert.equal(harness.state.launches.length, launches, 'no launch')
+  assert.equal(harness.state.restores.length, restores, 'no restore/maximize')
+  assert.equal(harness.state.paused.length, paused, 'capture pause untouched')
+  assert.equal(harness.state.activated, activated, 'no activation')
+  assert.equal(harness.supervisor.humanMode, false, 'humanMode untouched')
+  assert.equal(harness.capture.paused, true, 'capture keeps its prior pause state')
+  assert.equal(JSON.parse(fs.readFileSync(path.join(home, 'settings.json'), 'utf8')).browser, 'auto', 'settings must not be rewritten')
+})
+
+test('a failed launch restores prior control/capture state', async () => {
+  setSettingsBrowser(engine.bin)
+  harness.state.running = false
+  harness.state.current = null
+  harness.supervisor.humanMode = false
+  harness.capture.paused = false
+  const originalLaunch = harness.manager.launch
+  harness.manager.launch = async () => { throw new Error('engine missing') }
+  try {
+    const res = await login()
+    assert.equal(res.status, 502)
+    assert.match(res.body.error, /engine missing/)
+    assert.equal(harness.supervisor.humanMode, false, 'humanMode rolled back to the prior value')
+    assert.equal(harness.capture.paused, false, 'capture pause restored to the prior value')
+    assert.equal(harness.state.paused.at(-1), false, 'capture was un-paused after the failure')
+  } finally {
+    harness.manager.launch = originalLaunch
+  }
 })
 
 test('uninstallLauncher removes only our launcher by default', async () => {

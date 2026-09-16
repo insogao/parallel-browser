@@ -5,6 +5,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { generateDefaultIcon, makeIcns } from './brand.ts'
 import { paths } from './paths.ts'
+import { acquireFileLock } from './single-instance.ts'
 import { loadSettings, saveSettings } from './store.ts'
 
 /**
@@ -27,10 +28,13 @@ const LSREGISTER =
   '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
 
 export interface LoginResult {
-  ok: true
+  ok: boolean
   launched: boolean
   restored: number
   engine: string | null
+  /** live managed session runs another engine: no side effects were applied */
+  mismatchedEngine?: boolean
+  currentEngine?: string
   note?: string
 }
 
@@ -117,9 +121,14 @@ export const RUNTIME_ENTRIES = [
   'node_modules',
 ]
 
-/** Dev-only packages never needed at runtime (keeps the snapshot ~3MB). */
+/** Dev-only packages never needed at runtime (keeps the snapshot ~3MB). Also
+ * prunes the matching pnpm hoist symlinks so the snapshot has no dangling
+ * links after typescript/@types are removed. */
 export function isRuntimeExcluded(relative: string): boolean {
   const parts = relative.split(path.sep)
+  if (parts[0] === 'node_modules' && parts[1] === '.pnpm' && parts[2] === 'node_modules' && parts[3]) {
+    return parts[3] === 'typescript' || parts[3] === '@types' || parts[3] === '.bin'
+  }
   if (parts[0] === 'node_modules' && parts[1] === '.pnpm' && parts[2]) {
     return parts[2].startsWith('typescript@') || parts[2].startsWith('@types+')
   }
@@ -208,17 +217,26 @@ export function findBrandedEngine(root = paths.root, preferred?: string): Brande
   return engines.find(e => path.basename(e.appPath) === `${LAUNCHER_APP_NAME}.app`) ?? engines[0] ?? null
 }
 
-/** Make the branded engine the selected engine. Returns changed=true when
- * settings.json was updated (no-op when it already points at a branded app). */
-export function selectBrandedEngineSetting(root = paths.root): { engine: BrandedEngine | null; changed: boolean } {
+/** Read-only resolution of which branded engine login would select. Never
+ * touches settings.json, so callers can refuse before any side effect. */
+export function resolveBrandedEngineSelection(root = paths.root): { engine: BrandedEngine | null; wouldChange: boolean } {
   const settings = loadSettings()
   const engines = findBrandedEngines(root)
   const current = engines.find(e => path.resolve(e.binPath) === path.resolve(settings.browser ?? ''))
-  if (current) return { engine: current, changed: false }
+  if (current) return { engine: current, wouldChange: false }
   const preferred = engines.find(e => path.basename(e.appPath) === `${LAUNCHER_APP_NAME}.app`) ?? engines[0] ?? null
-  if (!preferred) return { engine: null, changed: false }
-  saveSettings({ browser: preferred.binPath })
-  return { engine: preferred, changed: true }
+  return { engine: preferred, wouldChange: preferred != null }
+}
+
+/** Apply that selection. Returns changed=true when settings.json was updated
+ * (no-op when it already points at a branded app). */
+export function selectBrandedEngineSetting(root = paths.root): { engine: BrandedEngine | null; changed: boolean } {
+  const selection = resolveBrandedEngineSelection(root)
+  if (selection.wouldChange && selection.engine) {
+    saveSettings({ browser: selection.engine.binPath })
+    return { engine: selection.engine, changed: true }
+  }
+  return { engine: selection.engine, changed: false }
 }
 
 export function launcherPaths(opts: LauncherPathOptions = {}): LauncherPaths {
@@ -248,8 +266,25 @@ function copyRuntimeEntry(sourceRoot: string, staging: string, entry: string): v
   })
 }
 
+function installLockDir(p: LauncherPaths): string {
+  return path.join(p.root, 'launcher-install.lock')
+}
+
+/** Serializes runtime/launcher installs so concurrent installers cannot
+ * interleave staging/backup/rename or delete each other's fallback directory. */
+async function withInstallLock<T>(p: LauncherPaths, work: () => Promise<T>): Promise<T> {
+  const lockDir = installLockDir(p)
+  const lock = await acquireFileLock(lockDir, { waitMs: 120_000, pollMs: 200 })
+  if (!lock) throw new Error(`another launcher install is still running (lock: ${lockDir})`)
+  try {
+    return await work()
+  } finally {
+    lock.release()
+  }
+}
+
 /** Atomically (re)build the stable runtime snapshot the launcher invokes. */
-export async function installRuntime(opts: InstallRuntimeOptions = {}): Promise<{ runtimeDir: string; copied: string[] }> {
+async function installRuntimeUnlocked(opts: InstallRuntimeOptions = {}): Promise<{ runtimeDir: string; copied: string[] }> {
   const p = launcherPaths(opts)
   const sourceRoot = opts.sourceRoot ?? repoRoot()
   const logLine = opts.log ?? (() => {})
@@ -289,6 +324,12 @@ export async function installRuntime(opts: InstallRuntimeOptions = {}): Promise<
     fs.rmSync(staging, { recursive: true, force: true })
     throw err
   }
+}
+
+/** Public entry: rebuilds the snapshot under the install lock. */
+export async function installRuntime(opts: InstallRuntimeOptions = {}): Promise<{ runtimeDir: string; copied: string[] }> {
+  const p = launcherPaths(opts)
+  return withInstallLock(p, () => installRuntimeUnlocked(opts))
 }
 
 function launcherInfoPlist(): string {
@@ -398,9 +439,10 @@ export async function buildLauncherApp(opts: BuildLauncherOptions = {}): Promise
   }
 }
 
+/** Replacement/uninstall require the exact launcher bundle id; merely having a
+ * launcher.json resource is not ownership. */
 export function isOurLauncher(appPath: string): boolean {
-  if (readBundleInfo(appPath)?.bundleId === LAUNCHER_BUNDLE_ID) return true
-  return fs.existsSync(path.join(appPath, 'Contents', 'Resources', 'launcher.json'))
+  return readBundleInfo(appPath)?.bundleId === LAUNCHER_BUNDLE_ID
 }
 
 /** Build + atomically replace ~/Applications/Backlight.app, register it with
@@ -414,37 +456,39 @@ export async function installLauncher(opts: InstallLauncherOptions = {}): Promis
 }> {
   const p = launcherPaths(opts)
   const logLine = opts.log ?? (() => {})
-  if (fs.existsSync(p.launcherApp) && !isOurLauncher(p.launcherApp)) {
-    throw new Error(
-      `refusing to overwrite ${p.launcherApp}: it is not a Backlight launcher (expected bundle id ${LAUNCHER_BUNDLE_ID})`,
-    )
-  }
-  const runtime = opts.skipRuntime
-    ? { runtimeDir: p.runtimeDir, copied: [] as string[] }
-    : await installRuntime({ ...opts })
-  const built = await buildLauncherApp(opts)
-  const backup = `${p.launcherApp}.old-${process.pid}`
-  fs.mkdirSync(p.applicationsDir, { recursive: true })
-  fs.rmSync(backup, { recursive: true, force: true })
-  const hadOld = fs.existsSync(p.launcherApp)
-  try {
-    if (hadOld) fs.renameSync(p.launcherApp, backup)
-    fs.renameSync(built.appPath, p.launcherApp)
-  } catch (err) {
-    if (hadOld && !fs.existsSync(p.launcherApp) && fs.existsSync(backup)) fs.renameSync(backup, p.launcherApp)
+  return withInstallLock(p, async () => {
+    if (fs.existsSync(p.launcherApp) && !isOurLauncher(p.launcherApp)) {
+      throw new Error(
+        `refusing to overwrite ${p.launcherApp}: it is not a Backlight launcher (expected bundle id ${LAUNCHER_BUNDLE_ID})`,
+      )
+    }
+    const runtime = opts.skipRuntime
+      ? { runtimeDir: p.runtimeDir, copied: [] as string[] }
+      : await installRuntimeUnlocked({ ...opts })
+    const built = await buildLauncherApp(opts)
+    const backup = `${p.launcherApp}.old-${process.pid}`
+    fs.mkdirSync(p.applicationsDir, { recursive: true })
+    fs.rmSync(backup, { recursive: true, force: true })
+    const hadOld = fs.existsSync(p.launcherApp)
+    try {
+      if (hadOld) fs.renameSync(p.launcherApp, backup)
+      fs.renameSync(built.appPath, p.launcherApp)
+    } catch (err) {
+      if (hadOld && !fs.existsSync(p.launcherApp) && fs.existsSync(backup)) fs.renameSync(backup, p.launcherApp)
+      fs.rmSync(built.stagingRoot, { recursive: true, force: true })
+      throw err
+    }
+    fs.rmSync(backup, { recursive: true, force: true })
     fs.rmSync(built.stagingRoot, { recursive: true, force: true })
-    throw err
-  }
-  fs.rmSync(backup, { recursive: true, force: true })
-  fs.rmSync(built.stagingRoot, { recursive: true, force: true })
-  if (opts.register !== false) {
-    await run(LSREGISTER, ['-f', p.launcherApp], 30_000)
-    logLine(`registered with LaunchServices: ${p.launcherApp}`)
-  }
-  const selection = selectBrandedEngineSetting(p.root)
-  if (selection.changed) logLine(`settings.browser -> ${selection.engine?.binPath}`)
-  const checks = await verifyLauncher(opts)
-  return { appPath: p.launcherApp, runtimeDir: runtime.runtimeDir, engine: selection.engine?.binPath ?? null, settingsChanged: selection.changed, checks }
+    if (opts.register !== false) {
+      await run(LSREGISTER, ['-f', p.launcherApp], 30_000)
+      logLine(`registered with LaunchServices: ${p.launcherApp}`)
+    }
+    const selection = selectBrandedEngineSetting(p.root)
+    if (selection.changed) logLine(`settings.browser -> ${selection.engine?.binPath}`)
+    const checks = await verifyLauncher(opts)
+    return { appPath: p.launcherApp, runtimeDir: runtime.runtimeDir, engine: selection.engine?.binPath ?? null, settingsChanged: selection.changed, checks }
+  })
 }
 
 export async function verifyLauncher(opts: LauncherPathOptions = {}): Promise<VerifyCheck[]> {

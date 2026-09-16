@@ -85,7 +85,7 @@ bl stop
 
 ## 启动台入口与人工登录
 
-`bl launcher install` 会安装一个独立的 `~/Applications/Backlight.app`（bundle id `dev.backlight.launcher`，Launchpad 可直接发现），并把运行所需的最小快照安装到 `~/Library/Application Support/Backlight/runtime/`。它**不是**隐藏引擎 app 的副本：点击后执行 `bl login` 的同一路径，确保 daemon 运行、选中品牌化 Backlight 引擎（bundle id `dev.backlight.browser`，位于 `~/Library/Application Support/Backlight/apps/Backlight.app`），启动或复用受管默认 space/profile，然后显示、最大化并激活受管浏览器。重复点击幂等：已在运行时只 focus/show/maximize，不会产生未受管实例或第二个 daemon；已在运行的异引擎会话不会被终止。
+`bl launcher install` 会安装一个独立的 `~/Applications/Backlight.app`（bundle id `dev.backlight.launcher`，Launchpad 可直接发现），并把运行所需的最小快照安装到 `~/Library/Application Support/Backlight/runtime/`。它**不是**隐藏引擎 app 的副本：点击后执行 `bl login` 的同一路径，确保 daemon 运行、选中品牌化 Backlight 引擎（bundle id `dev.backlight.browser`，位于 `~/Library/Application Support/Backlight/apps/Backlight.app`），启动或复用受管默认 space/profile，然后显示、最大化并激活受管浏览器。重复点击幂等：已在运行时只 focus/show/maximize，不会产生未受管实例或第二个 daemon；已在运行的异引擎会话不会被终止，点击会明确返回“未接管”并提示先 `bl stop` 再试。安装/刷新使用独立锁串行化，可安全重复执行。
 
 ```bash
 bl launcher install              # 构建 + 原子替换 + 注册 LaunchServices + 校验

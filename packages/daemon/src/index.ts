@@ -1,4 +1,4 @@
-import fs from 'node:fs'
+import path from 'node:path'
 import { ActivityBus } from './activity.ts'
 import { BrowserManager } from './browser.ts'
 import { CaptureKeepAlive } from './capture.ts'
@@ -12,15 +12,30 @@ import { loadSettings } from './store.ts'
 import { error, initFileLogging, log } from './log.ts'
 import { FramePumpSupervisor } from './windows.ts'
 import { activateBrowser, browserAppState, hideBrowser, startTray, unhideBrowser } from './native.ts'
-import { readLiveDaemon } from './single-instance.ts'
+import { acquireFileLock, readLiveDaemon, removeDaemonInfo, writeDaemonInfo } from './single-instance.ts'
 
 export const VERSION = '0.1.0'
 
 async function main() {
   ensureDirs()
   initFileLogging(paths.logs)
-  // Single instance per data dir: a second daemon (e.g. from a double click)
-  // must exit instead of writing daemon.json and stealing the default port.
+
+  // Single instance per data dir: the lock is held from before the port probe
+  // until daemon.json is on disk. A duplicate (e.g. from a double click) that
+  // cannot take ownership waits, re-checks daemon.json and exits instead of
+  // binding a fallback port and overwriting the running daemon's info.
+  const lockDir = path.join(paths.root, 'daemon.lock')
+  const lock = await acquireFileLock(lockDir, { waitMs: 20_000, pollMs: 150 })
+  if (!lock) {
+    const live = readLiveDaemon()
+    if (live) {
+      log(`another backlight daemon is already running (pid=${live.pid} port=${live.port}); exiting`)
+      process.exit(0)
+    }
+    error(`could not acquire daemon start lock ${lockDir}; another daemon may be starting`)
+    process.exit(1)
+  }
+  process.on('exit', () => lock.release())
   const alreadyRunning = readLiveDaemon()
   if (alreadyRunning) {
     log(`another backlight daemon is already running (pid=${alreadyRunning.pid} port=${alreadyRunning.port}); exiting`)
@@ -101,8 +116,17 @@ async function main() {
   capture.start(1000)
 
   server.listen(proxyPort, '127.0.0.1', () => {
+    // Held the lock through startup, so nobody else can have claimed the data
+    // dir; still re-check defensively before publishing daemon.json.
+    const raced = readLiveDaemon()
+    if (raced && raced.pid !== process.pid) {
+      error(`another backlight daemon appeared during startup (pid=${raced.pid}); exiting`)
+      server.close()
+      process.exit(0)
+    }
     log(`backlight daemon v${VERSION} listening on http://127.0.0.1:${proxyPort}`)
-    fs.writeFileSync(paths.daemonFile, JSON.stringify({ pid: process.pid, port: proxyPort, startedAt: Date.now() }, null, 2))
+    writeDaemonInfo({ pid: process.pid, port: proxyPort, startedAt: Date.now() })
+    lock.release()
     void startTray().catch(err => error(`tray startup failed: ${err.message}`))
   })
 
@@ -112,7 +136,7 @@ async function main() {
     health.stop()
     capture.stop()
     extensions.stopWatching()
-    try { fs.rmSync(paths.daemonFile, { force: true }) } catch { /* ignore */ }
+    removeDaemonInfo()
     if (manager.running) await manager.stop()
     process.exit(0)
   }

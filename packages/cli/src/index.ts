@@ -7,7 +7,7 @@ import { spawn, execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { acquireStartLock, readLiveDaemon, releaseStartLock, type DaemonInfo } from '../../daemon/src/single-instance.ts'
+import { readLiveDaemon, type DaemonInfo } from '../../daemon/src/single-instance.ts'
 
 const daemonEntry = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'daemon', 'src', 'index.ts')
 const home = process.env.BACKLIGHT_HOME
@@ -33,28 +33,22 @@ async function ensureDaemon(env: Record<string, string> = {}): Promise<DaemonInf
   const existing = readDaemonInfo()
   if (existing) return existing
   fs.mkdirSync(home, { recursive: true })
-  // Two rapid clicks (launcher -> CLI) must not spawn two daemons: only the
-  // lock holder starts one, the loser waits for daemon.json from the winner.
-  const holdsLock = acquireStartLock(home)
-  if (holdsLock) {
-    const child = spawn(process.execPath, [daemonEntry], {
-      detached: true,
-      stdio: 'ignore',
-      env: { ...process.env, ...env },
-    })
-    child.unref()
+  // Two rapid clicks may spawn two daemon processes; the daemon-side start
+  // lock makes exactly one win and the duplicate exits instead of binding a
+  // fallback port and overwriting daemon.json.
+  const child = spawn(process.execPath, [daemonEntry], {
+    detached: true,
+    stdio: 'ignore',
+    env: { ...process.env, ...env },
+  })
+  child.unref()
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 200))
+    const info = readDaemonInfo()
+    if (info) return info
   }
-  try {
-    const deadline = Date.now() + 15_000
-    while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 200))
-      const info = readDaemonInfo()
-      if (info) return info
-    }
-    throw new Error('daemon did not start; see ~/Library/Application Support/Backlight/logs/daemon.log')
-  } finally {
-    if (holdsLock) releaseStartLock(home)
-  }
+  throw new Error('daemon did not start; see ~/Library/Application Support/Backlight/logs/daemon.log')
 }
 
 // ---- tiny arg parser ----------------------------------------------------------
@@ -172,6 +166,12 @@ async function main() {
     case 'login': {
       const info = await ensureDaemon()
       const res = await api(info, '/api/login', { method: 'POST', body: '{}' }, 180_000)
+      if (res.mismatchedEngine) {
+        console.log(`not taking over: ${res.note ?? 'managed browser is running with a different engine'}`)
+        if (res.currentEngine) console.log(`current engine: ${res.currentEngine}`)
+        process.exitCode = 1
+        return
+      }
       console.log(`managed browser ${res.launched ? 'launched' : 'reused'} · restored ${res.restored} window(s) maximized for login`)
       if (res.engine) console.log(`engine: ${res.engine}`)
       if (res.note) console.log(`note: ${res.note}`)
