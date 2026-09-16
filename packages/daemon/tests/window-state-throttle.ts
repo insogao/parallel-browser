@@ -98,11 +98,11 @@ const siteUrl = `http://127.0.0.1:${(site.address() as any).port}`
 // ---- app-control (same Swift source the daemon builds) ----------------------
 const appControl = path.join(tmp, 'bin', 'app-control')
 fs.mkdirSync(path.dirname(appControl), { recursive: true })
-execFileSync('/usr/bin/swiftc', [fileURLToPath(new URL('../../../tools/app-control.swift', import.meta.url)), '-o', appControl])
+execFileSync('/usr/bin/swiftc', [fileURLToPath(new URL('../../../tools/app-control.swift', import.meta.url)), '-o', appControl], { timeout: 120_000 })
 const nativeState = (pid: number): { active: boolean; hidden: boolean } =>
-  JSON.parse(execFileSync(appControl, ['state', String(pid)], { encoding: 'utf8' }))
+  JSON.parse(execFileSync(appControl, ['state', String(pid)], { encoding: 'utf8', timeout: 5_000 }))
 const nativeWindows = (pid: number): NativeWindowsProbe =>
-  parseNativeWindowsProbe(execFileSync(appControl, ['windows', String(pid)], { encoding: 'utf8' }))
+  parseNativeWindowsProbe(execFileSync(appControl, ['windows', String(pid)], { encoding: 'utf8', timeout: 5_000 }))
 
 // ---- isolated daemon --------------------------------------------------------
 const log = fs.openSync(path.join(tmp, 'daemon.log'), 'w')
@@ -202,6 +202,21 @@ const printObservations = (window: WindowStateSample[], label: string) => {
 }
 
 // ---- cleanup survives SIGINT/SIGTERM and never leaves isolated processes ----
+
+/** PIDs whose argv contains an exact literal path (no pkill -f regex). */
+function listProcessesMatching(needle: string): number[] {
+  const pids: number[] = []
+  try {
+    const ps = execFileSync('/bin/ps', ['-axo', 'pid=,args='], { encoding: 'utf8', timeout: 5_000 })
+    for (const line of ps.split('\n')) {
+      if (!line.includes(needle)) continue
+      const pid = Number(line.trim().split(/\s+/, 1)[0])
+      if (Number.isFinite(pid) && pid > 0 && pid !== process.pid) pids.push(pid)
+    }
+  } catch { /* ps unavailable; nothing to clean */ }
+  return pids
+}
+
 let cleanedUp = false
 async function cleanup(): Promise<void> {
   if (cleanedUp) return
@@ -219,9 +234,15 @@ async function cleanup(): Promise<void> {
   try { if (daemon.exitCode === null) daemon.kill('SIGKILL') } catch { /* ignore */ }
   try { site.close() } catch { /* ignore */ }
   try { fs.closeSync(log) } catch { /* ignore */ }
-  // kill any browser started with this temp profile, then remove the temp dir
-  try { execFileSync('/usr/bin/pkill', ['-f', tmp], { stdio: 'ignore' }) } catch { /* none left */ }
-  await sleep(400)
+  // Kill exactly this run's processes: the daemon child and any browser whose
+  // argv contains the exact temp profile path (no pkill -f pattern matching).
+  const profileDir = path.join(tmp, 'spaces', 'default', 'profile')
+  const stragglers = new Set<number>(listProcessesMatching(profileDir))
+  if (typeof daemon.pid === 'number' && daemon.exitCode === null) stragglers.add(daemon.pid)
+  for (const target of stragglers) { try { process.kill(target, 'SIGTERM') } catch { /* gone */ } }
+  await sleep(500)
+  for (const target of stragglers) { try { process.kill(target, 'SIGKILL') } catch { /* gone */ } }
+  await sleep(300)
   try { fs.rmSync(tmp, { recursive: true, force: true }) } catch { /* ignore */ }
 }
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {

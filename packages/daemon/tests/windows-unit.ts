@@ -174,6 +174,55 @@ test('an unverified maximize is not counted as a successful restore', async () =
   assert.equal(bounds.windowState, 'normal', 'window is un-minimized but not maximized')
 })
 
+test('maximize is never sent while the window refuses to leave minimized', async () => {
+  let bounds: any = { left: 60, top: 60, width: 1200, height: 800, windowState: 'minimized' }
+  const setStates: string[] = []
+  const cdp = {
+    attach: async () => 'session',
+    send: async (method: string, params: any) => {
+      if (method === 'Target.getTargets') return { targetInfos: [{ type: 'page', targetId: 'page' }] }
+      if (method === 'Browser.getWindowForTarget') return { windowId: 1 }
+      if (method === 'Browser.getWindowBounds') return { bounds: { ...bounds } }
+      if (method === 'Browser.setWindowBounds') {
+        if (params.bounds.windowState) setStates.push(params.bounds.windowState)
+        return {}
+      }
+      if (method === 'Runtime.evaluate') return { result: { value: JSON.stringify({ al: 0, at: 25, ah: 900 }) } }
+      throw new Error(method)
+    },
+  } as unknown as Cdp
+  const supervisor = new FramePumpSupervisor(() => ({ cdp }), () => [])
+  assert.equal(await supervisor.restoreAll(true), 0)
+  assert.ok(!setStates.includes('maximized'), `maximize must not be sent when normal never applies: ${setStates.join(',')}`)
+})
+
+test('a restore superseded while maximizing is not counted', async () => {
+  let bounds: any = { left: 60, top: 60, width: 1200, height: 800, windowState: 'minimized' }
+  let supervisor: FramePumpSupervisor
+  const cdp = {
+    attach: async () => 'session',
+    send: async (method: string, params: any) => {
+      if (method === 'Target.getTargets') return { targetInfos: [{ type: 'page', targetId: 'page' }] }
+      if (method === 'Browser.getWindowForTarget') return { windowId: 1 }
+      if (method === 'Browser.getWindowBounds') return { bounds: { ...bounds } }
+      if (method === 'Browser.setWindowBounds') {
+        const state = params.bounds.windowState
+        if (state === 'normal') bounds = { ...bounds, windowState: 'normal' }
+        if (state === 'maximized') {
+          bounds = { ...bounds, windowState: 'maximized' }
+          supervisor.beginControl() // a newer intent arrives exactly here
+        }
+        return {}
+      }
+      if (method === 'Runtime.evaluate') return { result: { value: JSON.stringify({ al: 0, at: 25, ah: 900 }) } }
+      throw new Error(method)
+    },
+  } as unknown as Cdp
+  supervisor = new FramePumpSupervisor(() => ({ cdp }), () => [])
+  assert.equal(await supervisor.restoreAll(true), 0, 'superseded restore must not be counted')
+  assert.equal(bounds.windowState, 'maximized', 'the maximize itself was applied before supersede')
+})
+
 test('show recovers a cornered startup window even when collapse mode is minimize', async () => {
   let bounds = { left: -1438, top: 945, width: 1440, height: 900, windowState: 'normal' }
   const cdp = {

@@ -5,11 +5,18 @@ import { CaptureKeepAlive, CAPTURE_TITLE } from '../src/capture.ts'
 import type { Cdp } from '../src/cdp.ts'
 import type { TargetHealth } from '../src/inject.ts'
 
-function fixture(t: any, options: { appHidden?: boolean; onHide?: () => void } = {}) {
+function fixture(t: any, options: {
+  appHidden?: boolean
+  onHide?: () => Promise<void> | void
+  onUnhide?: () => void
+  /** apply setWindowBounds only on a later getWindowBounds probe (macOS async) */
+  deferredBounds?: boolean
+} = {}) {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
   const page = { document: { title: 'Original' }, window: {} as any }
   const calls: { method: string; params: any; session?: string }[] = []
   let bounds = { windowState: 'minimized', left: 50, top: 60, width: 1200 }
+  let pendingBounds: { bounds: any; stale: number } | null = null
   let hook: (method: string, params: any) => any = () => undefined
   let controllerVisibility: 'visible' | 'hidden' = 'visible'
   const fake = {
@@ -22,8 +29,22 @@ function fixture(t: any, options: { appHidden?: boolean; onHide?: () => void } =
       if (method === 'Target.createTarget') return { targetId: 'controller' }
       if (method === 'Target.getTargets') return { targetInfos: [{ targetId: 'controller', type: 'page' }] }
       if (method === 'Browser.getWindowForTarget') return { windowId: 1 }
-      if (method === 'Browser.getWindowBounds') return { bounds: { ...bounds } }
-      if (method === 'Browser.setWindowBounds') { Object.assign(bounds, params.bounds); return {} }
+      if (method === 'Browser.getWindowBounds') {
+        if (pendingBounds) {
+          if (pendingBounds.stale > 0) { pendingBounds.stale--; return { bounds: { ...bounds } } }
+          Object.assign(bounds, pendingBounds.bounds)
+          pendingBounds = null
+        }
+        return { bounds: { ...bounds } }
+      }
+      if (method === 'Browser.setWindowBounds') {
+        if (options.deferredBounds) {
+          pendingBounds = { bounds: { ...params.bounds }, stale: 1 }
+          return {}
+        }
+        Object.assign(bounds, params.bounds)
+        return {}
+      }
       if (method === 'Runtime.evaluate') {
         if (params.expression.includes('screen.avail')) return { result: { value: '{"al":0,"at":25,"ah":900}' } }
         if (params.expression === 'document.visibilityState' && session === 'session-controller') {
@@ -36,11 +57,12 @@ function fixture(t: any, options: { appHidden?: boolean; onHide?: () => void } =
     },
   }
   let cdp = fake as unknown as Cdp
-  const capture = new CaptureKeepAlive(() => ({ cdp, controllerUrl: 'http://localhost/controller' }),
+  const capture = new CaptureKeepAlive(() => ({ cdp, controllerUrl: 'http://localhost/controller', pid: 4242 }),
     () => [{ targetId: 'page', title: 'Original', url: 'https://example.com', visibility: 'hidden' } as TargetHealth],
     {
       appHidden: async () => options.appHidden ?? false,
-      hideApp: async () => { options.onHide?.() },
+      hideApp: async () => { await options.onHide?.() },
+      unhideApp: async () => { options.onUnhide?.() },
     })
   async function settle(promise: Promise<unknown>, limit = 30000) {
     let done = false
@@ -181,6 +203,52 @@ test('takeover during capture setup keeps the window and never re-hides the app'
   assert.equal(hides, 0, 'takeover must never hide the app')
   assert.equal(f.bounds.windowState, 'normal', 'takeover window stays visible')
   assert.equal(f.bounds.left, 50, 'parked window is returned to its original position')
+})
+
+test('async normal transition and delayed position still restore position then minimize', async t => {
+  // macOS applies minimized -> normal asynchronously and a position sent in
+  // the same call is dropped. The fake reports the old state for one probe
+  // after every setWindowBounds, so only bounded re-probing can succeed.
+  let hides = 0
+  const f = fixture(t, { appHidden: true, deferredBounds: true, onHide: () => { hides++ } })
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.equal(f.capture.activeTargetId(), 'page')
+  const setBounds = f.calls.filter(c => c.method === 'Browser.setWindowBounds').map(c => c.params.bounds)
+  assert.deepEqual(setBounds[0], { windowState: 'normal' })
+  assert.equal(setBounds[1].left, -1198, 'park position only after normal applied')
+  assert.equal(setBounds.at(-2)?.left, 50, 'cleanup restores the original position while normal')
+  assert.equal(setBounds.at(-2)?.top, 60)
+  assert.deepEqual(setBounds.at(-1), { windowState: 'minimized' })
+  assert.equal(f.bounds.windowState, 'minimized')
+  assert.equal(f.bounds.left, 50)
+  assert.equal(hides, 1, 'a background app must be hidden exactly once after setup')
+})
+
+test('takeover during a delayed hide ends with the app visible (hide undone)', async t => {
+  const events: string[] = []
+  let captureRef: CaptureKeepAlive
+  let paused: Promise<void> | undefined
+  let releaseHide: () => void = () => {}
+  const hideGate = new Promise<void>(resolve => { releaseHide = resolve })
+  const f = fixture(t, {
+    appHidden: true,
+    onHide: async () => {
+      events.push('hide')
+      // takeover starts while the hide is still in flight
+      paused = captureRef.setPaused(true)
+      await Promise.resolve()
+      releaseHide()
+      await hideGate
+    },
+    onUnhide: () => { events.push('unhide') },
+  })
+  captureRef = f.capture
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.ok(paused, 'takeover must have started during the hide')
+  await f.settle(paused)
+  assert.deepEqual(events, ['hide', 'unhide'], 'a hide raced by takeover must be undone')
+  assert.equal(f.bounds.windowState, 'minimized')
+  assert.equal(f.bounds.left, 50)
 })
 
 test('hanging Runtime promise cannot block takeover or later disrupt it', async t => {

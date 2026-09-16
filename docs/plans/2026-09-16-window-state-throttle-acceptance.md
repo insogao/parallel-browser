@@ -33,13 +33,13 @@
 
 ## 本轮交付
 
-- `packages/daemon/tests/window-state-throttle.ts`：opt-in 真实验收（一个序列，capture 保活开启），最后清理隔离 daemon/app/profile，SIGINT/SIGTERM 也走同一清理。
+- `packages/daemon/tests/window-state-throttle.ts`：opt-in 真实验收（一个序列，capture 保活开启），最后清理隔离 daemon/app/profile，SIGINT/SIGTERM 也走同一清理；`app-control`/`swiftc` 调用带 timeout，进程清理用精确 profile 路径匹配而非 `pkill -f` 正则。
 - `packages/daemon/tests/window-state-samples.ts` + `window-state-throttle-unit.ts`：可复用采样辅助 + 纯单元验证（9 项）。
 - `packages/daemon/package.json`：新增 `test:window-state` 独立命令；**未加入** `test` / `test:integration`。
 - `tools/app-control.swift`：新增只读 `windows <pid>`（CGWindowList：窗口总数、on-screen layer-0 窗口数）。
-- `src/windows.ts`：新增 `maximizeWindow`，先有界等待 `normal` 再发 maximize，并**校验最终为 maximized**；未验证成功的恢复不计入 `restored`。
-- `src/capture.ts` + `src/index.ts`：park 拆成 `normal` 与位置两次调用、记录实际生效位置；cleanup 先恢复位置再最小化；新增可选依赖 `appHidden`/`hideApp`（`index.ts` 注入 `browserAppState`/`hideBrowser`），在 macOS picker 意外取消隐藏后恢复 `bg` 语义；takeover 时绝不重新隐藏。
-- `tests/capture-unit.ts` / `windows-unit.ts`：新增确定性单元测试覆盖上述行为。
+- `src/windows.ts`：新增 `maximizeWindow`，先有界等待 `normal`（超时直接失败、不发 maximize）再发 maximize，并**校验最终为 maximized**；未验证成功或中途被 supersede 的恢复不计入 `restored`。
+- `src/capture.ts` + `src/index.ts`：`normal` 生效后才发 park 位置、有界校验位置生效后才记录 parked；cleanup 不信任单次严格等值探针，按“恢复原位置 → 最小化”修复并有界验证 minimized（失败 warn）。新增 pid 绑定的 `appHidden`/`hideApp`/`unhideApp`（`index.ts` 注入 `browserAppState`/`hideBrowser`/`unhideBrowser`）：picker 解除隐藏后恢复 `bg` 语义；延迟 hide 期间发生 takeover 时补 unhide，人工接管最终可见。
+- `tests/capture-unit.ts` / `windows-unit.ts`：新增确定性单元测试覆盖上述行为（延迟 normal/位置、hide 被 takeover 竞态、normal 超时不发 maximize、supersede 不计恢复）。
 
 ## 已发生的真实 GUI 证据（一次运行，已足够标记结论）
 
@@ -50,7 +50,7 @@
 - 转移时间戳：`/api/bg` 4.00s → CDP minimized 4.96s / DOM hidden 4.96s / native offscreen 4.96s / AppKit hidden 5.84s；`show --maximize` 15.95s → DOM visible 16.29s → CDP maximized 17.37s；恢复后 `nativeRaf=100.5/s`。
 - 该轮随后在 Phase B 失败：capture 保活 setup 后窗口停在 `normal` 且前台可见。由此定位并修复第 4 项缺口；修复后的定向诊断（非验收）显示窗口能回到 `minimized/offscreen`，但 AppKit 仍被 picker 解除隐藏，于是补上 `hideApp` 再隐藏与单元测试。
 
-红绿记录：`app-control windows` 未实现时真实验收在 “baseline must have a native on-screen window” 失败；实现后该断言通过。`show --maximize` 修复前，新增单元测试失败；修复后通过。
+红绿记录：`app-control windows` 未实现时真实验收在 “baseline must have a native on-screen window” 失败；实现后该断言通过。`show --maximize` 修复前，对应单元测试失败；修复后通过。Reviewer 加固的 4 项新单元在旧源码上全部失败（capture 异步 normal/延迟位置、hide 被 takeover 竞态；windows normal 超时不发 maximize、supersede 不计恢复），加固后全绿。
 
 ## 待人工验收（pending，只跑一次）
 

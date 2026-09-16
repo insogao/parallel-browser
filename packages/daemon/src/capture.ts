@@ -24,9 +24,11 @@ interface ActiveCapture {
  */
 export interface CaptureKeepAliveDeps {
   /** true when the app-level background state (bg) hid the app */
-  appHidden?: () => Promise<boolean>
+  appHidden?: (pid: number) => Promise<boolean>
   /** re-apply that hidden state after a setup that unhid/activated the app */
-  hideApp?: () => Promise<void>
+  hideApp?: (pid: number) => Promise<void>
+  /** undo a hide that a takeover raced while the delayed hide was in flight */
+  unhideApp?: (pid: number) => Promise<void>
 }
 
 export class CaptureKeepAlive {
@@ -43,12 +45,12 @@ export class CaptureKeepAlive {
   private cooldownUntil = 0
   private disabled = false
   private paused = false
-  private getContext: () => { cdp: Cdp; controllerUrl: string } | null
+  private getContext: () => { cdp: Cdp; controllerUrl: string; pid: number } | null
   private getHealth: () => TargetHealth[]
   private deps: CaptureKeepAliveDeps
 
   constructor(
-    getContext: () => { cdp: Cdp; controllerUrl: string } | null,
+    getContext: () => { cdp: Cdp; controllerUrl: string; pid: number } | null,
     getHealth: () => TargetHealth[],
     deps: CaptureKeepAliveDeps = {},
   ) {
@@ -152,6 +154,9 @@ export class CaptureKeepAlive {
     const ctx = this.getContext()
     if (!ctx) return
     const { cdp } = ctx
+    // Bind the native-app operations to the instance this setup belongs to;
+    // a later restart must never be hidden/unhidden by stale deps.
+    const managedPid = ctx.pid
     const generation = this.generation
     const current = () => this.getContext()?.cdp === cdp && !cdp.closed
     const allowed = () => current() && !this.paused && this.generation === generation
@@ -187,23 +192,30 @@ export class CaptureKeepAlive {
         check()
         if (bounds.windowState === 'minimized') {
           original = bounds
-          if (this.deps.appHidden) appWasHidden = await this.deps.appHidden().catch(() => false)
+          if (this.deps.appHidden) appWasHidden = await this.deps.appHidden(managedPid).catch(() => false)
           const wa = await bounded(readWorkArea(cdp))
           check()
-          // Measured on macOS/CfT 153: a position sent together with the
-          // minimized -> normal transition is ignored (the window reappears at
-          // its old frame), so switch to normal first and park in a separate
-          // call. A position set on a minimized window would un-minimize it.
+          // macOS applies minimized -> normal asynchronously and drops a
+          // position sent in the same CDP call; wait for normal first, then
+          // park in a separate call. A position set on a minimized window
+          // would un-minimize it.
           const target = { left: wa.al - ((bounds.width ?? 1200) - OFFSCREEN_MARGIN), top: wa.at + wa.ah - OFFSCREEN_MARGIN }
           await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
           check()
+          const normal = await this.waitForWindowState(cdp, windowId, 'normal', allowed)
+          if (normal === null) return
+          if (normal !== 'normal') warn(`capture setup: window ${windowId} stayed ${normal}; parking anyway`)
+          check()
           await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: target })
           check()
-          // AppKit may clamp a mostly-offscreen frame; remember what actually
-          // applied so cleanup can recognize our own move.
-          const applied = await this.send<{ bounds?: { left?: number; top?: number } }>(cdp, 'Browser.getWindowBounds', { windowId }).catch(() => null)
-          parked = applied?.bounds && typeof applied.bounds.left === 'number' && typeof applied.bounds.top === 'number'
-            ? { left: applied.bounds.left, top: applied.bounds.top }
+          // AppKit may clamp a mostly-offscreen frame; only record the frame
+          // that actually applied, bounded, so a later strict probe cannot be
+          // fooled by our requested values.
+          const positionApplied = await this.waitForWindowPosition(cdp, windowId, target, allowed)
+          const applied = positionApplied ? target : await this.windowBounds(cdp, windowId)
+          if (!positionApplied) warn(`capture setup: window ${windowId} parked position did not apply (${JSON.stringify(applied)})`)
+          parked = applied && typeof applied.left === 'number' && typeof applied.top === 'number'
+            ? { left: applied.left, top: applied.top }
             : target
         }
       }
@@ -258,28 +270,105 @@ export class CaptureKeepAlive {
         }
       }
       if (parked && windowId !== undefined && current()) {
-        // Only undo our own offscreen move. A human may have restored/moved
-        // this window while setup or cleanup was awaiting CDP.
-        const now = await this.send(cdp, 'Browser.getWindowBounds', { windowId }).catch(() => null)
-        if (now?.bounds.windowState === 'normal' && now.bounds.left === parked.left && now.bounds.top === parked.top) {
-          if (allowed()) {
-            // Position must be restored while the window is normal: setting a
-            // position on a minimized window un-minimizes it (measured macOS/CfT 153).
-            await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { left: original.left, top: original.top } }).catch(() => {})
-            if (allowed()) await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } }).catch(() => {})
-            // The macOS capture picker can unhide/activate the app even when the
+        // The window was minimized when setup started and parked by us. Do not
+        // trust a single strict probe: whichever state the setup left behind,
+        // repair it back to original-position + minimized (bounded, warned on
+        // failure) as long as no takeover superseded us.
+        const now = await this.windowBounds(cdp, windowId)
+        if (allowed()) {
+          const minimized = await this.settleMinimized(cdp, windowId, original, allowed)
+          if (!minimized) {
+            const state = await this.windowState(cdp, windowId)
+            warn(`capture setup left window ${windowId} not minimized (state=${state ?? 'gone'})`)
+          }
+          if (allowed() && appWasHidden && this.deps.hideApp) {
+            // The macOS capture picker unhides/activates the app even when the
             // window stays minimized; bg semantics must survive the setup.
-            if (allowed() && appWasHidden && this.deps.hideApp) await this.deps.hideApp().catch(() => {})
-          } else if (this.paused && current()) {
-            // Takeover owns the window now: bring it back on-screen and leave it visible.
-            const latest = await this.send(cdp, 'Browser.getWindowBounds', { windowId }).catch(() => null)
-            if (latest?.bounds.left === parked.left && latest.bounds.top === parked.top) {
-              await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { left: original.left, top: original.top } }).catch(() => {})
+            await this.deps.hideApp(managedPid).catch((err) => warn(`capture re-hide failed: ${(err as Error).message}`))
+            // A takeover may have started while the delayed hide was in flight:
+            // the human must end visible, so undo our own hide.
+            if (!allowed() && this.deps.unhideApp) {
+              await this.deps.unhideApp(managedPid).catch((err) => warn(`capture unhide undo failed: ${(err as Error).message}`))
             }
           }
+        } else if (this.paused && current()) {
+          // Takeover owns the window now: only undo our own move, leave it visible.
+          if (now?.windowState === 'normal' && now.left === parked.left && now.top === parked.top) {
+            await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { left: original.left, top: original.top } }).catch(() => {})
+          }
+        } else {
+          debug(`capture cleanup skipped for window ${windowId} (superseded)`)
         }
       }
     }
+  }
+
+  /**
+   * Bounded window reads/writes used by setup and cleanup. macOS applies
+   * window transitions asynchronously, so nothing here trusts a single probe.
+   */
+  private async windowBounds(cdp: Cdp, windowId: number): Promise<any | null> {
+    const result = await this.send<{ bounds?: any }>(cdp, 'Browser.getWindowBounds', { windowId }).catch(() => null)
+    return result?.bounds ?? null
+  }
+
+  private async windowState(cdp: Cdp, windowId: number): Promise<string | null> {
+    return (await this.windowBounds(cdp, windowId))?.windowState ?? null
+  }
+
+  private async waitForWindowState(cdp: Cdp, windowId: number, wanted: string, alive: () => boolean, attempts = 20): Promise<string | null> {
+    let last: string | null = null
+    for (let i = 0; i < attempts; i++) {
+      if (!alive()) return last
+      last = await this.windowState(cdp, windowId)
+      if (last === null) return null
+      if (last === wanted) return wanted
+      await sleep(50)
+    }
+    return last
+  }
+
+  private async waitForWindowPosition(
+    cdp: Cdp,
+    windowId: number,
+    wanted: { left?: number; top?: number },
+    alive: () => boolean,
+    attempts = 20,
+  ): Promise<boolean> {
+    if (typeof wanted.left !== 'number' || typeof wanted.top !== 'number') return true
+    for (let i = 0; i < attempts; i++) {
+      if (!alive()) return false
+      const bounds = await this.windowBounds(cdp, windowId)
+      if (bounds === null) return false
+      if (bounds.left === wanted.left && bounds.top === wanted.top) return true
+      await sleep(50)
+    }
+    return false
+  }
+
+  /**
+   * Repair a parked window back to minimized at its original position.
+   * macOS needs the position while normal (setting a position on a minimized
+   * window un-minimizes it) and applies each transition asynchronously, so
+   * every step is bounded and verified.
+   */
+  private async settleMinimized(cdp: Cdp, windowId: number, original: any, alive: () => boolean): Promise<boolean> {
+    const bounds = await this.windowBounds(cdp, windowId)
+    if (bounds === null) return false
+    const positionOk = typeof original.left !== 'number' || typeof original.top !== 'number'
+      || (bounds.left === original.left && bounds.top === original.top)
+    if (bounds.windowState === 'minimized' && positionOk) return true
+    if (bounds.windowState !== 'normal') {
+      await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } }).catch(() => {})
+      await this.waitForWindowState(cdp, windowId, 'normal', alive)
+    }
+    if (alive()) {
+      await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { left: original.left, top: original.top } }).catch(() => {})
+      await this.waitForWindowPosition(cdp, windowId, original, alive)
+    }
+    if (!alive()) return false
+    await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } }).catch(() => {})
+    return (await this.waitForWindowState(cdp, windowId, 'minimized', alive)) === 'minimized'
   }
 
   /**

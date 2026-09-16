@@ -38,14 +38,14 @@ async function main() {
     () => health.snapshot(),
   )
   const capture = new CaptureKeepAlive(
-    () => (manager.current ? { cdp: manager.current.cdp, controllerUrl: `http://127.0.0.1:${proxyPort}/controller` } : null),
+    () => (manager.current ? { cdp: manager.current.cdp, controllerUrl: `http://127.0.0.1:${proxyPort}/controller`, pid: manager.current.pid } : null),
     () => health.snapshot(),
     {
-      appHidden: async () => (manager.current ? (await browserAppState(manager.current.pid)).hidden : false),
-      hideApp: async () => {
-        const cur = manager.current
-        if (cur) await hideBrowser(cur.pid)
-      },
+      // pid-bound: a browser restart must never let a stale setup hide/unhide
+      // the new instance
+      appHidden: async (pid) => (await browserAppState(pid)).hidden,
+      hideApp: async (pid) => { await hideBrowser(pid) },
+      unhideApp: async (pid) => { await unhideBrowser(pid) },
     },
   )
   const extensionDev = new ExtensionDev(manager, extensions, bus)

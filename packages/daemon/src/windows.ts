@@ -257,14 +257,21 @@ export class FramePumpSupervisor {
    * Maximize a window that may have just left minimized state. CDP rejects
    * `maximized` while the window is still minimized ("restore it to normal
    * state first"), so wait for the normal transition to apply, then verify the
-   * result. Bounded; returns false when the maximize did not stick.
+   * result. Bounded; returns false (and does not send maximize) when normal
+   * never arrives, and false when the maximize did not stick.
    */
   private async maximizeWindow(cdp: Cdp, windowId: number): Promise<boolean> {
+    let state: string | null = null
     for (let i = 0; i < 20; i++) {
       const bounds = await this.windowBounds(cdp, windowId)
       if (bounds === null) return false
-      if (bounds.windowState === 'normal') break
+      state = bounds.windowState ?? null
+      if (state === 'normal') break
       await sleep(50)
+    }
+    if (state !== 'normal') {
+      debug(`window ${windowId}: still ${state ?? 'unknown'} after waiting for normal; maximize skipped`)
+      return false
     }
     await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'maximized' } }).catch(() => {})
     for (let i = 0; i < 20; i++) {
@@ -326,6 +333,9 @@ export class FramePumpSupervisor {
           }
           let restored = true
           if (maximize) restored = await this.maximizeWindow(ctx.cdp, windowId)
+          // A newer intent may have superseded us during the bounded maximize
+          // wait; never count a stale restore.
+          if (!this.isControlCurrent(gen)) break
           this.collapsed.delete(windowId)
           if (restored) n++
         }
