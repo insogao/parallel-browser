@@ -1,6 +1,6 @@
 # 窗口状态转移与后台限流验收计划
 
-更新时间：2026-09-16。工作分支：`codex/window-state-throttle-test`（隔离 worktree）。本轮受主控校准：**真实验收改为显式 opt-in、一次性手工执行**，不进入 `test` / `test:integration` 默认链；GUI 最终结果 pending，由主控择机只跑一次。
+更新时间：2026-09-16。工作分支：`codex/window-state-throttle-test`（隔离 worktree）。本轮受主控校准：**真实验收改为显式 opt-in、一次性手工执行**，不进入 `test` / `test:integration` 默认链；2026-09-16 已按授权执行一次并通过（见下）。
 
 ## 目标
 
@@ -41,24 +41,27 @@
 - `src/capture.ts` + `src/index.ts`：`normal` 生效后才发 park 位置、有界校验位置生效后才记录 parked；cleanup 不信任单次严格等值探针，按“恢复原位置 → 最小化”修复并有界验证 minimized（失败 warn）。新增 pid 绑定的 `appHidden`/`hideApp`/`unhideApp`（`index.ts` 注入 `browserAppState`/`hideBrowser`/`unhideBrowser`）：picker 解除隐藏后恢复 `bg` 语义；延迟 hide 期间发生 takeover 时补 unhide，人工接管最终可见。
 - `tests/capture-unit.ts` / `windows-unit.ts`：新增确定性单元测试覆盖上述行为（延迟 normal/位置、hide 被 takeover 竞态、normal 超时不发 maximize、supersede 不计恢复）。
 
-## 已发生的真实 GUI 证据（一次运行，已足够标记结论）
+## 已执行的 GUI 验收结果（PASS，一次性）
 
-2026-09-16 11:18–11:21 CST，品牌化 Backlight.app（fixture 校验 executable sha256），临时 profile、随机端口。Phase A（capture 关闭、frame pump 关闭）：
+**最终 capture 开启的单序列验收（2026-09-16，`14f5c13`）**：`pnpm --filter @backlight/daemon test:window-state` 退出码 0，隔离品牌化 Backlight.app（fixture sha256 `8ac78806…c3dc`）、临时 profile、随机端口，run 后无残留、9333 空闲。
 
-- 可见/最大化基线：`timer=10.2/s`、服务器轮询 `4.0/s`、`shimRaf=98.9/s`、`nativeRaf=98.9/s`。
+- 最大化基线：`cdp=maximized`、AppKit hidden=false、on-screen≥1、DOM visible；timer 10.0/s、网络 3.9/s、shim rAF 100.2/s、原生 100.2/s。
+- `/api/bg` 4.00s → CDP minimized 4.95s / DOM hidden 4.95s / on-screen=0 4.95s / AppKit hidden 5.84s。
+- 最小化 + capture：`captureTargetId` 命中；CDP minimized / AppKit hidden / on-screen=0 全程；timer 10.1/s、网络 4.0/s、shim 100.0/s、原生 100.0/s；截图 17092B/27ms；DOM visibilityState 报 visible（capturer 语义，未伪造）。
+- `show --maximize` 22.66s → 23.05s DOM/native 可见 → 24.08s CDP maximized/AppKit unhidden；恢复原生 100.2/s。
+
+**更早一次 Phase A（capture 关闭、frame pump 关闭）**：
+
+- 最大化基线：`timer=10.2/s`、服务器轮询 `4.0/s`、`shimRaf=98.9/s`、`nativeRaf=98.9/s`。
 - 最小化观测窗口 10s：`timer=10.0/s`、服务器轮询 `4.0/s`、`shimRaf=58.5/s`、`nativeRaf=0.0/s`；CDP/DOM/AppKit on-screen 全程 `minimized/hidden/0`。
 - 转移时间戳：`/api/bg` 4.00s → CDP minimized 4.96s / DOM hidden 4.96s / native offscreen 4.96s / AppKit hidden 5.84s；`show --maximize` 15.95s → DOM visible 16.29s → CDP maximized 17.37s；恢复后 `nativeRaf=100.5/s`。
-- 该轮随后在 Phase B 失败：capture 保活 setup 后窗口停在 `normal` 且前台可见。由此定位并修复第 4 项缺口；修复后的定向诊断（非验收）显示窗口能回到 `minimized/offscreen`，但 AppKit 仍被 picker 解除隐藏，于是补上 `hideApp` 再隐藏与单元测试。
+- 该轮随后在 capture 阶段失败：窗口停在 `normal` 且前台可见，由此定位并修复缺口；最小化无 capture 的 `nativeRaf=0.0/s` 对照仍有效。
 
 红绿记录：`app-control windows` 未实现时真实验收在 “baseline must have a native on-screen window” 失败；实现后该断言通过。`show --maximize` 修复前，对应单元测试失败；修复后通过。Reviewer 加固的 4 项新单元在旧源码上全部失败（capture 异步 normal/延迟位置、hide 被 takeover 竞态；windows normal 超时不发 maximize、supersede 不计恢复），加固后全绿。第二轮 P1 的 2 项新单元（normal 后探针 reject/瞬时 reject）同样先红后绿；`windowTouched` 保证即使 park 未记录也会修复窗口。
 
-## 待人工验收（pending，只跑一次）
+## 人工验收（剩余）
 
-```bash
-pnpm --filter @backlight/daemon test:window-state
-```
-
-预期窗口状态变化（仅隔离测试 Backlight 自己的窗口）：启动可见 → 最大化 1 次 → 最小化 1 次（capture setup 期间有短暂的 park/normal 生产行为）→ 恢复/最大化 1 次。运行约 60–90s，会短暂出现一个被管理的测试浏览器窗口；不影响用户日常 daemon/标签页，不使用 9333。
+以上 `test:window-state` 已按授权执行一次并通过；物理 Dock 点击与真实鼠标激活仍未自动化，保持待人工验收。
 
 ## 禁止事项
 
@@ -96,7 +99,7 @@ pnpm --filter @backlight/daemon test:unit
 node --test packages/daemon/tests/capture-unit.ts packages/daemon/tests/windows-unit.ts packages/daemon/tests/window-state-throttle-unit.ts
 git diff --check
 
-# 唯一待执行的真实 GUI 验收（主控择机且只跑一次；会短暂操作隔离测试窗口）
+# 已执行的真实 GUI 验收（一次性，勿加入默认链；会短暂操作隔离测试窗口）
 pnpm --filter @backlight/daemon test:window-state
 ```
 
@@ -104,5 +107,5 @@ pnpm --filter @backlight/daemon test:window-state
 
 - 本机无预装 Backlight.app/daemon；已按项目官方品牌流程（`ensureChromiumForExtensions` + `brandBundle`）生成 `~/Library/Application Support/Backlight/apps/Backlight.app`（CfT 153.0.8010.47）。品牌化本身不改引擎、不重签名。
 - Node v22.22.0（README 验证环境为 Node 25）；`tsc --noEmit` 与原生 TS 运行均通过。
-- capture picker 会短暂取消 AppKit 隐藏；`hideApp` 依赖已接入并有单元测试，但**最终 GUI 断言尚未在真机复跑**，以 pending 记录。
+- capture picker 会短暂取消 AppKit 隐藏；`hideApp` 依赖已接入并有单元测试，且已由 2026-09-16 一次性真机验收确认（最小化+capture 全程 AppKit hidden、on-screen=0）。
 - 若最终 GUI 验收失败，保留日志与证据，不降级断言。
