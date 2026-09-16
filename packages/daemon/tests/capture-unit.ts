@@ -11,6 +11,8 @@ function fixture(t: any, options: {
   onUnhide?: () => void
   /** apply setWindowBounds only on a later getWindowBounds probe (macOS async) */
   deferredBounds?: boolean
+  onInternalNative?: (phase: 'begin' | 'end', kind: string) => void
+  onTransition?: (entry: any) => void
 } = {}) {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
   const page = { document: { title: 'Original' }, window: {} as any }
@@ -63,6 +65,8 @@ function fixture(t: any, options: {
       appHidden: async () => options.appHidden ?? false,
       hideApp: async () => { await options.onHide?.() },
       unhideApp: async () => { options.onUnhide?.() },
+      onInternalNative: (phase, kind) => { options.onInternalNative?.(phase, kind) },
+      onTransition: entry => { options.onTransition?.(entry) },
     })
   async function settle(promise: Promise<unknown>, limit = 30000) {
     let done = false
@@ -320,4 +324,62 @@ test('new CDP resets active capture and controller sessions', async t => {
   f.restart()
   await f.settle(f.capture.tick()); await f.settle(f.capture.tick())
   assert.equal(f.calls.filter(c => c.method === 'Target.createTarget').length, 2)
+})
+
+test('picker activation is bracketed as internal native activity with cleanup provenance', async t => {
+  const internal: string[] = []
+  const transitions: any[] = []
+  const f = fixture(t, {
+    appHidden: true,
+    onInternalNative: (phase, kind) => internal.push(`${phase}:${kind}`),
+    onTransition: entry => transitions.push(entry),
+  })
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.equal(f.capture.activeTargetId(), 'page')
+  assert.deepEqual(internal, ['begin:capture-picker', 'end:capture-picker'], 'the picker activation must open and close exactly one interval')
+  const events = transitions.map(e => `${e.event}:${e.branch ?? ''}`)
+  assert.ok(events.includes('capture-engage:picked'))
+  assert.ok(events.includes('capture-window:unminimized'))
+  assert.ok(events.includes('capture-window:parked'))
+  assert.ok(events.includes('capture-cleanup:minimized'))
+  assert.ok(events.includes('capture-cleanup:re-hide'), `missing re-hide branch: ${events.join(', ')}`)
+  assert.ok(transitions.every(e => typeof e.at === 'number'))
+  assert.ok(transitions.every(e => e.windowId === undefined || e.windowId === 1))
+  assert.ok(!JSON.stringify(transitions).includes('http'), 'transition log must not contain URLs')
+  assert.ok(!JSON.stringify(transitions).includes('Original'), 'transition log must not contain page titles')
+})
+
+test('failed setup still closes the internal interval and records a bounded cleanup branch', async t => {
+  const internal: string[] = []
+  const transitions: any[] = []
+  const f = fixture(t, {
+    appHidden: true,
+    onInternalNative: (phase, kind) => internal.push(`${phase}:${kind}`),
+    onTransition: entry => transitions.push(entry),
+  })
+  f.setHook(method => method === 'Input.dispatchMouseEvent' ? Promise.reject(new Error('input failed')) : undefined)
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.equal(f.capture.activeTargetId(), null)
+  assert.deepEqual(internal, ['begin:capture-picker', 'end:capture-picker'])
+  assert.ok(transitions.some(e => e.event === 'capture-cleanup' && e.branch === 'minimized'))
+})
+
+test('takeover during setup records the takeover cleanup branch and no re-hide', async t => {
+  let hides = 0
+  const transitions: any[] = []
+  const f = fixture(t, {
+    appHidden: true,
+    onHide: () => { hides++ },
+    onTransition: entry => transitions.push(entry),
+  })
+  let paused: Promise<void> | undefined
+  f.setHook(method => {
+    if (method === 'Target.activateTarget' && !paused) paused = f.capture.setPaused(true)
+  })
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.ok(paused)
+  await f.settle(paused)
+  assert.equal(hides, 0)
+  assert.ok(transitions.some(e => e.event === 'capture-cleanup' && e.branch === 'takeover-position-restored'))
+  assert.ok(!transitions.some(e => e.event === 'capture-cleanup' && e.branch === 're-hide'))
 })

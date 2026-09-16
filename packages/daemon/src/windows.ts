@@ -2,6 +2,7 @@ import type { Cdp } from './cdp.ts'
 import type { TargetHealth } from './inject.ts'
 import { loadSettings } from './store.ts'
 import { debug, log } from './log.ts'
+import type { TransitionEntry } from './state-log.ts'
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
@@ -12,6 +13,33 @@ export interface WindowStateInfo {
 }
 
 export interface WorkArea { al: number; at: number; ah: number }
+
+/** Explicit user/AI control intent. `bg` means "collapse and stay back" and is
+ * the anchor for rejecting tray auto-show requests that are really reactions
+ * to internal (capture-picker) native activation. */
+export interface ControlIntent {
+  kind: 'bg' | 'show'
+  source: string
+  route: string
+  requestId?: string
+  gen: number
+  at: number
+  /** internal native-activity sequence at the moment this intent was set */
+  internalSeq: number
+}
+
+interface InternalWindow {
+  kind: string
+  seq: number
+  from: number
+  to: number | null
+}
+
+export interface IntentMeta {
+  source?: string
+  route?: string
+  requestId?: string
+}
 
 /** 2px of the window stays on-screen: invisible in practice, but Chromium
  * still counts the window as visible (full-speed rAF, real screenshots). */
@@ -60,10 +88,102 @@ export class FramePumpSupervisor {
   private collapsed = new Map<number, { left: number; top: number; wasMinimized: boolean }>()
   private getContext: () => { cdp: Cdp } | null
   private getHealth: () => TargetHealth[]
+  /** optional privacy-safe state-transition sink (wired to StateTransitionLog) */
+  onTransition: ((entry: TransitionEntry) => void) | null = null
+  /** last explicit control intent; auto-show requests may not override 'bg' */
+  private intentRecord: ControlIntent | null = null
+  private internalSeq = 0
+  private internalWindows: InternalWindow[] = []
 
   constructor(getContext: () => { cdp: Cdp } | null, getHealth: () => TargetHealth[]) {
     this.getContext = getContext
     this.getHealth = getHealth
+  }
+
+  private transition(entry: Omit<TransitionEntry, 'at'> & { at?: number }): void {
+    try { this.onTransition?.({ at: entry.at ?? Date.now(), ...entry }) } catch { /* logging is best effort */ }
+  }
+
+  /** Record the latest explicit intent (menu/CLI/dashboard/launcher action). */
+  noteExplicitIntent(kind: 'bg' | 'show', meta: IntentMeta & { gen?: number } = {}): ControlIntent {
+    const intent: ControlIntent = {
+      kind,
+      source: meta.source ?? 'api',
+      route: meta.route ?? '',
+      requestId: meta.requestId,
+      gen: meta.gen ?? this.controlGeneration,
+      at: Date.now(),
+      internalSeq: this.internalSeq,
+    }
+    this.intentRecord = intent
+    this.transition({
+      event: 'control-intent',
+      branch: kind,
+      source: intent.source,
+      route: intent.route,
+      requestId: intent.requestId,
+      gen: intent.gen,
+    })
+    return intent
+  }
+
+  lastIntent(): ControlIntent | null {
+    return this.intentRecord
+  }
+
+  controlGen(): number {
+    return this.controlGeneration
+  }
+
+  /**
+   * Native activation/unhide the daemon performs for itself (capture picker,
+   * controller tab switch, re-hide after setup). Recorded as bounded intervals
+   * so a tray auto-show caused by them can be attributed and rejected without
+   * an arbitrary suppression timer.
+   */
+  beginInternalActivity(kind: string): number {
+    this.internalSeq++
+    this.internalWindows.push({ kind, seq: this.internalSeq, from: Date.now(), to: null })
+    if (this.internalWindows.length > 16) this.internalWindows.shift()
+    this.transition({ event: 'internal-native', branch: 'begin', detail: kind, gen: this.controlGeneration })
+    return this.internalSeq
+  }
+
+  endInternalActivity(kind: string): void {
+    for (let i = this.internalWindows.length - 1; i >= 0; i--) {
+      const window = this.internalWindows[i]!
+      if (window.kind === kind && window.to === null) {
+        window.to = Date.now()
+        this.transition({ event: 'internal-native', branch: 'end', detail: kind, gen: this.controlGeneration })
+        return
+      }
+    }
+  }
+
+  /** Most recent internal native-activity interval (open or closed). */
+  internalState(): { active: boolean; kind?: string; from?: number; to?: number } | null {
+    const last = this.internalWindows.at(-1)
+    if (!last) return null
+    return { active: last.to === null, kind: last.kind, from: last.from, to: last.to ?? undefined }
+  }
+
+  /** True when `at` falls inside (or just after the end of) an internal native
+   * activity interval. The small margin covers the notification delivery
+   * delay between the activation and the tray's observer callback. */
+  isInternalActivationAt(at: number, marginMs = 250): boolean {
+    for (let i = this.internalWindows.length - 1; i >= 0; i--) {
+      const window = this.internalWindows[i]!
+      if (at >= window.from - marginMs && at <= (window.to ?? Date.now()) + marginMs) return true
+      if (window.to !== null && at > window.to + marginMs) break
+    }
+    return false
+  }
+
+  /** Auto-show from the tray may not override a recent explicit bg when the
+   * activation it reacts to was generated by daemon-internal capture work. */
+  shouldIgnoreAutoShow(observedAt: number): boolean {
+    if (this.intentRecord?.kind !== 'bg') return false
+    return this.isInternalActivationAt(observedAt)
   }
 
   start(tickMs = 500) {
@@ -211,10 +331,15 @@ export class FramePumpSupervisor {
   async minimizeWindow(cdp: Cdp, windowId: number, settleRepeat = false, gen?: number): Promise<boolean> {
     const current = () => gen === undefined || this.isControlCurrent(gen)
     const cycles = settleRepeat ? 2 : 1
+    let before: string | undefined
     for (let cycle = 0; cycle < cycles; cycle++) {
       if (!current()) return false
       const initial = await this.windowBounds(cdp, windowId)
-      if (initial === null) return false
+      if (initial === null) {
+        this.transition({ event: 'window-minimize', windowId, gen, before, after: 'gone', branch: 'unreadable' })
+        return false
+      }
+      if (before === undefined) before = initial.windowState ?? 'unknown'
       if (!settleRepeat && initial.windowState === 'minimized') return true
       // Settling to normal is required both to leave maximized/fullscreen and
       // to repair a falsely reported minimized state on a hidden app.
@@ -241,7 +366,12 @@ export class FramePumpSupervisor {
     }
     const final = await this.windowBounds(cdp, windowId)
     if (final?.windowState !== 'minimized') debug(`window ${windowId}: minimize did not stick`)
-    return final?.windowState === 'minimized'
+    const minimized = final?.windowState === 'minimized'
+    this.transition({
+      event: 'window-minimize', windowId, gen, before, after: final?.windowState ?? 'unreadable',
+      branch: !current() ? 'superseded' : minimized ? (settleRepeat ? 'settle-repeat' : 'single') : 'not-stuck',
+    })
+    return minimized
   }
 
   private async windowBounds(cdp: Cdp, windowId: number): Promise<{ windowState?: string } | null> {
@@ -298,6 +428,7 @@ export class FramePumpSupervisor {
       const top = wa.at + wa.ah - OFFSCREEN_MARGIN
       await cdp.send('Browser.setWindowBounds', { windowId, bounds: { left, top } })
       this.collapsed.set(windowId, orig)
+      this.transition({ event: 'window-corner', windowId, before: orig.wasMinimized ? 'minimized' : 'normal', after: 'cornered', branch: 'corner' })
       log(`window ${windowId}: collapsed to corner (left=${left}, top=${top}, page keeps native full-speed)`)
       return true
     } catch (err) {
@@ -321,6 +452,7 @@ export class FramePumpSupervisor {
         const { bounds } = await ctx.cdp.send<{ bounds: any }>('Browser.getWindowBounds', { windowId })
         const orig = this.collapsed.get(windowId)
         const offscreen = bounds.left + bounds.width <= wa.al + 40 || bounds.top >= wa.at + wa.ah - 40
+        const before = bounds.windowState ?? 'normal'
         if (bounds.windowState === 'minimized' || orig || offscreen || maximize) {
           await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
           if (orig || offscreen) {
@@ -335,9 +467,17 @@ export class FramePumpSupervisor {
           if (maximize) restored = await this.maximizeWindow(ctx.cdp, windowId)
           // A newer intent may have superseded us during the bounded maximize
           // wait; never count a stale restore.
-          if (!this.isControlCurrent(gen)) break
+          if (!this.isControlCurrent(gen)) {
+            this.transition({ event: 'window-restore', windowId, gen, before, after: 'superseded', branch: 'maximize-wait' })
+            break
+          }
           this.collapsed.delete(windowId)
-          if (restored) n++
+          if (restored) {
+            n++
+            this.transition({ event: 'window-restore', windowId, gen, before, after: maximize ? 'maximized' : 'normal', branch: maximize ? 'maximize' : 'unminimize' })
+          } else {
+            this.transition({ event: 'window-restore', windowId, gen, before, after: 'not-restored', branch: 'maximize' })
+          }
         }
       } catch (err) { debug(`restore window ${windowId}: ${(err as Error).message}`) }
     }

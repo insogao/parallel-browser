@@ -10,6 +10,7 @@ import { findFreePort } from './ports.ts'
 import { createServer } from './proxy.ts'
 import { loadSettings } from './store.ts'
 import { error, initFileLogging, log } from './log.ts'
+import { StateTransitionLog } from './state-log.ts'
 import { FramePumpSupervisor } from './windows.ts'
 import { activateBrowser, browserAppState, hideBrowser, startTray, unhideBrowser } from './native.ts'
 import { acquireFileLock, readLiveDaemon, removeDaemonInfo, writeDaemonInfo } from './single-instance.ts'
@@ -50,6 +51,7 @@ async function main() {
   }
 
   const bus = new ActivityBus()
+  const stateLog = new StateTransitionLog()
   const extensions = new ExtensionManager()
   const manager: BrowserManager = new BrowserManager({
     extensions,
@@ -60,6 +62,7 @@ async function main() {
     () => (manager.current ? { cdp: manager.current.cdp } : null),
     () => health.snapshot(),
   )
+  supervisor.onTransition = entry => stateLog.record(entry)
   const capture = new CaptureKeepAlive(
     () => (manager.current ? { cdp: manager.current.cdp, controllerUrl: `http://127.0.0.1:${proxyPort}/controller`, pid: manager.current.pid } : null),
     () => health.snapshot(),
@@ -69,6 +72,13 @@ async function main() {
       appHidden: async (pid) => (await browserAppState(pid)).hidden,
       hideApp: async (pid) => { await hideBrowser(pid) },
       unhideApp: async (pid) => { await unhideBrowser(pid) },
+      // Bracket the picker's native activation so the tray can attribute the
+      // resulting didActivate/didUnhide notification to the daemon, not a user.
+      onInternalNative: (phase, kind) => {
+        if (phase === 'begin') supervisor.beginInternalActivity(kind)
+        else supervisor.endInternalActivity(kind)
+      },
+      onTransition: entry => stateLog.record(entry),
     },
   )
   const extensionDev = new ExtensionDev(manager, extensions, bus)
@@ -105,6 +115,7 @@ async function main() {
     hideBrowser,
     unhideBrowser,
     activateBrowser,
+    stateLog,
   })
 
   extensions.startWatching((files) => {

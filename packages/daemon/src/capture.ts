@@ -3,6 +3,7 @@ import type { TargetHealth } from './inject.ts'
 import { loadSettings } from './store.ts'
 import { OFFSCREEN_MARGIN, readWorkArea } from './windows.ts'
 import { debug, log, warn } from './log.ts'
+import type { TransitionEntry } from './state-log.ts'
 
 export const CAPTURE_TITLE = 'BACKLIGHT_AGENT'
 const CONTROLLER_PATH = '/controller'
@@ -29,6 +30,14 @@ export interface CaptureKeepAliveDeps {
   hideApp?: (pid: number) => Promise<void>
   /** undo a hide that a takeover raced while the delayed hide was in flight */
   unhideApp?: (pid: number) => Promise<void>
+  /**
+   * Bracket the native activation the capture picker performs on our behalf.
+   * The supervisor attributes activation notifications inside this interval to
+   * the daemon itself, so tray auto-show cannot override an explicit bg.
+   */
+  onInternalNative?: (phase: 'begin' | 'end', kind: string) => void
+  /** privacy-safe state-transition sink */
+  onTransition?: (entry: Omit<TransitionEntry, 'at'> & { at?: number }) => void
 }
 
 export class CaptureKeepAlive {
@@ -154,6 +163,10 @@ export class CaptureKeepAlive {
     return bounded(cdp.send<T>(method, method === 'Runtime.evaluate' ? { timeout: 1500, ...params } : params, session))
   }
 
+  private transition(entry: Omit<TransitionEntry, 'at'> & { at?: number }): void {
+    try { this.deps.onTransition?.({ at: entry.at ?? Date.now(), ...entry }) } catch { /* logging is best effort */ }
+  }
+
   private async engage(target: TargetHealth): Promise<void> {
     const ctx = this.getContext()
     if (!ctx) return
@@ -167,11 +180,13 @@ export class CaptureKeepAlive {
     const check = () => { if (!allowed()) throw new Error('capture setup aborted') }
     const cur = this.getHealth().find(t => t.targetId === target.targetId)
     if (!cur || cur.visibility === 'visible') return
+    this.transition({ event: 'capture-engage', source: 'capture', branch: 'picked' })
     let controllerSession: string | null = null
     let targetSession: string | undefined
     let titleTouched = false
     let switched = false
     let started = false
+    let internalKind: string | null = null
     let windowId: number | undefined
     let original: any
     let parked: { left: number; top: number } | undefined
@@ -217,6 +232,7 @@ export class CaptureKeepAlive {
             throw new Error(`window ${windowId} did not reach normal (state=${normal ?? 'unreadable'})`)
           }
           check()
+          this.transition({ event: 'capture-window', windowId, branch: 'unminimized', before: 'minimized', after: 'normal', detail: appWasHidden ? 'bg-app-hidden' : 'app-visible' })
           await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: target })
           check()
           // AppKit may clamp a mostly-offscreen frame; only record the frame
@@ -225,12 +241,17 @@ export class CaptureKeepAlive {
           const positionApplied = await this.waitForWindowPosition(cdp, windowId, target, allowed)
           const applied = positionApplied ? target : await this.windowBounds(cdp, windowId)
           if (!positionApplied) warn(`capture setup: window ${windowId} parked position did not apply (${JSON.stringify(applied)})`)
+          this.transition({ event: 'capture-window', windowId, branch: 'parked', before: 'normal', after: positionApplied ? 'parked-offscreen' : 'park-position-failed' })
           parked = applied && typeof applied.left === 'number' && typeof applied.top === 'number'
             ? { left: applied.left, top: applied.top }
             : target
         }
       }
       switched = true
+      // Native activation performed for the picker: bracket it so the tray
+      // auto-show observer cannot mistake it for a user Dock click.
+      internalKind = 'capture-picker'
+      this.deps.onInternalNative?.('begin', internalKind)
       await this.send(cdp, 'Target.activateTarget', { targetId: this.controller!.targetId })
       await sleep(300)
       check()
@@ -266,6 +287,7 @@ export class CaptureKeepAlive {
         this.noteFailure(`capture keep-alive failed: ${(err as Error).message}`)
       }
     } finally {
+      if (internalKind) this.deps.onInternalNative?.('end', internalKind)
       if (!started && controllerSession) await this.stopStream(cdp, controllerSession)
       if (titleTouched && targetSession) await this.restoreTitle(cdp, targetSession)
       if (switched) {
@@ -294,6 +316,9 @@ export class CaptureKeepAlive {
               failureCounted = true
               this.noteFailure(message)
             }
+            this.transition({ event: 'capture-cleanup', windowId, source: 'capture', branch: 'repair-failed', before: 'normal', after: state ?? 'unreadable' })
+          } else {
+            this.transition({ event: 'capture-cleanup', windowId, source: 'capture', branch: 'minimized', before: 'normal', after: 'minimized' })
           }
           if (allowed() && appWasHidden && this.deps.hideApp) {
             // The macOS capture picker unhides/activates the app even when the
@@ -303,6 +328,9 @@ export class CaptureKeepAlive {
             // the human must end visible, so undo our own hide.
             if (!allowed() && this.deps.unhideApp) {
               await this.deps.unhideApp(managedPid).catch((err) => warn(`capture unhide undo failed: ${(err as Error).message}`))
+              this.transition({ event: 'capture-cleanup', source: 'capture', branch: 'takeover-unhide-undo', before: 'hidden', after: 'visible' })
+            } else {
+              this.transition({ event: 'capture-cleanup', source: 'capture', branch: 're-hide', before: 'visible', after: 'hidden' })
             }
           }
         } else if (this.paused && current()) {
@@ -317,8 +345,10 @@ export class CaptureKeepAlive {
             if (typeof original?.left === 'number' && typeof original?.top === 'number') {
               await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { left: original.left, top: original.top } }).catch(() => {})
             }
+            this.transition({ event: 'capture-cleanup', windowId, source: 'capture', branch: 'takeover-position-restored', before: latest?.windowState ?? 'unreadable', after: 'visible' })
           }
         } else {
+          this.transition({ event: 'capture-cleanup', windowId, source: 'capture', branch: 'skipped-superseded', before: 'parked', after: 'untouched' })
           debug(`capture cleanup skipped for window ${windowId} (superseded)`)
         }
       }

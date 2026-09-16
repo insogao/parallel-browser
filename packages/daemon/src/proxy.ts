@@ -18,6 +18,19 @@ import { resolveBrandedEngineSelection, selectBrandedEngineSetting, type LoginRe
 import type { FramePumpSupervisor } from './windows.ts'
 import { TapState, tapFrame } from './tap.ts'
 import { log, debug } from './log.ts'
+import { StateTransitionLog, type TransitionEntry } from './state-log.ts'
+
+/** Tray-originated requests that reconcile visibility rather than express a
+ * new user intent. They must never outrank an explicit recent bg. */
+const AUTO_SHOW_SOURCES = new Set(['tray.auto.activate', 'tray.auto.unhide', 'tray.auto.poll'])
+
+export interface RequestMeta {
+  source: string
+  requestId: string
+  route: string
+  /** true when the request is a tray reconciliation, not an explicit action */
+  auto: boolean
+}
 
 export interface ServerDeps {
   manager: BrowserManager
@@ -35,6 +48,20 @@ export interface ServerDeps {
   hideBrowser: (pid: number) => Promise<void>
   unhideBrowser: (pid: number) => Promise<void>
   activateBrowser: (pid: number) => Promise<void>
+  /** bounded privacy-safe transition log (optional; unit tests may omit) */
+  stateLog?: StateTransitionLog
+}
+
+/** Best-effort privacy-safe transition logging (never throws into routes). */
+function transition(deps: ServerDeps, entry: Omit<TransitionEntry, 'at'> & { at?: number }): void {
+  try { deps.stateLog?.record({ at: entry.at ?? Date.now(), ...entry }) } catch { /* logging is best effort */ }
+}
+
+/** Sanitize a caller-provided source label; never persisted verbatim. */
+function requestMeta(payload: any, route: string, requestId: string): RequestMeta {
+  const raw = typeof payload?.source === 'string' ? payload.source : 'api'
+  const source = raw.replace(/[^a-zA-Z0-9._-]+/g, '').slice(0, 48) || 'api'
+  return { source, requestId, route, auto: AUTO_SHOW_SOURCES.has(source) || payload?.explicit === false }
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
@@ -73,6 +100,8 @@ function rewriteDebuggerUrls(text: string, proxyPort: number): string {
 export function createServer(deps: ServerDeps): http.Server {
   const upstream = () => deps.manager.current?.upstreamPort ?? null
   const httpServer = http.createServer()
+  let requestCounter = 0
+  const nextRequestId = () => `r${(++requestCounter).toString(36)}`
 
   // Native app-visibility operations (hide/unhide/activate) are serialized in
   // arrival order. Each op rechecks its control generation inside the critical
@@ -94,12 +123,19 @@ export function createServer(deps: ServerDeps): http.Server {
       return run
     },
     /** Persist the visibility of the newest intent without forcing focus. */
-    async persist(gen: number, activate: boolean): Promise<void> {
+    async persist(gen: number, activate: boolean, meta: Partial<RequestMeta> = {}): Promise<void> {
       const cur = deps.manager.current
       if (!cur) return
       await nativeControl.op(gen, async () => {
-        if (activate) await deps.activateBrowser(cur.pid)
-        else await deps.unhideBrowser(cur.pid)
+        let before: string | undefined
+        try { before = (await deps.appState(cur.pid)).hidden ? 'hidden' : 'visible' } catch { /* unknown */ }
+        if (activate) {
+          await deps.activateBrowser(cur.pid)
+          transition(deps, { event: 'native-activate', source: meta.source, route: meta.route, requestId: meta.requestId, gen, pid: cur.pid, before: before ?? 'unknown', after: 'active-visible' })
+        } else {
+          await deps.unhideBrowser(cur.pid)
+          transition(deps, { event: 'native-unhide', source: meta.source, route: meta.route, requestId: meta.requestId, gen, pid: cur.pid, before: before ?? 'unknown', after: 'visible' })
+        }
       })
     },
   }
@@ -107,9 +143,9 @@ export function createServer(deps: ServerDeps): http.Server {
   // Repeated clicks (Launchpad) share one in-flight login: the browser is
   // launched/reused once and every click resolves with the same result.
   let loginInFlight: Promise<LoginResult> | null = null
-  const login = (): Promise<LoginResult> => {
+  const login = (meta: RequestMeta): Promise<LoginResult> => {
     if (!loginInFlight) {
-      loginInFlight = runLogin(deps, nativeControl).finally(() => { loginInFlight = null })
+      loginInFlight = runLogin(deps, nativeControl, meta).finally(() => { loginInFlight = null })
     }
     return loginInFlight
   }
@@ -134,7 +170,7 @@ export function createServer(deps: ServerDeps): http.Server {
         return
       }
       if (url.pathname.startsWith('/api/')) {
-        await handleApi(req, res, url, deps, nativeControl, login)
+        await handleApi(req, res, url, deps, nativeControl, login, nextRequestId)
         return
       }
       if (url.pathname === '/json' || url.pathname === '/json/list' || url.pathname === '/json/new'
@@ -246,7 +282,7 @@ function pipeCdpSocket(req: http.IncomingMessage, socket: import('node:stream').
 /** Per-server serialization of native app-visibility operations. */
 interface NativeControl {
   op<T>(gen: number, work: () => Promise<T>): Promise<T | undefined>
-  persist(gen: number, activate: boolean): Promise<void>
+  persist(gen: number, activate: boolean, meta?: Partial<RequestMeta>): Promise<void>
 }
 
 /**
@@ -255,7 +291,7 @@ interface NativeControl {
  * then show + maximize + activate for assisted login. A live session is never
  * killed or switched; repeated/concurrent calls are idempotent.
  */
-async function runLogin(deps: ServerDeps, native: NativeControl): Promise<LoginResult> {
+async function runLogin(deps: ServerDeps, native: NativeControl, meta?: RequestMeta): Promise<LoginResult> {
   // Resolve read-only first: a live managed session on another engine must be
   // refused before any side effect (settings write, humanMode, capture pause,
   // restore/maximize, activate or launch).
@@ -297,7 +333,7 @@ async function runLogin(deps: ServerDeps, native: NativeControl): Promise<LoginR
       engine = instance.binary
     }
     const restored = deps.manager.running ? await deps.supervisor.restoreAll(true, gen) : 0
-    await native.persist(gen, true)
+    await native.persist(gen, true, meta)
     return { ok: true, launched, restored, engine, note }
   } catch (err) {
     // Launch failed: restore the prior control/capture intent as far as the
@@ -314,11 +350,14 @@ async function handleApi(
   url: URL,
   deps: ServerDeps,
   native: NativeControl,
-  login: () => Promise<LoginResult>,
+  login: (meta: RequestMeta) => Promise<LoginResult>,
+  nextRequestId: () => string,
 ) {
   const body = req.method === 'POST' || req.method === 'PUT' ? await readBody(req) : ''
   const payload = body ? (() => { try { return JSON.parse(body) } catch { return {} } })() : {}
   const route = `${req.method} ${url.pathname}`
+  const requestId = nextRequestId()
+  const meta = requestMeta(payload, route, requestId)
 
   switch (route) {
     case 'GET /api/demo': {
@@ -332,6 +371,11 @@ async function handleApi(
         daemon: { version: deps.version, pid: process.pid, uptimeSec: Math.round((Date.now() - deps.startedAt) / 1000), port: settings.proxyPort },
         settings,
         control: deps.supervisor.humanMode ? 'human' : 'background',
+        // Let the tray attribute auto-show reactions: `intent` is the last
+        // explicit user action, `internal` is a daemon-internal native
+        // activation interval (capture picker). No page content is exposed.
+        intent: deps.supervisor.lastIntent(),
+        internal: deps.supervisor.internalState(),
         browser: cur
           ? {
               running: true,
@@ -349,8 +393,9 @@ async function handleApi(
       return
     }
     case 'POST /api/launch': {
-      deps.supervisor.beginControl() // a new launch outranks any settling collapse
+      const gen = deps.supervisor.beginControl() // a new launch outranks any settling collapse
       deps.supervisor.humanMode = payload.focus === true || payload.keepVisible === true || payload.background === false
+      if (deps.supervisor.humanMode) deps.supervisor.noteExplicitIntent('show', { ...meta, gen })
       await deps.capture.setPaused(deps.supervisor.humanMode)
       deps.supervisor.start()
       const inst = await deps.manager.launch({
@@ -365,7 +410,11 @@ async function handleApi(
       return
     }
     case 'POST /api/login': {
-      json(res, 200, await login())
+      const result = await login(meta)
+      // A successful login is an explicit show (launcher/Dock path); a
+      // mismatched-engine refusal applied zero side effects and is not.
+      if (result.ok) deps.supervisor.noteExplicitIntent('show', { ...meta, gen: deps.supervisor.controlGen() })
+      json(res, 200, result)
       return
     }
     case 'POST /api/stop': {
@@ -373,6 +422,41 @@ async function handleApi(
       deps.supervisor.stop()
       await deps.manager.stop()
       json(res, 200, { ok: true })
+      return
+    }
+    case 'POST /api/console': {
+      // Explicit user action (tray "open console"): show the daemon dashboard
+      // in the managed Backlight browser, never in the macOS default browser.
+      // Recursion-safe: the dashboard only calls local /api/* endpoints.
+      const gen = deps.supervisor.beginControl()
+      deps.supervisor.noteExplicitIntent('show', { ...meta, gen })
+      deps.supervisor.humanMode = true
+      await deps.capture.setPaused(true)
+      const dashboardUrl = `http://127.0.0.1:${req.socket.localPort}/`
+      let launched = false
+      let activated = false
+      if (!deps.manager.running) {
+        const inst = await deps.manager.launch({ url: dashboardUrl, focus: true })
+        transition(deps, { event: 'console-open', source: meta.source, route, requestId, gen, pid: inst.pid, branch: 'launched-managed' })
+        json(res, 200, { ok: true, launched: true, activated: false })
+        return
+      }
+      const cur = deps.manager.current!
+      const tabs = await deps.manager.listTabs()
+      const existing = tabs.find(t => t.type === 'page' && t.url.startsWith(dashboardUrl))
+      if (existing) {
+        await cur.cdp.send('Target.activateTarget', { targetId: existing.targetId })
+        activated = true
+      } else {
+        await cur.cdp.send('Target.createTarget', { url: dashboardUrl })
+      }
+      await deps.supervisor.restoreAll(false, gen)
+      await native.persist(gen, true, meta)
+      transition(deps, {
+        event: 'console-open', source: meta.source, route, requestId, gen, pid: cur.pid,
+        branch: existing ? 'activated-existing-tab' : 'created-managed-tab', after: 'visible',
+      })
+      json(res, 200, { ok: true, launched, activated })
       return
     }
     case 'POST /api/restart': {
@@ -388,18 +472,26 @@ async function handleApi(
       // outranked by a later allocation. Every delayed step and the native
       // hide (in its own critical section) recheck it.
       const gen = deps.supervisor.beginControl()
+      deps.supervisor.noteExplicitIntent('bg', { ...meta, gen })
       await deps.capture.setPaused(false)
       // A hidden app needs the normal -> minimized cycle repeated for the
       // miniaturize (and renderer visibility) to actually apply; the repeat is
       // invisible there. A visible app minimizes on the first cycle.
       let appHidden = false
+      let appStateKnown = false
       if (deps.manager.current) {
-        try { appHidden = (await deps.appState(deps.manager.current.pid)).hidden } catch { /* unknown: single cycle */ }
+        try { appHidden = (await deps.appState(deps.manager.current.pid)).hidden; appStateKnown = true } catch { /* unknown: single cycle */ }
       }
       const n = deps.manager.running ? await deps.supervisor.collapseAll(appHidden, gen) : 0
       if (deps.manager.current) {
         const pid = deps.manager.current.pid
-        await native.op(gen, () => deps.hideBrowser(pid))
+        const hidden = await native.op(gen, async () => { await deps.hideBrowser(pid); return true })
+        transition(deps, {
+          event: 'native-hide', source: meta.source, route, requestId, gen, pid,
+          before: appStateKnown ? (appHidden ? 'hidden' : 'visible') : undefined,
+          after: hidden ? 'hidden' : undefined,
+          branch: hidden ? 'applied' : 'superseded',
+        })
       }
       const superseded = !deps.supervisor.isControlCurrent(gen)
       json(res, 200, { ok: true, collapsed: n, superseded })
@@ -407,11 +499,25 @@ async function handleApi(
     }
     case 'POST /api/show':
     case 'POST /api/restore': {
+      const observedAt = Number.isFinite(Number(payload.observedAt)) ? Number(payload.observedAt) : Date.now()
+      // A tray auto-show is a reconciliation of the app being brought forward.
+      // If the daemon itself just activated the app for capture, that is not a
+      // user intent and must not override an explicit recent "collapse to bg".
+      if (meta.auto && deps.supervisor.shouldIgnoreAutoShow(observedAt)) {
+        transition(deps, {
+          event: 'show-skip', source: meta.source, route, requestId,
+          gen: deps.supervisor.controlGen(), branch: 'internal-activation',
+          detail: `observedAt=${Math.round(observedAt)}`,
+        })
+        json(res, 200, { ok: true, restored: 0, ignored: 'internal-activation' })
+        return
+      }
       const gen = deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
+      deps.supervisor.noteExplicitIntent('show', { ...meta, gen })
       deps.supervisor.humanMode = true
       await deps.capture.setPaused(true)
       const n = deps.manager.running ? await deps.supervisor.restoreAll(payload.maximize === true, gen) : 0
-      await native.persist(gen, payload.activate !== false)
+      await native.persist(gen, payload.activate !== false, meta)
       json(res, 200, { ok: true, restored: n })
       return
     }
@@ -420,6 +526,12 @@ async function handleApi(
         windows: deps.manager.running ? await deps.supervisor.windowStates() : [],
         pumping: deps.supervisor.pumpTargetIds().length,
       })
+      return
+    }
+    case 'GET /api/state-log': {
+      // Bounded, privacy-safe recent transitions (no URLs/titles/content).
+      const limit = Number(url.searchParams.get('limit') ?? 50)
+      json(res, 200, { entries: deps.stateLog?.recent(limit) ?? [] })
       return
     }
     case 'GET /api/health': {
@@ -456,6 +568,7 @@ async function handleApi(
     }
     case 'POST /api/extensions/dev': {
       const gen = deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
+      deps.supervisor.noteExplicitIntent('show', { ...meta, gen })
       const name = String(payload.name ?? '')
       deps.extensionDev.entry(name)
       if (!deps.manager.running) {
@@ -472,7 +585,7 @@ async function handleApi(
       }
       if (!targetId) return json(res, 400, { error: 'select a website targetId or url' })
       await deps.supervisor.restoreAll(payload.maximize === true, gen)
-      await native.persist(gen, payload.activate !== false)
+      await native.persist(gen, payload.activate !== false, meta)
       const result = await deps.extensionDev.openPanel(name, targetId)
       json(res, 200, { ok: true, ...result })
       return
@@ -487,6 +600,7 @@ async function handleApi(
       const target = (await deps.manager.listTabs()).find(t => t.targetId === payload.targetId)
       if (!target) return json(res, 404, { error: 'target is no longer available; refresh the target list' })
       const gen = deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
+      deps.supervisor.noteExplicitIntent('show', { ...meta, gen })
       deps.supervisor.humanMode = true
       await deps.capture.setPaused(true)
       // Go through our loopback proxy: Chromium rejects the frontend's
@@ -494,7 +608,7 @@ async function handleApi(
       const inspectorUrl = `devtools://devtools/bundled/inspector.html?ws=127.0.0.1:${req.socket.localPort}/devtools/page/${target.targetId}`
       const { targetId } = await cur.cdp.send('Target.createTarget', { url: inspectorUrl, newWindow: true })
       await deps.supervisor.restoreAll(false, gen)
-      await native.persist(gen, payload.activate !== false)
+      await native.persist(gen, payload.activate !== false, meta)
       json(res, 200, { ok: true, targetId })
       return
     }
