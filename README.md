@@ -121,6 +121,31 @@ bl ext rm demo
 
 保存扩展文件后，Backlight 使用 Chromium 的 `Extensions.loadUnpacked` 定向重载。内容脚本改动后仍需刷新目标网页；面板重开可能丢失内存状态，持久状态应写入 `chrome.storage`。
 
+## BrowserPilot 集成（测试用扩展，无硬耦合）
+
+Backlight 仓库不包含任何 BrowserPilot 专属代码。BrowserPilot 是可独立分发的 Chrome MV3 扩展，这里只是它的通用宿主与 macOS 集成测试场；不得为 BrowserPilot 增加 Backlight 硬依赖，也不得为测试去改 BrowserPilot 的独立分发形态。
+
+- **通用扩展注册表与热加载**：`bl ext add/rm/reload/ls` 管理的注册表持久化为 Backlight home 下的 `extensions.json`；运行时通过 `GET /api/extensions` 返回 `runtime[]`（id/name/version/path/enabled）与最近一次 reload 结果。加载/重载走 Chromium `Extensions.loadUnpacked`，不重启浏览器。2026-09-16 实测 `runtime[0] = { id: nnollghpaggbcdkkgoieneffnlijinio, name: BrowserPilot, version: 0.1.0, enabled: true }`。
+- **profile 级 native host**：Chrome 按显式 `--user-data-dir` 在 `<user-data-dir>/NativeMessagingHosts/` 查找用户级 host。当前默认 profile（`~/Library/Application Support/Backlight/spaces/default/profile`）下的 `com.browserpilot.browseragent.json` 指向 BrowserPilot worktree 的 `native-host/dist/host-mac.sh`。定向注册命令（在 BrowserPilot worktree 内执行，`--only-user-data-dir` 只写显式目标，不碰自动发现目录）：
+  ```bash
+  npm run register-host:mac -- --only-user-data-dir --user-data-dir "$HOME/Library/Application Support/Backlight/spaces/default/profile"
+  ```
+- **当前默认安装（2026-09-16）**：默认 space 已加载上述 BrowserPilot worktree 的 `dist/`；host 是品牌浏览器进程的直接子进程（实测 pid 14500 ← 浏览器 pid 2810），监听 `127.0.0.1:47001`。注册与连接在未重启浏览器的情况下生效：`npm run client -- ping '{}' --no-launch` 返回 `pong: true`。
+- **如何验证**：
+  ```bash
+  curl -s http://127.0.0.1:9333/api/extensions          # runtime[] 的 id/name/version/enabled
+  # BrowserPilot worktree 内（host 离线时只报错，不会拉起浏览器）：
+  npm run client -- ping '{}' --no-launch
+  npm run client -- list_templates '{}' --no-launch
+  ```
+- **新 space 的注册缺口**：host 注册按 user-data-dir 精确作用域；将来新增 Backlight space/profile 不会自动获得 host，需要对该 space 的 profile 目录重跑上面的 `--only-user-data-dir` 注册，再由该实例的扩展调用 `connectNative`（注册本身不需要为生效而重启浏览器）。
+- **worktree dist 路径脆弱性**：当前扩展加载路径与 host wrapper 都指向 BrowserPilot 功能 worktree 的产物；移动或删除该 worktree 会同时破坏已加载扩展与 host 注册。合并/迁移后需重新 `bl ext add`（或 reload）并按新路径重跑注册。
+- 模板库存口径：BrowserPilot 侧只有 3 个编译内置模板（search、gemini-ask、chatgpt-ask）开箱即用，其余 registry 包需运行时 install/sync；Backlight 文档不得把“registry 有包”写成“已安装/已验证”。
+
+## 窗口状态与启动器变更的生效条件
+
+2026-09-16 的窗口状态保活/来源归因、托盘 source 与 `/api/console`、启动器 `LSUIElement` 等修复已通过确定性单元与一次性真机验收（`pnpm --filter @backlight/daemon test:window-state`、`test:bg-rebound` 各一次 PASS），并已原子刷新 runtime 快照；但 **live daemon（pid 2695）与 tray（pid 2768）仍运行旧内存代码**，在用户批准的完整重启前不生效：旧 tray 的自动 show 没有 source/归属门禁，旧组合的“打开控制台”仍可能走默认浏览器。安全升级步骤与人工验收项见 [docs/development/2026-09-16.md](docs/development/2026-09-16.md) 的“生效条件与安全步骤”。
+
 ## 技术方案与代码路径
 
 | 模块 | 技术选择 | 作用与代码路径 |
@@ -137,7 +162,7 @@ bl ext rm demo
 | 用户入口 | Node.js CLI、HTML Dashboard | `packages/cli/`、`packages/daemon/src/proxy.ts`、`demo.html` |
 | 验收 | Node test、真实 Backlight.app | `packages/daemon/tests/`、`tests/backlight-fixture.ts` |
 
-完整状态、已验证结论和剩余边界见 [PROJECT_INDEX.md](PROJECT_INDEX.md)。按日期记录的测试证据见 [docs/development/2026-09-13.md](docs/development/2026-09-13.md)。
+完整状态、已验证结论和剩余边界见 [PROJECT_INDEX.md](PROJECT_INDEX.md)。按日期记录的测试证据见 [docs/development/2026-09-16.md](docs/development/2026-09-16.md)（窗口状态/启动器/来源归因）与 [docs/development/2026-09-13.md](docs/development/2026-09-13.md)。
 
 ## 开发规范
 
@@ -211,6 +236,8 @@ git diff --check
 - [项目交接索引](PROJECT_INDEX.md)
 - [侧栏扩展示例](examples/side-panel/README.md)
 - [开发计划](docs/plans/2026-09-13-opencode-completion.md)
+- [窗口状态验收计划](docs/plans/2026-09-16-window-state-throttle-acceptance.md)
+- [2026-09-16 开发与验收记录](docs/development/2026-09-16.md)
 - [首次公开发布记录](docs/development/2026-09-15.md)
 - [Chromium Extensions CDP](https://chromedevtools.github.io/devtools-protocol/tot/Extensions/)
 - [Chrome sidePanel API](https://developer.chrome.com/docs/extensions/reference/api/sidePanel)

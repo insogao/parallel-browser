@@ -30,6 +30,16 @@
 - **验证状态（2026-09-13 19:47 CST，品牌化 Backlight）：`pnpm --filter @backlight/daemon test` 通过 —— 单元 25/25 + brand 11 项 + spike/supervisor/extensions/agent/background/usability 全部 PASS（32 条 PASS，无 FAIL）；6 条 `[Backlight acceptance]` 路径均为 `.../Backlight.app/...`，sha256 一致，无临时进程/目录遗留。**
 - 本轮修复已全部提交（自 `6a4b097` capture 修复起，至本文档更新）。日常 daemon 不会自动加载源码，需用户下次安全重启后生效；不要在用户使用期间擅自终止其浏览器。
 
+## 外部扩展集成（BrowserPilot，测试用，无硬耦合）
+
+Backlight 不含 BrowserPilot 专属代码；BrowserPilot 是可独立分发的扩展，这里只做通用宿主与 macOS 集成测试场。2026-09-16 实测现状：
+
+- 通用扩展注册表 + 热加载：`extensions.json` 持久化，`GET /api/extensions` 返回 `runtime[]`（id/name/version/path/enabled）；`Extensions.loadUnpacked` 重载不重启浏览器。当前 `runtime[0]` = BrowserPilot `nnollghpaggbcdkkgoieneffnlijinio` 0.1.0，`enabled=true`，加载路径为 BrowserPilot worktree 的 `dist/`。
+- profile 级 native host：默认 profile `<Backlight home>/spaces/default/profile/NativeMessagingHosts/com.browserpilot.browseragent.json` 指向 BrowserPilot worktree 的 `native-host/dist/host-mac.sh`；host 为品牌浏览器子进程并监听 127.0.0.1:47001。注册/连接在未重启浏览器的情况下生效（`npm run client -- ping '{}' --no-launch` → `pong: true`，在 BrowserPilot worktree 内执行）。
+- 验证入口：`curl -s http://127.0.0.1:9333/api/extensions`；`npm run client -- ping '{}' --no-launch`；`npm run client -- list_templates '{}' --no-launch`（后两者只连运行中的 host，不会拉起浏览器）。
+- 缺口：host 注册按 user-data-dir 作用域，新 Backlight space 的 profile 需对该目录重跑 `--only-user-data-dir` 注册；worktree 移动/删除会同时破坏已加载扩展与 host wrapper 指向，合并后需重新 `bl ext add`/reload 并按新路径注册。
+- 口径：BrowserPilot 仅 3 个编译内置模板（search、gemini-ask、chatgpt-ask）开箱即用，其余 registry 包需运行时 install/sync；不得写成“已全部安装/验证”。
+
 ## 测试规范
 
 入口：`pnpm --filter @backlight/daemon test`，类型检查：`pnpm -r --if-present run check`。
