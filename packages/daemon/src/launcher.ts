@@ -350,6 +350,7 @@ function launcherInfoPlist(): string {
   <key>CFBundleVersion</key><string>${version}</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict>
@@ -502,6 +503,13 @@ export async function verifyLauncher(opts: LauncherPathOptions = {}): Promise<Ve
 
   const info = readBundleInfo(p.launcherApp)
   add('bundle id', info?.bundleId === LAUNCHER_BUNDLE_ID, `CFBundleIdentifier=${info?.bundleId ?? 'missing'}`)
+  let plistText = ''
+  try {
+    plistText = fs.readFileSync(path.join(p.launcherApp, 'Contents', 'Info.plist'), 'utf8')
+  } catch { /* reported by plist lint below */ }
+  // The launcher hands off to the CLI and exits; LSUIElement keeps it out of
+  // the Dock (no duplicate icon flash) while Launchpad still lists it.
+  add('launcher hidden from Dock (LSUIElement)', /<key>LSUIElement<\/key>\s*<true\s*\/>/.test(plistText), 'LSUIElement=true')
   try {
     const lint = await run('/usr/bin/plutil', ['-lint', path.join(p.launcherApp, 'Contents', 'Info.plist')], 30_000)
     add('plist lint', /OK$/m.test(lint.trim()) || lint.includes('OK'), lint.trim())

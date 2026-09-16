@@ -296,6 +296,10 @@ test('installLauncher is idempotent, leaves the engine untouched and verifies cl
   assert.ok(checks.some(c => c.name === 'cli arguments' && c.ok))
   assert.ok(checks.some(c => c.name === 'codesign verify' && c.ok))
   assert.ok(checks.some(c => c.name === 'engine distinct from launcher app' && c.ok))
+  assert.ok(checks.some(c => c.name === 'launcher hidden from Dock (LSUIElement)' && c.ok),
+    'launcher must be LSUIElement so clicks do not flash a duplicate Dock icon')
+  const plist = fs.readFileSync(path.join(first.appPath, 'Contents', 'Info.plist'), 'utf8')
+  assert.match(plist, /<key>LSUIElement<\/key>\s*<true\s*\/>/)
 
   assert.equal(sha256(engine.bin), engineBinDigest, 'engine executable must not be modified')
   assert.equal(sha256(path.join(engine.app, 'Contents', 'Info.plist')), enginePlistDigest, 'engine plist must not be modified')
@@ -389,7 +393,13 @@ function loginHarness() {
   const supervisor = {
     humanMode: false,
     starts: 0,
+    intents: [] as any[],
     beginControl: () => 7,
+    controlGen: () => 7,
+    noteExplicitIntent(kind: string, meta: any) { this.intents.push({ kind, ...meta }); return { kind, ...meta } },
+    lastIntent: () => null,
+    internalState: () => null,
+    shouldIgnoreAutoShow: () => false,
     start() { this.starts++ },
     async restoreAll(maximize: boolean) { state.restores.push(maximize); return 3 },
     isControlCurrent: () => true,
