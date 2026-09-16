@@ -12,7 +12,8 @@
     "test": "pnpm run test:unit && pnpm run test:integration",
     "build": "tsc --noEmit",
     "test:unit": "node --test tests/*-unit.ts && node tests/brand.ts",
-    "test:integration": "caffeinate -dis node tests/spike.ts && caffeinate -dis node tests/supervisor.ts && caffeinate -dis node tests/extensions.ts && caffeinate -dis node tests/agent.ts && caffeinate -dis node tests/background.ts && caffeinate -dis node tests/usability.ts"
+    "test:integration": "caffeinate -dis node tests/spike.ts && caffeinate -dis node tests/supervisor.ts && caffeinate -dis node tests/extensions.ts && caffeinate -dis node tests/agent.ts && caffeinate -dis node tests/background.ts && caffeinate -dis node tests/usability.ts",
+    "test:window-state": "caffeinate -dis node tests/window-state-throttle.ts"
   },
   "dependencies": {
     "@puppeteer/browsers": "^3.2.2",

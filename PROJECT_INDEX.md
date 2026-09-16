@@ -1,6 +1,6 @@
 # Backlight 项目索引与交接
 
-更新时间：2026-09-15。项目地址：<https://github.com/insogao/parallel-browser>。此文件是当前状态入口；PLAN.md、DISCUSSION.md 中的早期结论仅作历史参考。
+更新时间：2026-09-16。项目地址：<https://github.com/insogao/parallel-browser>。此文件是当前状态入口；PLAN.md、DISCUSSION.md 中的早期结论仅作历史参考。
 
 ## 用户要求（后续开发必须遵守）
 
@@ -20,7 +20,9 @@
 - 观测：修复多条 rAF 调度链；区分原生帧率与补偿回调，不伪造 document.hidden。
 - 最小化：查清“CDP 报告 minimized 但 AppKit 未真正最小化”的根因；应用隐藏时执行两次 normal→minimized 循环，`document.hidden === true`、三页持续轮询（`tests/usability.ts` 连续通过，证据含 target/windowId/bounds/native 状态）。假性 minimized（隐藏应用上报告可为假）在 `settleRepeat` 下强制恢复循环，重复 `/api/bg` 可修复（`tests/windows-unit.ts`）。
 - 控制代际（last-intent-wins）：`collapseAll`/`restoreAll` 开启代际，`/api/bg` 在进入路由时（任何 await 前）就分配代际，延迟最小化步骤会校验；show/restore/launch/ext-dev/inspect 会作废在途 bg。native hide/unhide/activate 由每服务器队列按到达顺序串行化，临界区内重查代际：bg 先进 hide 则后到 show 的 unhide 排后执行，show 先进则旧 bg 跳过 hide。`tests/proxy-race-unit.ts` 3 个 API 级竞态用例覆盖 settle 中 show、setPaused(false) 挂起中 show、hide 在途时 show。
-- 原生可见性：新增 `app-control unhide`（不抢焦点）；AppKit hide/unhide 异步生效，改为发出请求后用新进程校验状态并有界重试，show(activate:false) 与 bg 连续切换不再出现状态漂移。
+- 原生可见性：新增 `app-control unhide`（不抢焦点）；AppKit hide/unhide 异步生效，改为发出请求后用新进程校验状态并有界重试，show(activate:false) 与 bg 连续切换不再出现状态漂移。2026-09-16 新增只读 `app-control windows`（CGWindowList：窗口总数、on-screen layer-0 窗口数），用于真实验收交叉验证原生最小化。
+- 窗口状态验收（2026-09-16）：新增 opt-in `test:window-state`，在隔离品牌化 Backlight.app 上跑一个 `可见/最大化 → 最小化 → 恢复/最大化` 序列，分开采集 CDP windowState、AppKit hidden/WindowServer on-screen、`document.visibilityState`、timer、服务器网络轮询、补偿 rAF、原生 compositor rAF。一次真实运行证明：最小化 10s 内 timer 10.0/s、网络轮询 4.0/s、shim rAF 58.5/s、原生 compositor rAF 0.0/s；恢复后原生 100.5/s。纯单元守卫“不伪造 visibilityState”与速率阈值区分（38/38 单元通过）。
+- 窗口/捕获修复（2026-09-16）：`show --maximize` 在最小化窗口上先有界等待 `normal` 再 maximize 并校验结果，未验证成功不计入 `restored`；capture 保活 setup 的 park 拆成 `normal` 与位置两次调用并记录实际位置，cleanup 先恢复位置再最小化，新增 `appHidden`/`hideApp` 依赖在 macOS picker 解除隐藏后恢复 `bg` 语义（`index.ts` 注入 `browserAppState`/`hideBrowser`，单元覆盖；真机 capture 复验 pending，只跑一次）。
 - CDP：`Cdp.send` 先注册 waiter 再发送，修复快速响应被丢弃导致的永久挂起；`tests/cdp-unit.ts` 3 个确定性测试。
 - **验证状态（2026-09-13 19:47 CST，品牌化 Backlight）：`pnpm --filter @backlight/daemon test` 通过 —— 单元 25/25 + brand 11 项 + spike/supervisor/extensions/agent/background/usability 全部 PASS（32 条 PASS，无 FAIL）；6 条 `[Backlight acceptance]` 路径均为 `.../Backlight.app/...`，sha256 一致，无临时进程/目录遗留。**
 - 本轮修复已全部提交（自 `6a4b097` capture 修复起，至本文档更新）。日常 daemon 不会自动加载源码，需用户下次安全重启后生效；不要在用户使用期间擅自终止其浏览器。
@@ -29,7 +31,9 @@
 
 入口：`pnpm --filter @backlight/daemon test`，类型检查：`pnpm -r --if-present run check`。
 
-单元测试为 `tests/*-unit.ts`（capture、windows、extension-dev、cdp、proxy、proxy-race、targets、raf 等）加 `tests/brand.ts`。集成入口 `tests/agent.ts` 的每次 CDP 调用有 15s 上限，回归失败快速报错而非无限挂起；生产代码不设短超时。
+单元测试为 `tests/*-unit.ts`（capture、windows、extension-dev、cdp、proxy、proxy-race、targets、raf、window-state 等）加 `tests/brand.ts`；当前 38/38 单元 + brand 通过。集成入口 `tests/agent.ts` 的每次 CDP 调用有 15s 上限，回归失败快速报错而非无限挂起；生产代码不设短超时。
+
+窗口状态 + 全通道后台限流验收是**手工 opt-in**：`pnpm --filter @backlight/daemon test:window-state`。它只跑一个 `maximize → minimize → restore` 序列，会短暂操作隔离测试 Backlight 窗口，**不在** `test`/`test:integration` 默认链；真机结果由主控择机跑一次后记录（当前标记 pending）。
 
 所有会启动浏览器的测试（含 probe）使用 `packages/daemon/tests/backlight-fixture.ts`：
 
@@ -69,6 +73,8 @@ node packages/cli/bin/backlight.js inspect <targetId>
 - 角落（corner）模式下窗口几乎完全离屏，Chromium 不产生合成帧：默认 `Page.captureScreenshot` 可能永久等待，`fromSurface:false` 也不保证成功。后台截图请使用 capture keep-alive（spike 实测 57–78ms）或可见窗口；AI 客户端在后台截屏前应先恢复窗口或依赖捕获保活。
 - 人工接手中断 capture setup（含 controller 已激活、或成功后暂停的竞态）时回到原网页；若用户已切换其它标签则保留用户选择。
 - 应用隐藏时窗口需要两次 normal→minimized 循环才会真正隐藏（AppKit 与 CDP 状态语义差异）；应用可见时一次即可。
+- capture 保活 setup 会短暂 park/取消最小化窗口，macOS picker 也可能取消 AppKit 隐藏；已修复为恢复位置后再最小化并用 `hideApp` 再隐藏，但该修复的**真机 capture 最终验收尚未复跑**（pending：`test:window-state`）。最小化且无 capture 时原生 compositor rAF=0 已由 2026-09-16 一次真实运行证明。
+- `document.visibilityState` 不做断言也不改写：capture 豁免下显示值由 Chromium 决定；补偿 rAF 只代表页面逻辑帧。
 - sidePanel 调试会关闭并重新打开当前窗口面板，以准确定位目标；面板临时状态可能丢失，storage 数据保留。隐藏面板的 WebContents 会被复用，归属用 `chrome.windows.getCurrent()` 验证。
 - 原始 CDP 客户端仍可操作窗口；AI 应尊重 status.control 的人工接手状态。
 - Dock 真鼠标点击、复杂登录站点兼容性仍需补充验收；多窗口同扩展面板归属已由双窗口集成测试覆盖（3/3）。

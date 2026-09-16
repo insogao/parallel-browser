@@ -22,6 +22,13 @@ interface ActiveCapture {
  * the tab whose title matches. One capture at a time (single magic title);
  * other hidden targets fall back to the frame pump / rAF shim layers.
  */
+export interface CaptureKeepAliveDeps {
+  /** true when the app-level background state (bg) hid the app */
+  appHidden?: () => Promise<boolean>
+  /** re-apply that hidden state after a setup that unhid/activated the app */
+  hideApp?: () => Promise<void>
+}
+
 export class CaptureKeepAlive {
   private timer: NodeJS.Timeout | null = null
   private ticking = false
@@ -38,10 +45,16 @@ export class CaptureKeepAlive {
   private paused = false
   private getContext: () => { cdp: Cdp; controllerUrl: string } | null
   private getHealth: () => TargetHealth[]
+  private deps: CaptureKeepAliveDeps
 
-  constructor(getContext: () => { cdp: Cdp; controllerUrl: string } | null, getHealth: () => TargetHealth[]) {
+  constructor(
+    getContext: () => { cdp: Cdp; controllerUrl: string } | null,
+    getHealth: () => TargetHealth[],
+    deps: CaptureKeepAliveDeps = {},
+  ) {
     this.getContext = getContext
     this.getHealth = getHealth
+    this.deps = deps
   }
 
   start(tickMs = 1000) {
@@ -153,6 +166,7 @@ export class CaptureKeepAlive {
     let windowId: number | undefined
     let original: any
     let parked: { left: number; top: number } | undefined
+    let appWasHidden = false
     try {
       check()
       controllerSession = await this.ensureController(cdp, check)
@@ -173,11 +187,24 @@ export class CaptureKeepAlive {
         check()
         if (bounds.windowState === 'minimized') {
           original = bounds
+          if (this.deps.appHidden) appWasHidden = await this.deps.appHidden().catch(() => false)
           const wa = await bounded(readWorkArea(cdp))
           check()
-          parked = { left: wa.al - ((bounds.width ?? 1200) - OFFSCREEN_MARGIN), top: wa.at + wa.ah - OFFSCREEN_MARGIN }
-          await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal', ...parked } })
+          // Measured on macOS/CfT 153: a position sent together with the
+          // minimized -> normal transition is ignored (the window reappears at
+          // its old frame), so switch to normal first and park in a separate
+          // call. A position set on a minimized window would un-minimize it.
+          const target = { left: wa.al - ((bounds.width ?? 1200) - OFFSCREEN_MARGIN), top: wa.at + wa.ah - OFFSCREEN_MARGIN }
+          await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
           check()
+          await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: target })
+          check()
+          // AppKit may clamp a mostly-offscreen frame; remember what actually
+          // applied so cleanup can recognize our own move.
+          const applied = await this.send<{ bounds?: { left?: number; top?: number } }>(cdp, 'Browser.getWindowBounds', { windowId }).catch(() => null)
+          parked = applied?.bounds && typeof applied.bounds.left === 'number' && typeof applied.bounds.top === 'number'
+            ? { left: applied.bounds.left, top: applied.bounds.top }
+            : target
         }
       }
       switched = true
@@ -235,10 +262,16 @@ export class CaptureKeepAlive {
         // this window while setup or cleanup was awaiting CDP.
         const now = await this.send(cdp, 'Browser.getWindowBounds', { windowId }).catch(() => null)
         if (now?.bounds.windowState === 'normal' && now.bounds.left === parked.left && now.bounds.top === parked.top) {
-          if (allowed()) await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } }).catch(() => {})
-          // Recheck after the minimize await: takeover owns subsequent moves.
-          if (allowed()) await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { left: original.left, top: original.top } }).catch(() => {})
-          else if (this.paused && current()) {
+          if (allowed()) {
+            // Position must be restored while the window is normal: setting a
+            // position on a minimized window un-minimizes it (measured macOS/CfT 153).
+            await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { left: original.left, top: original.top } }).catch(() => {})
+            if (allowed()) await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } }).catch(() => {})
+            // The macOS capture picker can unhide/activate the app even when the
+            // window stays minimized; bg semantics must survive the setup.
+            if (allowed() && appWasHidden && this.deps.hideApp) await this.deps.hideApp().catch(() => {})
+          } else if (this.paused && current()) {
+            // Takeover owns the window now: bring it back on-screen and leave it visible.
             const latest = await this.send(cdp, 'Browser.getWindowBounds', { windowId }).catch(() => null)
             if (latest?.bounds.left === parked.left && latest.bounds.top === parked.top) {
               await this.send(cdp, 'Browser.setWindowBounds', { windowId, bounds: { left: original.left, top: original.top } }).catch(() => {})

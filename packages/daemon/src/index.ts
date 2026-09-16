@@ -40,6 +40,13 @@ async function main() {
   const capture = new CaptureKeepAlive(
     () => (manager.current ? { cdp: manager.current.cdp, controllerUrl: `http://127.0.0.1:${proxyPort}/controller` } : null),
     () => health.snapshot(),
+    {
+      appHidden: async () => (manager.current ? (await browserAppState(manager.current.pid)).hidden : false),
+      hideApp: async () => {
+        const cur = manager.current
+        if (cur) await hideBrowser(cur.pid)
+      },
+    },
   )
   const extensionDev = new ExtensionDev(manager, extensions, bus)
 

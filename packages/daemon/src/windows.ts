@@ -253,6 +253,30 @@ export class FramePumpSupervisor {
     }
   }
 
+  /**
+   * Maximize a window that may have just left minimized state. CDP rejects
+   * `maximized` while the window is still minimized ("restore it to normal
+   * state first"), so wait for the normal transition to apply, then verify the
+   * result. Bounded; returns false when the maximize did not stick.
+   */
+  private async maximizeWindow(cdp: Cdp, windowId: number): Promise<boolean> {
+    for (let i = 0; i < 20; i++) {
+      const bounds = await this.windowBounds(cdp, windowId)
+      if (bounds === null) return false
+      if (bounds.windowState === 'normal') break
+      await sleep(50)
+    }
+    await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'maximized' } }).catch(() => {})
+    for (let i = 0; i < 20; i++) {
+      const bounds = await this.windowBounds(cdp, windowId)
+      if (bounds === null) return false
+      if (bounds.windowState === 'maximized') return true
+      await sleep(50)
+    }
+    debug(`window ${windowId}: maximize did not stick`)
+    return false
+  }
+
   /** Move one window to the offscreen corner. Returns true if moved. */
   async cornerWindow(cdp: Cdp, windowId: number): Promise<boolean> {
     try {
@@ -300,9 +324,10 @@ export class FramePumpSupervisor {
               top: top >= wa.at + wa.ah - 40 ? wa.at + 40 : top,
             } })
           }
-          if (maximize) await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'maximized' } })
+          let restored = true
+          if (maximize) restored = await this.maximizeWindow(ctx.cdp, windowId)
           this.collapsed.delete(windowId)
-          n++
+          if (restored) n++
         }
       } catch (err) { debug(`restore window ${windowId}: ${(err as Error).message}`) }
     }

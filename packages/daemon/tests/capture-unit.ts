@@ -5,7 +5,7 @@ import { CaptureKeepAlive, CAPTURE_TITLE } from '../src/capture.ts'
 import type { Cdp } from '../src/cdp.ts'
 import type { TargetHealth } from '../src/inject.ts'
 
-function fixture(t: any) {
+function fixture(t: any, options: { appHidden?: boolean; onHide?: () => void } = {}) {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
   const page = { document: { title: 'Original' }, window: {} as any }
   const calls: { method: string; params: any; session?: string }[] = []
@@ -37,7 +37,11 @@ function fixture(t: any) {
   }
   let cdp = fake as unknown as Cdp
   const capture = new CaptureKeepAlive(() => ({ cdp, controllerUrl: 'http://localhost/controller' }),
-    () => [{ targetId: 'page', title: 'Original', url: 'https://example.com', visibility: 'hidden' } as TargetHealth])
+    () => [{ targetId: 'page', title: 'Original', url: 'https://example.com', visibility: 'hidden' } as TargetHealth],
+    {
+      appHidden: async () => options.appHidden ?? false,
+      hideApp: async () => { options.onHide?.() },
+    })
   async function settle(promise: Promise<unknown>, limit = 30000) {
     let done = false
     promise.finally(() => { done = true })
@@ -142,6 +146,41 @@ test('setup error restores title and minimized window position', async t => {
   assert.equal(f.page.document.title, 'Original')
   assert.equal(f.bounds.windowState, 'minimized')
   assert.equal(f.bounds.left, 50)
+})
+
+test('capture setup parks as a separate call, restores position before minimizing, re-hides a background app', async t => {
+  let hides = 0
+  const f = fixture(t, { appHidden: true, onHide: () => { hides++ } })
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.equal(f.capture.activeTargetId(), 'page')
+  const setBounds = f.calls.filter(c => c.method === 'Browser.setWindowBounds').map(c => c.params.bounds)
+  // macOS drops a position sent together with the minimized -> normal transition,
+  // so the park must be two calls: normal first, then the offscreen position.
+  assert.deepEqual(setBounds[0], { windowState: 'normal' })
+  assert.equal(setBounds[1].left, -1198)
+  // Cleanup must restore the position while normal, then minimize last: a
+  // position set on a minimized window would un-minimize it (measured macOS/CfT 153).
+  assert.equal(setBounds.at(-2)?.left, 50)
+  assert.equal(setBounds.at(-2)?.top, 60)
+  assert.deepEqual(setBounds.at(-1), { windowState: 'minimized' })
+  assert.equal(f.bounds.windowState, 'minimized')
+  assert.equal(f.bounds.left, 50)
+  assert.equal(hides, 1, 'a background app must be hidden again after capture setup')
+})
+
+test('takeover during capture setup keeps the window and never re-hides the app', async t => {
+  let hides = 0
+  const f = fixture(t, { appHidden: true, onHide: () => { hides++ } })
+  let paused: Promise<void> | undefined
+  f.setHook(method => {
+    if (method === 'Target.activateTarget' && !paused) paused = f.capture.setPaused(true)
+  })
+  await f.capture.tick(); await f.settle(f.capture.tick())
+  assert.ok(paused)
+  await f.settle(paused)
+  assert.equal(hides, 0, 'takeover must never hide the app')
+  assert.equal(f.bounds.windowState, 'normal', 'takeover window stays visible')
+  assert.equal(f.bounds.left, 50, 'parked window is returned to its original position')
 })
 
 test('hanging Runtime promise cannot block takeover or later disrupt it', async t => {
