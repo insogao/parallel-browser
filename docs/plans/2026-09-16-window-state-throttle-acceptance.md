@@ -135,3 +135,13 @@ pnpm --filter @backlight/daemon test:bg-invisibility
 - Node v22.22.0（README 验证环境为 Node 25）；`tsc --noEmit` 与原生 TS 运行均通过。
 - capture picker 会短暂取消 AppKit 隐藏；`hideApp` 依赖已接入并有单元测试，且已由 2026-09-16 一次性真机验收确认（最小化+capture 全程 AppKit hidden、on-screen=0）。
 - 若最终 GUI 验收失败，保留日志与证据，不降级断言。
+
+## 2026-09-16 follow-up：隐藏后台重启 fail-closed（取代“复建后 repair hide”）
+
+严格采样（从 `/api/restart` 请求前开始、覆盖 PID 变化）证明 warm reopen/复建标签路径无法零瞬显：旧实现的请求窗内 12/41 个样本 visible（新 pid unhidden → onScreen=2 → repair hide）。因此：
+
+- 隐藏（或可见性不可读）时的 plain/automatic 后台重启在停止进程之前被拒绝：`POST /api/restart` 返回 409 `{restarted:false,deferred:true,reason:"hidden-restart-unsafe"|"hidden-state-unknown"}`，pid/端口/标签页会话保留，state-log 记 `restart/branch=deferred/after=unchanged` + source/route/requestId + 原因；不再有 spawn-then-hide。
+- 显式 visible restart（explicit source + `focus:true`/`keepVisible:true`/`background:false`）与 show/login 保持可用；tabCapture 与冷启动首启的 verified hidden 结束语义不变。
+- 扩展热重载继续 `Extensions.loadUnpacked`，不重启浏览器（`extension-dev-unit` 断言零 stop/restart）；`restartIfRunning` 同规则。
+- launch 失败（debug endpoint/CDP/verified hide）会清理已 spawn 进程，不留未跟踪可见进程。
+- `test:bg-invisibility` 的重启段现在是：请求前起采样 → 断言 409 deferred 与零 visible 样本 → 断言会话保留 → 显式 visible restart 覆盖 PID 变化 → 隐藏 `/api/open` 严格采样 → 冷启动首启诊断（瞬态记录，不假装为零）。

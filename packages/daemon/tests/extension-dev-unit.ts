@@ -24,6 +24,8 @@ function fixture() {
       switch (method) {
         case 'Extensions.getExtensions':
           return { extensions: [{ id: 'ext1', name: 'demo', path: extPath, version: '1.0.0', enabled: true }] }
+        case 'Extensions.loadUnpacked':
+          return { id: 'ext1' }
         case 'Browser.getWindowForTarget':
           return { windowId: params.targetId === 'page-a' ? 1 : 3 }
         case 'Target.createTarget':
@@ -93,4 +95,24 @@ test('openPanel rejects panels from other windows and still closes sessions and 
   await assert.rejects(f.dev.openPanel('demo', 'page-a'), /side panel did not open/)
   assert.ok(f.calls.some(c => c.method === 'Target.closeTarget' && c.params.targetId === 'bridge'), 'bridge must close on failure')
   assert.equal(f.openSessions.size, 0, 'no sessions may leak on failure')
+})
+
+test('extension hot reload keeps the browser running: no stop/restart (same fail-closed rule)', async () => {
+  const f = fixture()
+  const manager = (f.dev as unknown as { manager: any }).manager
+  const lifecycle: string[] = []
+  manager.stop = async () => { lifecycle.push('stop') }
+  manager.restart = async () => { lifecycle.push('restart') }
+  manager.restartIfRunning = async () => { lifecycle.push('restartIfRunning') }
+
+  const loaded = await f.dev.load('demo', true)
+  assert.equal(loaded.id, 'ext1', 'the extension must reload through Extensions.loadUnpacked')
+  assert.deepEqual(lifecycle, [], 'hot reload must never stop or restart the browser')
+  assert.equal(manager.running, true, 'the browser must stay running')
+  assert.equal(f.dev.lastReload?.ok, true, JSON.stringify(f.dev.lastReload))
+
+  // A file-watcher batch uses the same path and must not restart either.
+  await f.dev.changed([path.join(extPath, 'manifest.json')])
+  assert.deepEqual(lifecycle, [])
+  assert.equal(manager.running, true)
 })

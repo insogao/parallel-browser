@@ -623,17 +623,52 @@ async function handleApi(
       // it with an actual visibility flag. A plain restart — even `cli.restart`
       // — is forced background and never inherits settings.launchMode.
       const foreground = requestedForeground && meta.origin === 'explicit'
+      // Fail closed for hidden background restarts BEFORE any side effect:
+      // stopping a working invisible browser only to repair an unhide that
+      // macOS performs during relaunch/session rebuild would violate the
+      // no-reappearance contract. The browser keeps running unchanged.
+      if (!foreground) {
+        const deferral = await deps.manager.backgroundRestartDeferral()
+        if (deferral) {
+          transition(deps, {
+            event: 'restart', origin: meta.origin, source: meta.source, route, requestId,
+            gen: deps.supervisor.controlGen(), branch: 'deferred', after: 'unchanged',
+            detail: `${deferral}: hidden browser kept running (stop-then-launch would unhide it before the repair hide; use an explicit visible restart or bl stop/bl launch)`,
+          })
+          json(res, 409, {
+            ok: false, restarted: false, deferred: true, reason: deferral,
+            error: `hidden background restart deferred (${deferral}); the running browser was kept; use an explicit visible restart (focus/keepVisible) or \`bl stop\` + \`bl launch\``,
+          })
+          return
+        }
+      }
       const gen = deps.supervisor.beginControl() // restart outranks any settling collapse
       const intent = deps.supervisor.noteIntent(meta.origin, foreground ? 'show' : 'bg', { source: meta.source, route, requestId, gen })
       if (requestedForeground && !foreground) {
         transition(deps, { event: 'policy-downgrade', ...intentFields(intent), branch: 'foreground', detail: 'non-explicit-visible-restart' })
       }
+      const previousHumanMode = deps.supervisor.humanMode
       deps.supervisor.humanMode = foreground
       try {
-        await deps.manager.restart(payload.reason ?? 'manual restart', {
+        const result = await deps.manager.restart(payload.reason ?? 'manual restart', {
           focus: foreground && (payload.focus === true || payload.background === false),
           keepVisible: foreground && payload.keepVisible === true,
         })
+        if (!result.restarted) {
+          // The manager re-checked and refused (state changed while the route
+          // was queued); never report an applied restart, never claim visible.
+          deps.supervisor.humanMode = previousHumanMode
+          transition(deps, {
+            event: 'restart', ...intentFields(intent), branch: 'deferred', after: 'unchanged',
+            detail: `${result.deferred ?? 'deferred'}: hidden browser kept running`,
+          })
+          deps.supervisor.completeIntent(intent.token, 'superseded')
+          json(res, 409, {
+            ok: false, restarted: false, deferred: true, reason: result.deferred ?? 'deferred',
+            error: 'hidden background restart deferred; the running browser was kept',
+          })
+          return
+        }
         transition(deps, {
           event: 'restart', ...intentFields(intent),
           branch: foreground ? 'visible-request' : 'forced-background',

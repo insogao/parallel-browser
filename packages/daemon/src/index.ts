@@ -59,6 +59,8 @@ async function main() {
     // Background launches re-assert native hidden (macOS warm reopen can
     // otherwise relaunch a previously-visible app unhidden).
     hideApp: hideBrowser,
+    // Visibility evidence for the fail-closed hidden-restart guard.
+    appState: browserAppState,
   })
   const health = new HealthMonitor(() => (manager.current ? { cdp: manager.current.cdp } : null))
   const supervisor: FramePumpSupervisor = new FramePumpSupervisor(

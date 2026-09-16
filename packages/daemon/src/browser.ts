@@ -113,7 +113,32 @@ export interface ManagerDeps {
    * screen. Optional so unit tests can stub the manager without the OS.
    */
   hideApp?: (pid: number) => Promise<void>
+  /**
+   * Native app visibility probe (native.ts browserAppState), used to decide
+   * whether a background restart is safe. Missing/unreadable state fails
+   * closed (a restart is then refused rather than risking an unhide).
+   */
+  appState?: (pid: number) => Promise<{ active: boolean; hidden: boolean }>
 }
+
+export interface RestartResult {
+  restarted: boolean
+  /**
+   * Reason a background restart was refused before stopping the current
+   * process. The browser is left running exactly as it was.
+   */
+  deferred?: string
+}
+
+/**
+ * A hidden background restart cannot be made transient-free on macOS:
+ * `open -g -j`/LaunchServices can bring the relaunched app up unhidden, and
+ * restoring the session creates windows/tabs, which unhides the app again.
+ * `stop() -> launch() -> hideApp()` therefore only repairs visibility after
+ * the fact. Callers must use this to fail closed.
+ */
+export const HIDDEN_RESTART_UNSAFE = 'hidden-restart-unsafe'
+export const RESTART_STATE_UNKNOWN = 'hidden-state-unknown'
 
 export class BrowserManager {
   current: BrowserInstance | null = null
@@ -213,62 +238,69 @@ export class BrowserManager {
       + `extensions=${extensionPaths.length}${captureExtension ? '+capture-helper' : ''}, mode=${backgroundLaunch ? 'background' : 'visible'})`,
     )
 
-    // wait for the debug endpoint
-    const deadline = Date.now() + 20_000
-    let version: { Browser: string; webSocketDebuggerUrl: string } | null = null
-    while (Date.now() < deadline) {
-      if (child && (child.pid ?? 0) > 0 && child.exitCode != null) {
-        throw new Error(`browser exited immediately (code=${child.exitCode})`)
+    // Everything after the spawn can fail (debug endpoint, CDP connect, the
+    // verified hide). A failed launch must never leave a spawned browser
+    // running untracked or visible, so tear it down before propagating.
+    let cdp: Cdp | null = null
+    try {
+      // wait for the debug endpoint
+      const deadline = Date.now() + 20_000
+      let version: { Browser: string; webSocketDebuggerUrl: string } | null = null
+      while (Date.now() < deadline) {
+        if (child && (child.pid ?? 0) > 0 && child.exitCode != null) {
+          throw new Error(`browser exited immediately (code=${child.exitCode})`)
+        }
+        try {
+          version = await fetchVersion(upstreamPort, 1500)
+          break
+        } catch { await sleep(300) }
       }
-      try {
-        version = await fetchVersion(upstreamPort, 1500)
-        break
-      } catch { await sleep(300) }
-    }
-    if (!version) throw new Error('browser debug endpoint did not come up within 20s')
+      if (!version) throw new Error('browser debug endpoint did not come up within 20s')
 
-    const cdp = await Cdp.connect(version.webSocketDebuggerUrl)
-    const realPid = await resolveChromePid(profileDir)
-    this.current = {
-      child,
-      pid: realPid,
-      binary,
-      version: version.Browser,
-      upstreamPort,
-      space,
-      profileDir,
-      extensionPaths,
-      captureExtensionId: captureExtension?.id ?? null,
-      capturePageUrl: captureExtension?.pageUrl ?? null,
-      cdp,
-      startedAt: Date.now(),
-    }
-    this.startReaper()
-
-    // background mode: open initial url(s) as background targets, then collapse
-    // any on-screen window as fast as possible (frame pump keeps pages fast)
-    if (backgroundLaunch) {
-      if (opts.url) {
-        await cdp.send('Target.createTarget', { url: opts.url, background: true }).catch((e) =>
-          warn(`background target failed: ${e.message}`))
+      cdp = await Cdp.connect(version.webSocketDebuggerUrl)
+      const realPid = await resolveChromePid(profileDir)
+      const instance: BrowserInstance = {
+        child,
+        pid: realPid,
+        binary,
+        version: version.Browser,
+        upstreamPort,
+        space,
+        profileDir,
+        extensionPaths,
+        captureExtensionId: captureExtension?.id ?? null,
+        capturePageUrl: captureExtension?.pageUrl ?? null,
+        cdp,
+        startedAt: Date.now(),
       }
-      await this.autoCollapse(cdp)
-      // A background launch must also be natively hidden: macOS may relaunch a
-      // previously-visible app unhidden (warm reopen) despite `open -g -j`.
-      // Verified by native.ts; a hide failure fails the launch, never silently
-      // leaves a cornered-but-unhidden window.
-      if (this.deps.hideApp) await this.deps.hideApp(realPid)
-    } else if (opts.url) {
-      // visible mode: open the initial url(s) in the startup window
-      const cur = this.current
-      const urls = [opts.url]
-      await cdp.send('Target.createTarget', { url: urls[0] }).catch((e) =>
-        warn(`initial target failed: ${e.message}`))
-      void cur
-    }
+      this.current = instance
+      this.startReaper()
 
-    log(`browser up: ${version.Browser} pid=${realPid}`)
-    return this.current
+      // background mode: open initial url(s) as background targets, then collapse
+      // any on-screen window as fast as possible (frame pump keeps pages fast)
+      if (backgroundLaunch) {
+        if (opts.url) {
+          await cdp.send('Target.createTarget', { url: opts.url, background: true }).catch((e) =>
+            warn(`background target failed: ${e.message}`))
+        }
+        await this.autoCollapse(cdp)
+        // A background launch must also be natively hidden: macOS may relaunch a
+        // previously-visible app unhidden (warm reopen) despite `open -g -j`.
+        // Verified by native.ts; a hide failure fails the launch, never silently
+        // leaves a cornered-but-unhidden window.
+        if (this.deps.hideApp) await this.deps.hideApp(realPid)
+      } else if (opts.url) {
+        // visible mode: open the initial url(s) in the startup window
+        await cdp.send('Target.createTarget', { url: opts.url }).catch((e) =>
+          warn(`initial target failed: ${e.message}`))
+      }
+
+      log(`browser up: ${version.Browser} pid=${realPid}`)
+      return instance
+    } catch (err) {
+      await this.cleanupFailedLaunch(profileDir, cdp, child, pid)
+      throw err
+    }
   }
 
   /**
@@ -362,21 +394,51 @@ export class BrowserManager {
     this.reaper.unref?.()
   }
 
+  /** kill by profile dir — works for direct spawns and `open -g` launches */
+  private async killProfile(profileDir: string): Promise<void> {
+    await new Promise<void>(resolve => execFile('pkill', ['-f', `user-data-dir=${profileDir}`], () => resolve()))
+  }
+
+  private async waitProfileGone(profileDir: string): Promise<void> {
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      if (!(await isProfileAlive(profileDir))) break
+      await sleep(200)
+    }
+  }
+
+  /**
+   * A launch that failed after the spawn (debug endpoint, CDP connect, or the
+   * verified hide for background mode) must not leave an untracked browser
+   * process behind — especially not a visible one whose hide failed. Stop the
+   * process and clear any state that points at it.
+   */
+  private async cleanupFailedLaunch(
+    profileDir: string,
+    cdp: Cdp | null,
+    child: ChildProcess | null,
+    pid: number,
+  ): Promise<void> {
+    try { cdp?.close() } catch { /* ignore */ }
+    if (this.current?.profileDir === profileDir) this.current = null
+    await this.killProfile(profileDir)
+    if (child && pid > 0) {
+      try { child.kill('SIGTERM') } catch { /* ignore */ }
+    }
+    await this.waitProfileGone(profileDir)
+    log(`launch failed; stopped browser for ${profileDir} (no untracked process left)`)
+  }
+
   async stop(): Promise<void> {
     const cur = this.current
     if (!cur) return
     this.current = null
     cur.cdp.close()
-    // kill by profile dir — works for both direct spawns and `open -g` launches
-    await new Promise<void>(resolve => execFile('pkill', ['-f', `user-data-dir=${cur.profileDir}`], () => resolve()))
+    await this.killProfile(cur.profileDir)
     if (cur.child && cur.pid > 0) {
       try { cur.child.kill('SIGTERM') } catch { /* ignore */ }
     }
-    const deadline = Date.now() + 5000
-    while (Date.now() < deadline) {
-      if (!(await isProfileAlive(cur.profileDir))) break
-      await sleep(200)
-    }
+    await this.waitProfileGone(cur.profileDir)
     log('browser stopped')
   }
 
@@ -385,10 +447,43 @@ export class BrowserManager {
     try { return await fetchTargets(this.current.upstreamPort) } catch { return [] }
   }
 
-  /** Restart preserving http(s) tabs (used by extension hot reload). */
-  async restart(reason: string, launchOpts: Pick<LaunchOptions, 'focus' | 'keepVisible'> = {}): Promise<void> {
-    if (!this.running || !this.current) return
+  /**
+   * Reason a background (non-visible) restart must be refused, or null when it
+   * is safe. Fail closed: a natively hidden browser would be stopped and
+   * relaunched only to repair an unhide that macOS performs while the first
+   * window/tab of the restored session is born; an unreadable visibility state
+   * cannot prove the browser is on screen, so it is treated as hidden too.
+   * A visible browser is safe: nothing invisible can "reappear".
+   */
+  async backgroundRestartDeferral(): Promise<string | null> {
     const cur = this.current
+    if (!cur) return null
+    if (!this.deps.appState) return RESTART_STATE_UNKNOWN
+    try {
+      const { hidden } = await this.deps.appState(cur.pid)
+      return hidden ? HIDDEN_RESTART_UNSAFE : null
+    } catch {
+      return RESTART_STATE_UNKNOWN
+    }
+  }
+
+  /**
+   * Restart preserving http(s) tabs. Background restarts fail closed on a
+   * hidden browser and return `{restarted:false, deferred}` without touching
+   * the process; only an explicit visible request may restart while hidden.
+   * Extension hot reload does not use this: it goes through
+   * `Extensions.loadUnpacked` and keeps the browser running.
+   */
+  async restart(reason: string, launchOpts: Pick<LaunchOptions, 'focus' | 'keepVisible'> = {}): Promise<RestartResult> {
+    if (!this.running || !this.current) return { restarted: false }
+    const cur = this.current
+    if (!launchRequestsVisibility(launchOpts)) {
+      const deferral = await this.backgroundRestartDeferral()
+      if (deferral) {
+        log(`restart deferred (${reason}): ${deferral}; pid=${cur.pid} stays running (stop-then-launch would unhide it before the repair hide)`)
+        return { restarted: false, deferred: deferral }
+      }
+    }
     const tabs = (await this.listTabs())
       .filter(t => /^https?:/i.test(t.url))
       .map(t => t.url)
@@ -415,11 +510,17 @@ export class BrowserManager {
         await this.deps.hideApp(opened.pid)
       }
     }
+    return { restarted: true }
   }
 
-  async restartIfRunning(reason: string): Promise<void> {
-    // Internal/automatic restart helper: never relaunch into a visible window.
-    if (this.running) await this.restart(reason, { focus: false })
+  /**
+   * Internal/automatic restart helper (e.g. a future engine swap). Observes
+   * the same fail-closed rule as `restart`: a hidden browser is never stopped,
+   * and the function reports the deferral to the caller.
+   */
+  async restartIfRunning(reason: string): Promise<RestartResult> {
+    if (!this.running) return { restarted: false }
+    return this.restart(reason, { focus: false })
   }
 }
 

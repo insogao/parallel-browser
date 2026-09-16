@@ -25,6 +25,10 @@ interface Track {
   launchOpts: any
   launchHistory: any[]
   restarts: Array<{ reason: string; opts: any }>
+  /** set to a reason to make the manager's fail-closed restart guard refuse */
+  restartDeferral: string | null
+  /** result the fake manager returns from restart (race-path coverage) */
+  restartResult: { restarted: boolean; deferred?: string }
   activatedTabs: string[]
   createdTabs: string[]
   createdOpts: any[]
@@ -44,6 +48,7 @@ function harness(opts: HarnessOptions = {}) {
     running: opts.running ?? true,
     bounds: { left: 60, top: 60, width: 1200, height: 800, windowState: opts.initial ?? 'normal' },
     hidden: false, hideCalls: 0, minimizes: 0, launches: 0, launchOpts: null, launchHistory: [], restarts: [],
+    restartDeferral: null, restartResult: { restarted: true },
     activatedTabs: [], createdTabs: [], createdOpts: [], pausedCalls: [], tabs: [],
   }
   const cdp = {
@@ -81,7 +86,11 @@ function harness(opts: HarnessOptions = {}) {
     },
     async listTabs() { return track.tabs },
     async stop() { track.running = false; manager.current = null },
-    async restart(reason: string, restartOpts: any = {}) { track.restarts.push({ reason, opts: restartOpts }) },
+    async backgroundRestartDeferral() { return track.restartDeferral },
+    async restart(reason: string, restartOpts: any = {}) {
+      track.restarts.push({ reason, opts: restartOpts })
+      return track.restartResult
+    },
   }
   const supervisor = new FramePumpSupervisor(() => (manager.current ? { cdp } : null) as any, () => [])
   const stateLog = new StateTransitionLog({ sink: () => {} })
@@ -582,6 +591,47 @@ test('restart never inherits launchMode=visible: plain restarts are background, 
       h.server.close()
     }
   })
+})
+
+test('a hidden plain restart is deferred with zero side effects and honest logs', { timeout: 20_000 }, async () => {
+  const h = harness()
+  const base = await h.listen()
+  try {
+    h.track.restartDeferral = 'hidden-restart-unsafe'
+    const beforeGen = h.supervisor.controlGen()
+    const refused = await post(base, '/api/restart', { reason: 'probe', source: 'cli.restart' })
+    assert.equal(refused.status, 409, JSON.stringify(refused))
+    assert.equal(refused.body.ok, false)
+    assert.equal(refused.body.restarted, false)
+    assert.equal(refused.body.deferred, true)
+    assert.equal(refused.body.reason, 'hidden-restart-unsafe')
+    assert.equal(h.track.restarts.length, 0, 'no restart may be attempted while hidden')
+    assert.equal(h.supervisor.controlGen(), beforeGen, 'a refused restart must not bump the control generation')
+    const entries = h.stateLog.recent(40)
+    const deferred = entries.find(e => e.event === 'restart' && e.source === 'cli.restart')
+    assert.ok(deferred, `deferred restart provenance missing: ${JSON.stringify(entries)}`)
+    assert.equal(deferred.branch, 'deferred')
+    assert.equal(deferred.after, 'unchanged')
+    assert.ok(String(deferred.detail ?? '').includes('hidden-restart-unsafe'), JSON.stringify(deferred))
+    assert.ok(!entries.some(e => e.event === 'restart' && e.branch === 'forced-background'))
+    assert.ok(!entries.some(e => e.event === 'control-intent' && e.source === 'cli.restart'), 'no intent may be recorded for a refused restart')
+
+    // Race path: the early check passed, then the manager re-checked and
+    // refused. The route must still report honestly (no applied restart).
+    h.track.restartDeferral = null
+    h.track.restartResult = { restarted: false, deferred: 'hidden-restart-unsafe' }
+    const raced = await post(base, '/api/restart', { reason: 'probe', source: 'cli.restart' })
+    assert.equal(raced.status, 409, JSON.stringify(raced))
+    assert.equal(raced.body.deferred, true)
+    assert.equal(h.track.restarts.length, 1, 'the race path may call the manager once')
+    const racedEntries = h.stateLog.recent(40).filter(e => e.event === 'restart' && e.source === 'cli.restart')
+    const racedEntry = racedEntries.at(-1)
+    assert.ok(racedEntry && racedEntry.branch === 'deferred' && typeof racedEntry.token === 'string',
+      `race deferral must log with the intent token: ${JSON.stringify(racedEntry)}`)
+    assert.ok(!h.stateLog.recent(40).some(e => e.event === 'restart' && e.branch === 'forced-background'))
+  } finally {
+    h.server.close()
+  }
 })
 
 // ---- extension dev / inspect ------------------------------------------------
