@@ -80,7 +80,7 @@ function harness(opts: { running?: boolean; initial?: string } = {}) {
     version: '0',
     startedAt: 0,
     pulse() {},
-    capture: { isPaused: () => false, setPaused: async () => {}, activeTargetId: () => null },
+    capture: { isPaused: () => false, setPaused: async () => {}, activeTargetId: () => null, prearm: async () => null },
     appState: async () => ({ active: false, hidden: track.hidden }),
     hideBrowser: async () => { nativeCalls.push('hide'); track.hideCalls++; track.hidden = true },
     unhideBrowser: async () => { nativeCalls.push('unhide'); track.hidden = false },

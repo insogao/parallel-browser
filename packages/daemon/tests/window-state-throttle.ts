@@ -299,15 +299,28 @@ try {
   // ---- minimize once -------------------------------------------------------
   const bgRequestedAt = Date.now() - T0
   await api('bg', {})
-  await waitFor(async () => (await api('status')).browser?.captureTargetId === targetId,
-    'capture keep-alive engages for the probe target', CAPTURE_ENGAGE_TIMEOUT_MS)
-  // capture setup transiently parks/normalizes the window; wait until the
-  // production background state is stable again before observing.
-  await waitFor(() => {
-    const recent = sliceWindow(samples, Date.now() - T0 - 2_500, Date.now() - T0)
-    return recent.length >= 4 && recent.every(s => s.cdpWindowState === 'minimized'
-      && s.nativeAppHidden === true && s.nativeOnScreenWindows === 0)
-  }, 'minimized + natively hidden state settles after capture setup')
+  // Capture is pre-armed inside /api/bg while the window is still visible (the
+  // only state in which Chrome establishes real capture frames); it must be
+  // armed for the probe target before the route returns.
+  const afterBg = await api('status')
+  assert.equal(afterBg.browser?.captureTargetId, targetId, 'capture keep-alive must be pre-armed by /api/bg')
+  // Explicit-bg contract: once the window has settled into the hidden state it
+  // may NEVER come back on screen, even transiently. The previous
+  // getDisplayMedia setup un-minimized/parked the window and let the picker
+  // unhide the app here — the release-blocking regression this now rejects.
+  await waitFor(() => samples.some(s => s.cdpWindowState === 'minimized'
+    && s.nativeAppHidden === true && s.nativeOnScreenWindows === 0),
+  'minimized + natively hidden state settles after bg', CAPTURE_ENGAGE_TIMEOUT_MS)
+  const settledAt = firstSampleAt(samples, s => s.cdpWindowState === 'minimized'
+    && s.nativeAppHidden === true && s.nativeOnScreenWindows === 0)
+  assert.ok(settledAt !== null, 'minimized + natively hidden state must be reached after bg')
+  const afterSettle = samples.filter(s => s.atMs >= settledAt!)
+  assert.ok(holdsThroughout(afterSettle, s => s.cdpWindowState === 'minimized'),
+    `CDP must never leave minimized after bg (saw ${afterSettle.filter(s => s.cdpWindowState !== 'minimized').map(s => `${s.atMs}ms:${s.cdpWindowState}`).join(', ')})`)
+  assert.ok(holdsThroughout(afterSettle, s => s.nativeAppHidden === true),
+    `AppKit must never be unhidden after bg (saw ${afterSettle.filter(s => s.nativeAppHidden !== true).map(s => `${s.atMs}ms:${s.nativeAppHidden}`).join(', ')})`)
+  assert.ok(holdsThroughout(afterSettle, s => s.nativeOnScreenWindows === 0),
+    `no native on-screen window may ever appear after bg (saw ${afterSettle.filter(s => (s.nativeOnScreenWindows ?? 1) !== 0).map(s => `${s.atMs}ms:${s.nativeOnScreenWindows}`).join(', ')})`)
   const minimizingEvents = [
     { atMs: bgRequestedAt, label: 'requested background (/api/bg)' },
     { atMs: firstSampleAt(samples, s => s.cdpWindowState === 'minimized'), label: 'CDP windowState=minimized' },
@@ -317,16 +330,15 @@ try {
   ].sort((a, b) => (a.atMs ?? Infinity) - (b.atMs ?? Infinity))
   console.log('  transitions:')
   console.log(formatTimeline(minimizingEvents))
+  // capture must not have mutated the window at all
+  const stateEntries = (await api('state-log?limit=200')).entries as any[]
+  assert.ok(!stateEntries.some(e => e.event === 'capture-window'),
+    `capture must not record window mutations: ${JSON.stringify(stateEntries.filter(e => e.event === 'capture-window'))}`)
 
   // ---- single minimized observation window ---------------------------------
-  const hiddenStart = Date.now() - T0
   await sleep(HIDDEN_OBSERVE_MS)
-  const hiddenEnd = Date.now() - T0
-  const hidden = sliceWindow(samples, hiddenStart, hiddenEnd)
+  const hidden = sliceWindow(samples, settledAt!, Date.now() - T0)
   assert.ok(hidden.length >= 15, `minimized window must have enough samples: ${hidden.length}`)
-  assert.ok(holdsThroughout(hidden, s => s.cdpWindowState === 'minimized'), 'CDP must stay minimized for the whole observation window')
-  assert.ok(holdsThroughout(hidden, s => s.nativeAppHidden === true), 'AppKit must stay hidden for the whole observation window')
-  assert.ok(holdsThroughout(hidden, s => s.nativeOnScreenWindows === 0), 'no native on-screen window may appear while minimized')
   const hiddenObserved = printObservations(hidden, 'minimized + capture')
   assert.ok(hiddenObserved.timerRate !== null && hiddenObserved.timerRate >= MIN_TIMER_PER_SEC,
     `minimized timer/s ${fmt(hiddenObserved.timerRate)} < ${MIN_TIMER_PER_SEC} (Chromium hidden clamp is ~1/s)`)

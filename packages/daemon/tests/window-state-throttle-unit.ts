@@ -5,6 +5,8 @@ import {
   firstSampleAt,
   formatTimeline,
   holdsThroughout,
+  isInvisibleProbe,
+  parseNativeVisibilityProbe,
   parseNativeWindowsProbe,
   ratePerSec,
   sliceWindow,
@@ -40,6 +42,24 @@ test('native windows probe rejects output that cannot prove on-screen state', ()
   assert.throws(() => parseNativeWindowsProbe('unsupported command'), /unexpected app-control windows output/)
   assert.throws(() => parseNativeWindowsProbe('{"windowCount":7}'), /unexpected app-control windows output/)
   assert.throws(() => parseNativeWindowsProbe('{"windowCount":7,"onScreenWindowCount":null}'), /unexpected/)
+})
+
+test('atomic visibility probe parses hidden/on-screen together and rejects partial output', () => {
+  assert.deepEqual(
+    parseNativeVisibilityProbe('{"active":false,"hidden":true,"windowCount":9,"onScreenWindowCount":0}\n'),
+    { active: false, hidden: true, windowCount: 9, onScreenWindowCount: 0 },
+  )
+  assert.throws(() => parseNativeVisibilityProbe('{"hidden":true,"onScreenWindowCount":0}'), /unexpected app-control visibility output/)
+  assert.throws(() => parseNativeVisibilityProbe('{"active":false,"hidden":"true","windowCount":9,"onScreenWindowCount":0}'), /unexpected/)
+  assert.throws(() => parseNativeVisibilityProbe('unsupported command'), /unexpected app-control visibility output/)
+})
+
+test('isInvisibleProbe requires both native channels, never a missing one', () => {
+  assert.equal(isInvisibleProbe({ hidden: true, onScreenWindowCount: 0 }), true)
+  assert.equal(isInvisibleProbe({ hidden: true, onScreenWindowCount: 1 }), false)
+  assert.equal(isInvisibleProbe({ hidden: false, onScreenWindowCount: 0 }), false)
+  assert.equal(isInvisibleProbe({ hidden: null as unknown as boolean, onScreenWindowCount: 0 }), false)
+  assert.equal(isInvisibleProbe({ hidden: true, onScreenWindowCount: null as unknown as number }), false)
 })
 
 test('firstSampleAt records the transition timestamp of the first match only', () => {

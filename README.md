@@ -144,7 +144,7 @@ Backlight 仓库不包含任何 BrowserPilot 专属代码。BrowserPilot 是可�
 
 ## 窗口状态与启动器变更的生效条件
 
-2026-09-16 的窗口状态保活/来源归因、托盘 source 与 `/api/console`、启动器 `LSUIElement` 等修复已通过确定性单元与一次性真机验收（`pnpm --filter @backlight/daemon test:window-state`、`test:bg-rebound` 各一次 PASS），并已原子刷新 runtime 快照；但 **live daemon（pid 2695）与 tray（pid 2768）仍运行旧内存代码**，在用户批准的完整重启前不生效：旧 tray 的自动 show 没有 source/归属门禁，旧组合的“打开控制台”仍可能走默认浏览器。安全升级步骤与人工验收项见 [docs/development/2026-09-16.md](docs/development/2026-09-16.md) 的“生效条件与安全步骤”。
+2026-09-16 的窗口状态保活/来源归因、托盘 source 与 `/api/console`、启动器 `LSUIElement` 等修复已通过确定性单元与一次性真机验收；同日更晚的 release-blocker 修复（显式 bg 不再出现 1–3s 瞬时弹出：capture 改为隐藏扩展页 tabCapture + `/api/bg` 可见时 pre-arm，`getDisplayMedia` picker 路径移除）经 `test:window-state`、`test:bg-invisibility` 各隔离真机 PASS（详见 [docs/development/2026-09-16.md](docs/development/2026-09-16.md)）。已安装的 runtime 快照仍可能是旧代码：**应经 `bl launcher install` 刷新后，在用户批准的重启窗口让新 daemon/浏览器生效**；在用户批准的完整重启前，live daemon/tray 仍运行旧内存代码（旧 capture 机制仍有瞬时显隐）。安全升级步骤与人工验收项见当日开发记录的“生效条件与安全步骤”。
 
 ## 技术方案与代码路径
 
@@ -153,7 +153,7 @@ Backlight 仓库不包含任何 BrowserPilot 专属代码。BrowserPilot 是可�
 | 浏览器生命周期 | Node.js、Chromium、CDP | 启动、停止、profile、后台 target：`packages/daemon/src/browser.ts` |
 | 品牌化 | Chromium app bundle、plist、icns | 独立名称、bundle ID、运行时图标：`packages/daemon/src/brand.ts` |
 | CDP 客户端与代理 | TypeScript、WebSocket | 协议连接、target 标准化、首帧缓冲：`packages/daemon/src/cdp.ts`、`packages/daemon/src/proxy.ts` |
-| 后台保活 | tab capture、定时器/rAF 调度 | 单目标原生捕获与回退策略：`packages/daemon/src/capture.ts`、`packages/daemon/src/inject.ts` |
+| 后台保活 | 隐藏扩展页 tabCapture、定时器/rAF 调度 | 单目标原生捕获（bg 前 pre-arm、零窗口操作）与回退策略：`packages/daemon/src/capture.ts`、`packages/daemon/src/capture-extension.ts`、`packages/daemon/src/inject.ts` |
 | 窗口控制 | CDP Browser domain | 最小化、贴角、恢复、控制代际：`packages/daemon/src/windows.ts` |
 | 原生应用控制 | Swift、AppKit | hide/unhide/activate/state：`tools/app-control.swift`、`packages/daemon/src/native.ts` |
 | Dock 与菜单栏 | Swift、NSWorkspace | 激活监听、受管实例路由：`packages/tray/main.swift` |

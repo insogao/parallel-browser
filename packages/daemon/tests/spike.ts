@@ -53,14 +53,9 @@ async function waitApi(timeoutMs: number): Promise<void> {
   throw new Error('daemon did not come up')
 }
 
-async function runSpike() {
-  // no pump interference; we measure shim + corner behaviour directly
-  await post('/api/settings', { backgroundMode: false, captureKeepAlive: false })
-  const launched = await post('/api/launch', { url: PAGE_HTML, keepVisible: true })
-  if (!launched.ok) throw new Error(`launch failed: ${JSON.stringify(launched)}`)
-  console.log(`browser pid=${launched.pid} (window visible ~2s baseline, then collapsed/minimized)`)
-
-  const version = await fetchVersion(launched.upstreamPort)
+/** Attach to the freshly launched BL Spike page (after injection reload). */
+async function attachPage(upstreamPort: number) {
+  const version = await fetchVersion(upstreamPort)
   const cdp = await Cdp.connect(version.webSocketDebuggerUrl)
   let page: any
   const navigationDeadline = Date.now() + 10000
@@ -83,6 +78,17 @@ async function runSpike() {
   }
   await cdp.send('Page.reload', {}, sessionId)
   await sleep(2000)
+  return { cdp, page, sessionId, windowId }
+}
+
+async function runSpike() {
+  // no pump interference; we measure shim + corner behaviour directly
+  await post('/api/settings', { backgroundMode: false, captureKeepAlive: false })
+  const launched = await post('/api/launch', { url: PAGE_HTML, keepVisible: true })
+  if (!launched.ok) throw new Error(`launch failed: ${JSON.stringify(launched)}`)
+  console.log(`browser pid=${launched.pid} (window visible ~2s baseline, then collapsed/minimized)`)
+
+  let { cdp, page, sessionId, windowId } = await attachPage(launched.upstreamPort)
 
   const read = async () => (await cdp.send<{ result: { value: any } }>('Runtime.evaluate', {
     expression: 'window.__blHealth ? JSON.parse(JSON.stringify({r:window.__blHealth.raf,n:window.__blHealth.native,t:window.__blHealth.timer,v:document.visibilityState})) : null',
@@ -119,7 +125,12 @@ async function runSpike() {
   results['minimized'] = { ...(await rates(4000)) }
   console.log('minimized          ', JSON.stringify(results['minimized']))
 
-  // 3. capture keep-alive (main keep-alive layer): enable + collapse
+  // 3. capture keep-alive (main keep-alive layer): enable + collapse.
+  // The helper extension is loaded at launch; /api/bg pre-arms the capture
+  // while the window is visible (the only state that establishes real frames),
+  // so restore visibility first, then collapse with capture already active.
+  await post('/api/show', { activate: false })
+  await sleep(1500)
   await post('/api/settings', { captureKeepAlive: true })
   await post('/api/bg', {})
   const t0 = Date.now()

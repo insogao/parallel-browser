@@ -49,6 +49,36 @@ export function parseNativeWindowsProbe(stdout: string): NativeWindowsProbe {
   return { windowCount, onScreenWindowCount }
 }
 
+/** Atomic native visibility probe from `app-control visibility <pid>`. */
+export interface NativeVisibilityProbe {
+  active: boolean
+  hidden: boolean
+  windowCount: number
+  onScreenWindowCount: number
+}
+
+/** Parse `app-control visibility <pid>` output (single-process atomic read). */
+export function parseNativeVisibilityProbe(stdout: string): NativeVisibilityProbe {
+  let parsed: { active?: unknown; hidden?: unknown; windowCount?: unknown; onScreenWindowCount?: unknown }
+  try {
+    parsed = JSON.parse(stdout) as typeof parsed
+  } catch {
+    throw new Error(`unexpected app-control visibility output: ${stdout.trim()}`)
+  }
+  const { active, hidden, windowCount, onScreenWindowCount } = parsed ?? {}
+  if (typeof active !== 'boolean' || typeof hidden !== 'boolean'
+    || typeof windowCount !== 'number' || !Number.isFinite(windowCount)
+    || typeof onScreenWindowCount !== 'number' || !Number.isFinite(onScreenWindowCount)) {
+    throw new Error(`unexpected app-control visibility output: ${stdout.trim()}`)
+  }
+  return { active, hidden, windowCount, onScreenWindowCount }
+}
+
+/** True when a sample proves the app is not visible in any way. */
+export function isInvisibleProbe(probe: Pick<NativeVisibilityProbe, 'hidden' | 'onScreenWindowCount'>): boolean {
+  return probe.hidden === true && probe.onScreenWindowCount === 0
+}
+
 /** First sample (in chronological order) that matches, with its timestamp. */
 export function firstSampleAt(
   samples: WindowStateSample[],

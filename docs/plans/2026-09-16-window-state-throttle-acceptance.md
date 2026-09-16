@@ -1,6 +1,8 @@
 # 窗口状态转移与后台限流验收计划
 
-更新时间：2026-09-16。工作分支：`codex/window-state-throttle-test`（隔离 worktree）。本轮受主控校准：**真实验收改为显式 opt-in、一次性手工执行**，不进入 `test` / `test:integration` 默认链；2026-09-16 已按授权执行一次并通过（见下）。
+更新时间：2026-09-16。工作分支：`codex/window-state-throttle-test`（隔离 worktree）。本轮受主控校准：**真实验收改为显式 opt-in、一次性手工执行**，不进入 `test` / `test:integration` 默认链。
+
+> ⚠️ **2026-09-16 更正**：下文「已执行的 GUI 验收结果（PASS，一次性）」记录的那次 PASS 是**无效的**。当时的验收在 capture setup 完成后等待窗口回到 minimized/hidden 再断言，放过了中间 1–3s 的瞬时显隐；`/var/folders/.../opencode/accept/live-bg.out` 的 live 证据显示显式 bg 后 t=1s onScreen=1、t=2s CDP normal、t=3s `hidden=false onScreen=2 capture=yes`、t=4s 才复归 minimized/hidden——即用户反馈的“收起后短暂弹出”，属 release blocker。已按下方「2026-09-16 release-blocker 修复」重构 capture 机制并复跑通过；该 PASS 段落仅作历史记录。
 
 ## 目标
 
@@ -49,6 +51,27 @@
 - `/api/bg` 4.00s → CDP minimized 4.95s / DOM hidden 4.95s / on-screen=0 4.95s / AppKit hidden 5.84s。
 - 最小化 + capture：`captureTargetId` 命中；CDP minimized / AppKit hidden / on-screen=0 全程；timer 10.1/s、网络 4.0/s、shim 100.0/s、原生 100.0/s；截图 17092B/27ms；DOM visibilityState 报 visible（capturer 语义，未伪造）。
 - `show --maximize` 22.66s → 23.05s DOM/native 可见 → 24.08s CDP maximized/AppKit unhidden；恢复原生 100.2/s。
+
+## 2026-09-16 release-blocker 修复（capture 机制重构）
+
+### 根因（Chromium 源码 + 隔离 A/B 实测）
+
+1. **macOS 硬门槛**：`chrome/browser/media/webrtc/display_media_access_handler.cc` 中 `getDisplayMedia` 在 macOS 上当 `web_contents->GetVisibility() != VISIBLE` 时直接以 `CAPTURE_FROM_BACKGROUND_PAGE_ON_MAC`（JS 侧 `InvalidStateError`）拒绝。隔离实测：窗口 minimized 时，即使 controller 是 active tab、有合成 click 也失败（`diag silent/click`，`InvalidStateError`）。因此旧实现必须先 `Browser.setWindowBounds normal` 取消最小化（窗口立即 on-screen，AppKit hidden 仍为 true）。
+2. **Views picker 激活应用**：窗口 normal 后 auto-select 仍会创建并 `Show()` picker 窗口（`desktop_media_picker_views.cc` / `desktop_media_list_controller.cc` 异步 `AcceptSpecificSource`），macOS 上表现为 AppKit unhide + 窗口置前 ~0.4–1.5s（live-bg.out t=2–3s；隔离 A/B 同样复现 `hidden=false onScreen=2`）。清理再 minimize+hide 只是“事后恢复”，不是“从未可见”。
+3. **隐藏装定的捕获无真实帧**：`chrome.tabCapture` 扩展路径没有 VISIBLE 门槛（可在最小化+隐藏时装定，rAF 保持 100/s），但实测窗口隐藏时装定只产生 rAF 豁免、不产生 captured frames，且 `Page.captureScreenshot` 默认与 `fromSurface:false` 都永久挂起；可见时装定后再最小化则截图 21–38ms、真实帧正常（`diag-shot` A/B）。
+
+### 修复
+
+- 内置 helper 扩展（`src/capture-extension.ts`，写入 `<BACKLIGHT_HOME>/extensions/backlight-capture`，`--allowlisted-extension-id` 基于 realpath 计算）在隐藏后台页用 `chrome.tabCapture.getMediaStreamId` + `getUserMedia({chromeMediaSource:'tab'})` 装定 CapturerCount 豁免；全程无窗口/应用可见性操作。helper 随每次受管启动加载（可动态开关 `captureKeepAlive`）。
+- `/api/bg` 在 `collapseAll` **之前**调用 `capture.prearm()`：窗口仍可见时对当前可见页装定，随后最小化不再触发任何 capture 装定动作；截图/真实帧在最小化期间保持可用（旧机制的先决条件以无副作用方式满足）。
+- `capture.ts` 删除 normal/park/activate/click/cleanup/hideApp 全部窗口与原生可见性路径；`tests/capture-unit.ts` 断言装定路径零 `Browser.*` / `Input.dispatchMouseEvent` / `Target.activateTarget`。
+
+### 新验收口径与证据
+
+- **任何一帧都不能复现**：`test:window-state` 改为从首个 minimized+hidden+onScreen=0 采样点起，之后每个采样都必须保持（不再等待 capture 完成后再断言）。
+- **高频回归**：新增 opt-in `test:bg-invisibility`（`tests/bg-invisibility.ts`），`app-control visibility` 新增原子命令，~100ms 采样 AppKit hidden + WindowServer on-screen + CDP windowState，从 bg 前观察到 capture 装定后；settle 后任何 `hidden=false`/`on-screen>0`/`CDP≠minimized` 立即失败，并断言捕获目标原生 rAF 保持、显式 show 可用、state-log 无 `capture-window`/`internal-native`。
+- 隔离真机结果（2026-09-16 本轮，两次独立运行）：`test:bg-invisibility` PASS（28/21 samples @~100ms，0 violations；capture 期间 native rAF 100/s；explicit show 后 100/s）。`test:window-state` PASS（基线 100.1/s；settle 后全程 minimized/hidden/onScreen=0；最小化+capture timer 10.0/s、网络 4.0/s、shim 99.9/s、原生 99.9/s、截图 17080B/21ms；show --maximize 恢复 99.7/s）。
+- 纯单元：`pnpm --filter @backlight/daemon test:unit` 71/71 + brand 11 通过；集成链 supervisor/extensions/agent/background/usability PASS。**spike 的“minimized shim ≥12/s”断言在本机当前环境为 ~10.5/s，且用改动前的 `git stash` 旧代码复测同样 ~10.5/s，与本修复无关；该既有阈值未改动、未声称通过。**
 
 **更早一次 Phase A（capture 关闭、frame pump 关闭）**：
 
@@ -101,6 +124,9 @@ git diff --check
 
 # 已执行的真实 GUI 验收（一次性，勿加入默认链；会短暂操作隔离测试窗口）
 pnpm --filter @backlight/daemon test:window-state
+
+# 显式 bg 不可见性高频回归（一次性 opt-in；~100ms 原生采样拒绝任何瞬显）
+pnpm --filter @backlight/daemon test:bg-invisibility
 ```
 
 ## 环境与风险

@@ -54,7 +54,7 @@ function harness(opts: HarnessOptions = {}) {
     manager: { current: { cdp, pid: 999_999, upstreamPort: 1 }, running: true },
     supervisor,
     health: {},
-    capture: { setPaused: opts.setPaused ?? (async () => {}) },
+    capture: { setPaused: opts.setPaused ?? (async () => {}), prearm: async () => null },
     extensions: {},
     extensionDev: {},
     bus: new ActivityBus(),

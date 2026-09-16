@@ -474,6 +474,16 @@ async function handleApi(
       const gen = deps.supervisor.beginControl()
       deps.supervisor.noteExplicitIntent('bg', { ...meta, gen })
       await deps.capture.setPaused(false)
+      // Arm capture while the window is still visible. Chrome only establishes
+      // the capture frame source in that state; arming after minimization
+      // grants the rAF exemption but no real frames/screenshots. Arming itself
+      // is invisible (hidden extension page, no activation), and having the
+      // capture already active is what lets the collapse stay invisible.
+      const prearmed = await deps.capture.prearm().catch(() => null)
+      transition(deps, {
+        event: 'capture-prearm', source: meta.source, route, requestId, gen,
+        branch: prearmed ? 'armed' : 'none',
+      })
       // A hidden app needs the normal -> minimized cycle repeated for the
       // miniaturize (and renderer visibility) to actually apply; the repeat is
       // invisible there. A visible app minimizes on the first cycle.

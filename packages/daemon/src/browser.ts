@@ -6,6 +6,7 @@ import { paths } from './paths.ts'
 import { findFreePort } from './ports.ts'
 import { loadSettings } from './store.ts'
 import { ExtensionManager } from './extensions.ts'
+import { ensureCaptureExtension, type CaptureExtension } from './capture-extension.ts'
 import { OFFSCREEN_MARGIN, readWorkArea } from './windows.ts'
 import { log, warn, error } from './log.ts'
 
@@ -80,6 +81,10 @@ export interface BrowserInstance {
   space: string
   profileDir: string
   extensionPaths: string[]
+  /** bundled tab-capture helper id (null when the engine cannot load extensions) */
+  captureExtensionId: string | null
+  /** hidden helper page the capture keep-alive drives (null when unavailable) */
+  capturePageUrl: string | null
   cdp: Cdp
   startedAt: number
 }
@@ -115,15 +120,26 @@ export class BrowserManager {
     fs.mkdirSync(profileDir, { recursive: true })
 
     const extensionPaths = opts.bare ? [] : this.deps.extensions.enabledPaths(opts.with)
+    // Tab-capture keep-alive needs the bundled helper extension. It is always
+    // loaded (dev/bare modes included) so the captureKeepAlive setting can be
+    // toggled without a browser restart; it is only driven when that setting
+    // is on, and it is the only mechanism that can arm capture without any
+    // window/app visibility operation.
+    let captureExtension: CaptureExtension | null = ensureCaptureExtension()
     let binary = detectBrowserBinary(settings.browser)
-    if (extensionPaths.length > 0 && isBrandedChrome(binary)) {
+    if ((extensionPaths.length > 0 || captureExtension) && isBrandedChrome(binary)) {
       const cached = await ensureChromiumForExtensions()
       if (cached) binary = cached
-      else
+      else if (extensionPaths.length > 0)
         throw new Error(
           'branded Google Chrome ignores --load-extension (M136+). Install Chromium / Chrome for Testing, or run: backlight doctor',
         )
+      else {
+        warn('capture keep-alive disabled: branded Chrome ignores --load-extension; hidden pages use the frame pump/rAF shim')
+        captureExtension = null
+      }
     }
+    const loadedExtensions = captureExtension ? [captureExtension.dir, ...extensionPaths] : extensionPaths
 
     const backgroundLaunch = opts.keepVisible ? false : !(opts.focus ?? settings.launchMode === 'visible')
     const upstreamPort = await findFreePort()
@@ -140,12 +156,12 @@ export class BrowserManager {
       '--disable-session-crashed-bubble',
       // allow the silent-audio keep-alive to run without a user gesture
       '--autoplay-policy=no-user-gesture-required',
-      // tab-capture keep-alive: getDisplayMedia() from the controller tab
-      // auto-selects the BACKLIGHT_AGENT tab (CapturerCount exemption);
-      // blink-settings removes the user-gesture requirement (daemon-initiated)
-      '--auto-select-tab-capture-source-by-title=BACKLIGHT_AGENT',
-      '--blink-settings=displayCaptureRequiresUserGesture=false',
     ]
+    if (captureExtension) {
+      // the hidden helper page may capture any managed tab without a user
+      // invocation; its id is derived from the materialized extension path
+      args.push(`--allowlisted-extension-id=${captureExtension.id}`)
+    }
     if (backgroundLaunch) {
       // start with no window; pages open as background targets afterwards so
       // nothing pops to the front. The first window is born AT the offscreen
@@ -160,15 +176,18 @@ export class BrowserManager {
         `--window-size=${winW},${winH}`,
       )
     }
-    if (extensionPaths.length > 0) {
-      args.push(`--load-extension=${extensionPaths.join(',')}`)
+    if (loadedExtensions.length > 0) {
+      args.push(`--load-extension=${loadedExtensions.join(',')}`)
       if (settings.soloExtensions) {
-        args.push(`--disable-extensions-except=${extensionPaths.join(',')}`)
+        args.push(`--disable-extensions-except=${loadedExtensions.join(',')}`)
       }
     }
 
     const { child, pid } = await this.spawnBrowser(binary, args, profileDir, backgroundLaunch)
-    log(`launching ${binary} (space=${space}, upstreamPort=${upstreamPort}, extensions=${extensionPaths.length}, mode=${backgroundLaunch ? 'background' : 'visible'})`)
+    log(
+      `launching ${binary} (space=${space}, upstreamPort=${upstreamPort}, `
+      + `extensions=${extensionPaths.length}${captureExtension ? '+capture-helper' : ''}, mode=${backgroundLaunch ? 'background' : 'visible'})`,
+    )
 
     // wait for the debug endpoint
     const deadline = Date.now() + 20_000
@@ -195,6 +214,8 @@ export class BrowserManager {
       space,
       profileDir,
       extensionPaths,
+      captureExtensionId: captureExtension?.id ?? null,
+      capturePageUrl: captureExtension?.pageUrl ?? null,
       cdp,
       startedAt: Date.now(),
     }

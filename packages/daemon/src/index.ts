@@ -64,20 +64,13 @@ async function main() {
   )
   supervisor.onTransition = entry => stateLog.record(entry)
   const capture = new CaptureKeepAlive(
-    () => (manager.current ? { cdp: manager.current.cdp, controllerUrl: `http://127.0.0.1:${proxyPort}/controller`, pid: manager.current.pid } : null),
+    () => (manager.current ? {
+      cdp: manager.current.cdp,
+      capturePageUrl: manager.current.capturePageUrl,
+      pid: manager.current.pid,
+    } : null),
     () => health.snapshot(),
     {
-      // pid-bound: a browser restart must never let a stale setup hide/unhide
-      // the new instance
-      appHidden: async (pid) => (await browserAppState(pid)).hidden,
-      hideApp: async (pid) => { await hideBrowser(pid) },
-      unhideApp: async (pid) => { await unhideBrowser(pid) },
-      // Bracket the picker's native activation so the tray can attribute the
-      // resulting didActivate/didUnhide notification to the daemon, not a user.
-      onInternalNative: (phase, kind) => {
-        if (phase === 'begin') supervisor.beginInternalActivity(kind)
-        else supervisor.endInternalActivity(kind)
-      },
       onTransition: entry => stateLog.record(entry),
     },
   )
