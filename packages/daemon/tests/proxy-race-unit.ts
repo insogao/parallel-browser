@@ -99,11 +99,11 @@ test('show during a settling /api/bg supersedes it: no minimize, no hide, stays 
   })
   const base = await h.listen()
   try {
-    const bgPromise = post(base, '/api/bg', {})
+    const bgPromise = post(base, '/api/bg', { source: 'test.race.bg' })
     const deadline = Date.now() + 5000
     while (!held && Date.now() < deadline) await sleep(10)
     assert.ok(held, 'bg must reach the settle step')
-    const show = await post(base, '/api/show', { activate: false })
+    const show = await post(base, '/api/show', { activate: false, source: 'test.race.show' })
     assert.equal(show.body.ok, true)
     release()
     const bg = await bgPromise
@@ -128,11 +128,11 @@ test('show arriving while bg awaits setPaused(false) still supersedes the older 
   })
   const base = await h.listen()
   try {
-    const bgPromise = post(base, '/api/bg', {})
+    const bgPromise = post(base, '/api/bg', { source: 'test.race.bg' })
     const deadline = Date.now() + 5000
     while (!pausedGateEntered && Date.now() < deadline) await sleep(10)
     assert.ok(pausedGateEntered, 'bg must be parked in setPaused(false)')
-    const show = await post(base, '/api/show', { activate: false })
+    const show = await post(base, '/api/show', { activate: false, source: 'test.race.show' })
     assert.equal(show.body.ok, true)
     release()
     const bg = await bgPromise
@@ -158,11 +158,11 @@ test('show during an in-flight native hide leaves the app visible', { timeout: 2
   })
   const base = await h.listen()
   try {
-    const bgPromise = post(base, '/api/bg', {})
+    const bgPromise = post(base, '/api/bg', { source: 'test.race.bg' })
     const deadline = Date.now() + 5000
     while (!hideEntered && Date.now() < deadline) await sleep(10)
     assert.ok(hideEntered, 'bg must reach the native hide')
-    const showPromise = post(base, '/api/show', { activate: false })
+    const showPromise = post(base, '/api/show', { activate: false, source: 'test.race.show' })
     await sleep(50) // let show queue its unhide behind the in-flight hide
     release()
     const show = await showPromise

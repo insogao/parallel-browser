@@ -39,7 +39,7 @@ async function waitFor(fn: () => Promise<boolean>, message: string, timeout = 15
 try {
   await waitFor(async () => !!(await api('status')).daemon, 'daemon startup')
   await api('settings', { captureKeepAlive: false })
-  await api('launch', { url: siteUrl + '/one' })
+  await api('launch', { url: siteUrl + '/one', source: 'test.usability.launch' })
   const status = await api('status')
   cdp = await Cdp.connect((await fetchVersion(status.browser.upstreamPort)).webSocketDebuggerUrl)
   const pages = async () => (await cdp!.send('Target.getTargets')).targetInfos.filter((t: any) => t.url.startsWith(siteUrl))
@@ -64,7 +64,7 @@ try {
     }
     return parts.join('; ')
   }
-  await api('show', { maximize: true, activate: false })
+  await api('show', { maximize: true, activate: false, source: 'test.usability.show' })
   let { bounds } = await cdp.send('Browser.getWindowBounds', { windowId })
   assert.ok(bounds.left >= 0 && bounds.top < 900, 'show brings startup window onscreen')
   assert.equal(bounds.windowState, 'maximized', 'show supports maximize')
@@ -74,7 +74,7 @@ try {
   assert.equal(await cdp.evaluateOnSession(session, 'document.querySelector("#draft").value'), 'unsaved login draft')
   assert.equal((await api('status')).control, 'human')
   console.log('PASS human takeover: maximize, open without moving window, preserve draft')
-  await api('bg', {})
+  await api('bg', { source: 'test.usability.bg' })
   let minimized = false
   const minimizeDeadline = Date.now() + 15000
   while (Date.now() < minimizeDeadline) {

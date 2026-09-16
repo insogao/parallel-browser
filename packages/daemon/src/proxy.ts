@@ -15,7 +15,7 @@ import { brandBundle } from './brand.ts'
 import { paths } from './paths.ts'
 import { resolveBrandedEngineSelection, selectBrandedEngineSetting, type LoginResult } from './launcher.ts'
 
-import type { FramePumpSupervisor } from './windows.ts'
+import type { ControlIntent, FramePumpSupervisor, IntentOrigin, IntentRef } from './windows.ts'
 import { TapState, tapFrame } from './tap.ts'
 import { log, debug } from './log.ts'
 import { StateTransitionLog, type TransitionEntry } from './state-log.ts'
@@ -25,7 +25,10 @@ import { StateTransitionLog, type TransitionEntry } from './state-log.ts'
 const AUTO_SHOW_SOURCES = new Set(['tray.auto.activate', 'tray.auto.unhide', 'tray.auto.poll'])
 
 export interface RequestMeta {
-  source: string
+  /** caller label; absent when the caller provided none (never invented) */
+  source?: string
+  /** explicit | auto | internal | unknown */
+  origin: IntentOrigin
   requestId: string
   route: string
   /** true when the request is a tray reconciliation, not an explicit action */
@@ -57,11 +60,31 @@ function transition(deps: ServerDeps, entry: Omit<TransitionEntry, 'at'> & { at?
   try { deps.stateLog?.record({ at: entry.at ?? Date.now(), ...entry }) } catch { /* logging is best effort */ }
 }
 
-/** Sanitize a caller-provided source label; never persisted verbatim. */
+/**
+ * Attribution for one request. A sanitized caller `source` is required for
+ * `explicit`; tray reconciliation sources and `explicit:false` are `auto`; a
+ * missing source is `unknown` and is never silently classified as human.
+ */
 function requestMeta(payload: any, route: string, requestId: string): RequestMeta {
-  const raw = typeof payload?.source === 'string' ? payload.source : 'api'
-  const source = raw.replace(/[^a-zA-Z0-9._-]+/g, '').slice(0, 48) || 'api'
-  return { source, requestId, route, auto: AUTO_SHOW_SOURCES.has(source) || payload?.explicit === false }
+  const raw = typeof payload?.source === 'string' ? payload.source.trim() : ''
+  const source = raw ? raw.replace(/[^a-zA-Z0-9._-]+/g, '').slice(0, 48) || undefined : undefined
+  const declaredAuto = payload?.explicit === false
+  const origin: IntentOrigin = declaredAuto || (source !== undefined && AUTO_SHOW_SOURCES.has(source))
+    ? 'auto'
+    : source !== undefined ? 'explicit' : 'unknown'
+  return { source, origin, requestId, route, auto: origin === 'auto' }
+}
+
+/** Correlation fields logged with every transition an intent produces. */
+function intentFields(intent: ControlIntent): IntentRef {
+  return {
+    origin: intent.origin,
+    token: intent.token,
+    source: intent.source,
+    route: intent.route,
+    requestId: intent.requestId,
+    gen: intent.gen,
+  }
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
@@ -122,21 +145,55 @@ export function createServer(deps: ServerDeps): http.Server {
       nativeQueue = run.catch(() => {})
       return run
     },
-    /** Persist the visibility of the newest intent without forcing focus. */
+    /**
+     * Persist the visibility of the newest intent. Only an `explicit` intent
+     * may foreground the app; auto/internal/unknown are downgraded to unhide
+     * (and the downgrade is logged, never silent).
+     */
     async persist(gen: number, activate: boolean, meta: Partial<RequestMeta> = {}): Promise<void> {
       const cur = deps.manager.current
       if (!cur) return
-      await nativeControl.op(gen, async () => {
+      const ref = deps.supervisor.intentRef(gen)
+      let foreground = activate
+      if (foreground && ref.origin !== 'explicit') {
+        foreground = false
+        transition(deps, {
+          event: 'policy-downgrade', ...ref, branch: 'activate',
+          source: ref.source ?? meta.source, detail: 'non-explicit-foreground',
+        })
+      }
+      let skipped = false
+      const base = {
+        ...ref,
+        source: ref.source ?? meta.source,
+        pid: cur.pid,
+      }
+      const ran = await nativeControl.op(gen, async () => {
         let before: string | undefined
         try { before = (await deps.appState(cur.pid)).hidden ? 'hidden' : 'visible' } catch { /* unknown */ }
-        if (activate) {
-          await deps.activateBrowser(cur.pid)
-          transition(deps, { event: 'native-activate', source: meta.source, route: meta.route, requestId: meta.requestId, gen, pid: cur.pid, before: before ?? 'unknown', after: 'active-visible' })
-        } else {
-          await deps.unhideBrowser(cur.pid)
-          transition(deps, { event: 'native-unhide', source: meta.source, route: meta.route, requestId: meta.requestId, gen, pid: cur.pid, before: before ?? 'unknown', after: 'visible' })
+        const entry = { event: foreground ? 'native-activate' : 'native-unhide', ...base, before: before ?? 'unknown' }
+        transition(deps, { ...entry, branch: 'requested' })
+        try {
+          if (foreground) {
+            await deps.activateBrowser(cur.pid)
+            transition(deps, { ...entry, after: 'active-visible', branch: 'applied' })
+          } else {
+            await deps.unhideBrowser(cur.pid)
+            transition(deps, { ...entry, after: 'visible', branch: 'applied' })
+          }
+        } catch (err) {
+          transition(deps, { ...entry, after: before ?? 'unknown', branch: 'failed', detail: (err as Error).message })
+          throw err
         }
+        return true
       })
+      if (ran !== true) skipped = true
+      if (skipped) {
+        transition(deps, {
+          event: foreground ? 'native-activate' : 'native-unhide', ...base,
+          branch: 'superseded', after: 'skipped',
+        })
+      }
     },
   }
 
@@ -299,6 +356,10 @@ async function runLogin(deps: ServerDeps, native: NativeControl, meta?: RequestM
   const before = deps.manager.current
   if (deps.manager.running && before && resolution.engine
     && path.resolve(before.binary) !== path.resolve(resolution.engine.binPath)) {
+    transition(deps, {
+      event: 'login-refused', origin: 'explicit', source: meta?.source, route: meta?.route, requestId: meta?.requestId,
+      pid: before.pid, branch: 'engine-mismatch',
+    })
     return {
       ok: false,
       launched: false,
@@ -322,10 +383,19 @@ async function runLogin(deps: ServerDeps, native: NativeControl, meta?: RequestM
   const previousHumanMode = deps.supervisor.humanMode
   const previousPaused = deps.capture.isPaused?.() ?? false
   const gen = deps.supervisor.beginControl()
+  // Record the explicit login intent BEFORE any side effect (launch/show/
+  // activate), so a tray auto-show reacting to our own launch sees a pending
+  // explicit intent and cannot steal the control generation.
+  const intent = deps.supervisor.noteExplicitIntent('show', {
+    source: meta?.source,
+    route: meta?.route,
+    requestId: meta?.requestId,
+    gen,
+  })
   deps.supervisor.humanMode = true
-  await deps.capture.setPaused(true)
   let launched = false
   try {
+    await deps.capture.setPaused(true)
     if (!deps.manager.running) {
       deps.supervisor.start()
       const instance = await deps.manager.launch({ focus: true })
@@ -334,10 +404,16 @@ async function runLogin(deps: ServerDeps, native: NativeControl, meta?: RequestM
     }
     const restored = deps.manager.running ? await deps.supervisor.restoreAll(true, gen) : 0
     await native.persist(gen, true, meta)
+    deps.supervisor.completeIntent(intent.token, 'applied')
     return { ok: true, launched, restored, engine, note }
   } catch (err) {
     // Launch failed: restore the prior control/capture intent as far as the
     // architecture allows (the bumped control generation deliberately stays).
+    transition(deps, {
+      event: 'login-failed', origin: 'explicit', token: intent.token, source: intent.source, route: intent.route,
+      requestId: intent.requestId, gen, branch: 'error', detail: (err as Error).message,
+    })
+    deps.supervisor.completeIntent(intent.token, 'failed')
     deps.supervisor.humanMode = previousHumanMode
     try { await deps.capture.setPaused(previousPaused) } catch { /* keep the original error */ }
     throw err
@@ -393,27 +469,53 @@ async function handleApi(
       return
     }
     case 'POST /api/launch': {
+      const requestedForeground = payload.focus === true || payload.keepVisible === true || payload.background === false
+      // Showing a window (`focus`/`keepVisible`) is foreground state: only an
+      // explicit intent may request it; anything else is forced to background.
+      const foreground = requestedForeground && meta.origin === 'explicit'
       const gen = deps.supervisor.beginControl() // a new launch outranks any settling collapse
-      deps.supervisor.humanMode = payload.focus === true || payload.keepVisible === true || payload.background === false
-      if (deps.supervisor.humanMode) deps.supervisor.noteExplicitIntent('show', { ...meta, gen })
-      await deps.capture.setPaused(deps.supervisor.humanMode)
-      deps.supervisor.start()
-      const inst = await deps.manager.launch({
-        url: payload.url,
-        space: payload.space,
-        with: payload.with,
-        bare: payload.bare === true,
-        focus: payload.focus === true || payload.background === false ? true : undefined,
-        keepVisible: payload.keepVisible === true,
-      })
-      json(res, 200, { ok: true, pid: inst.pid, upstreamPort: inst.upstreamPort, version: inst.version })
+      const intent = deps.supervisor.noteIntent(meta.origin, foreground ? 'show' : 'bg', { source: meta.source, route, requestId, gen })
+      if (requestedForeground && !foreground) {
+        transition(deps, { event: 'policy-downgrade', ...intentFields(intent), branch: 'foreground', detail: 'non-explicit-visible-launch' })
+      }
+      deps.supervisor.humanMode = foreground
+      try {
+        await deps.capture.setPaused(foreground)
+        deps.supervisor.start()
+        const inst = await deps.manager.launch({
+          url: payload.url,
+          space: payload.space,
+          with: payload.with,
+          bare: payload.bare === true,
+          focus: foreground ? (payload.focus === true || payload.background === false ? true : undefined) : requestedForeground ? false : undefined,
+          keepVisible: foreground ? payload.keepVisible === true : requestedForeground ? false : undefined,
+        })
+        transition(deps, {
+          event: 'launch', ...intentFields(intent), pid: inst.pid,
+          branch: foreground ? 'visible' : 'background',
+        })
+        deps.supervisor.completeIntent(intent.token, 'applied')
+        json(res, 200, { ok: true, pid: inst.pid, upstreamPort: inst.upstreamPort, version: inst.version })
+      } catch (err) {
+        transition(deps, { event: 'launch', ...intentFields(intent), branch: 'failed', detail: (err as Error).message })
+        deps.supervisor.completeIntent(intent.token, 'failed')
+        throw err
+      }
       return
     }
     case 'POST /api/login': {
+      // Login launches visibly, maximizes and foregrounds: it always requires
+      // an explicit caller source; auto/unknown requests are refused before any
+      // side effect and logged as rejected (never silently treated as human).
+      if (meta.origin !== 'explicit') {
+        transition(deps, {
+          event: 'request-rejected', origin: meta.origin, source: meta.source, route, requestId,
+          branch: 'non-explicit', detail: 'login requires an explicit source',
+        })
+        json(res, 400, { ok: false, error: 'login requires an explicit source label (e.g. cli.login)' })
+        return
+      }
       const result = await login(meta)
-      // A successful login is an explicit show (launcher/Dock path); a
-      // mismatched-engine refusal applied zero side effects and is not.
-      if (result.ok) deps.supervisor.noteExplicitIntent('show', { ...meta, gen: deps.supervisor.controlGen() })
       json(res, 200, result)
       return
     }
@@ -428,35 +530,50 @@ async function handleApi(
       // Explicit user action (tray "open console"): show the daemon dashboard
       // in the managed Backlight browser, never in the macOS default browser.
       // Recursion-safe: the dashboard only calls local /api/* endpoints.
+      if (meta.origin !== 'explicit') {
+        transition(deps, {
+          event: 'request-rejected', origin: meta.origin, source: meta.source, route, requestId,
+          branch: 'non-explicit', detail: 'console requires an explicit source',
+        })
+        json(res, 400, { ok: false, error: 'console requires an explicit source label (e.g. tray.menu.console)' })
+        return
+      }
       const gen = deps.supervisor.beginControl()
-      deps.supervisor.noteExplicitIntent('show', { ...meta, gen })
+      const intent = deps.supervisor.noteIntent(meta.origin, 'show', { source: meta.source, route, requestId, gen })
       deps.supervisor.humanMode = true
-      await deps.capture.setPaused(true)
       const dashboardUrl = `http://127.0.0.1:${req.socket.localPort}/`
       let launched = false
       let activated = false
-      if (!deps.manager.running) {
-        const inst = await deps.manager.launch({ url: dashboardUrl, focus: true })
-        transition(deps, { event: 'console-open', source: meta.source, route, requestId, gen, pid: inst.pid, branch: 'launched-managed' })
-        json(res, 200, { ok: true, launched: true, activated: false })
-        return
+      try {
+        await deps.capture.setPaused(true)
+        if (!deps.manager.running) {
+          const inst = await deps.manager.launch({ url: dashboardUrl, focus: true })
+          transition(deps, { event: 'console-open', ...intentFields(intent), pid: inst.pid, branch: 'launched-managed' })
+          deps.supervisor.completeIntent(intent.token, 'applied')
+          json(res, 200, { ok: true, launched: true, activated: false })
+          return
+        }
+        const cur = deps.manager.current!
+        const tabs = await deps.manager.listTabs()
+        const existing = tabs.find(t => t.type === 'page' && t.url.startsWith(dashboardUrl))
+        if (existing) {
+          await cur.cdp.send('Target.activateTarget', { targetId: existing.targetId })
+          activated = true
+        } else {
+          await cur.cdp.send('Target.createTarget', { url: dashboardUrl })
+        }
+        await deps.supervisor.restoreAll(false, gen)
+        await native.persist(gen, true, meta)
+        transition(deps, {
+          event: 'console-open', ...intentFields(intent), pid: cur.pid,
+          branch: existing ? 'activated-existing-tab' : 'created-managed-tab', after: 'visible',
+        })
+        deps.supervisor.completeIntent(intent.token, 'applied')
+        json(res, 200, { ok: true, launched, activated })
+      } catch (err) {
+        deps.supervisor.completeIntent(intent.token, 'failed')
+        throw err
       }
-      const cur = deps.manager.current!
-      const tabs = await deps.manager.listTabs()
-      const existing = tabs.find(t => t.type === 'page' && t.url.startsWith(dashboardUrl))
-      if (existing) {
-        await cur.cdp.send('Target.activateTarget', { targetId: existing.targetId })
-        activated = true
-      } else {
-        await cur.cdp.send('Target.createTarget', { url: dashboardUrl })
-      }
-      await deps.supervisor.restoreAll(false, gen)
-      await native.persist(gen, true, meta)
-      transition(deps, {
-        event: 'console-open', source: meta.source, route, requestId, gen, pid: cur.pid,
-        branch: existing ? 'activated-existing-tab' : 'created-managed-tab', after: 'visible',
-      })
-      json(res, 200, { ok: true, launched, activated })
       return
     }
     case 'POST /api/restart': {
@@ -472,63 +589,102 @@ async function handleApi(
       // outranked by a later allocation. Every delayed step and the native
       // hide (in its own critical section) recheck it.
       const gen = deps.supervisor.beginControl()
-      deps.supervisor.noteExplicitIntent('bg', { ...meta, gen })
-      await deps.capture.setPaused(false)
-      // Arm capture while the window is still visible. Chrome only establishes
-      // the capture frame source in that state; arming after minimization
-      // grants the rAF exemption but no real frames/screenshots. Arming itself
-      // is invisible (hidden extension page, no activation), and having the
-      // capture already active is what lets the collapse stay invisible.
-      const prearmed = await deps.capture.prearm().catch(() => null)
-      transition(deps, {
-        event: 'capture-prearm', source: meta.source, route, requestId, gen,
-        branch: prearmed ? 'armed' : 'none',
-      })
-      // A hidden app needs the normal -> minimized cycle repeated for the
-      // miniaturize (and renderer visibility) to actually apply; the repeat is
-      // invisible there. A visible app minimizes on the first cycle.
-      let appHidden = false
-      let appStateKnown = false
-      if (deps.manager.current) {
-        try { appHidden = (await deps.appState(deps.manager.current.pid)).hidden; appStateKnown = true } catch { /* unknown: single cycle */ }
-      }
-      const n = deps.manager.running ? await deps.supervisor.collapseAll(appHidden, gen) : 0
-      if (deps.manager.current) {
-        const pid = deps.manager.current.pid
-        const hidden = await native.op(gen, async () => { await deps.hideBrowser(pid); return true })
+      const intent = deps.supervisor.noteIntent(meta.origin, 'bg', { source: meta.source, route, requestId, gen })
+      try {
+        await deps.capture.setPaused(false)
+        // Arm capture while the window is still visible. Chrome only establishes
+        // the capture frame source in that state; arming after minimization
+        // grants the rAF exemption but no real frames/screenshots. Arming itself
+        // is invisible (hidden extension page, no activation), and having the
+        // capture already active is what lets the collapse stay invisible.
+        transition(deps, { event: 'capture-prearm', ...intentFields(intent), branch: 'requested' })
+        let prearmError: string | undefined
+        const prearmed = await deps.capture.prearm().catch((err) => { prearmError = (err as Error).message; return null })
         transition(deps, {
-          event: 'native-hide', source: meta.source, route, requestId, gen, pid,
-          before: appStateKnown ? (appHidden ? 'hidden' : 'visible') : undefined,
-          after: hidden ? 'hidden' : undefined,
-          branch: hidden ? 'applied' : 'superseded',
+          event: 'capture-prearm', ...intentFields(intent),
+          branch: prearmed ? 'armed' : prearmError ? 'failed' : 'none',
+          detail: prearmError,
         })
+        // A hidden app needs the normal -> minimized cycle repeated for the
+        // miniaturize (and renderer visibility) to actually apply; the repeat is
+        // invisible there. A visible app minimizes on the first cycle.
+        let appHidden = false
+        let appStateKnown = false
+        if (deps.manager.current) {
+          try { appHidden = (await deps.appState(deps.manager.current.pid)).hidden; appStateKnown = true } catch { /* unknown: single cycle */ }
+        }
+        const n = deps.manager.running ? await deps.supervisor.collapseAll(appHidden, gen) : 0
+        let hidden: boolean | undefined
+        if (deps.manager.current) {
+          const pid = deps.manager.current.pid
+          const base = {
+            ...intentFields(intent), pid,
+            before: appStateKnown ? (appHidden ? 'hidden' : 'visible') : undefined,
+          }
+          transition(deps, { event: 'native-hide', ...base, branch: 'requested' })
+          try {
+            hidden = await native.op(gen, async () => { await deps.hideBrowser(pid); return true })
+          } catch (err) {
+            transition(deps, { event: 'native-hide', ...base, branch: 'failed', detail: (err as Error).message })
+            throw err
+          }
+          transition(deps, {
+            event: 'native-hide', ...base,
+            after: hidden ? 'hidden' : undefined,
+            branch: hidden ? 'applied' : 'superseded',
+          })
+        }
+        const superseded = !deps.supervisor.isControlCurrent(gen)
+        deps.supervisor.completeIntent(intent.token, superseded ? 'superseded' : 'applied')
+        json(res, 200, { ok: true, collapsed: n, superseded })
+      } catch (err) {
+        deps.supervisor.completeIntent(intent.token, 'failed')
+        throw err
       }
-      const superseded = !deps.supervisor.isControlCurrent(gen)
-      json(res, 200, { ok: true, collapsed: n, superseded })
       return
     }
     case 'POST /api/show':
     case 'POST /api/restore': {
       const observedAt = Number.isFinite(Number(payload.observedAt)) ? Number(payload.observedAt) : Date.now()
       // A tray auto-show is a reconciliation of the app being brought forward.
-      // If the daemon itself just activated the app for capture, that is not a
-      // user intent and must not override an explicit recent "collapse to bg".
-      if (meta.auto && deps.supervisor.shouldIgnoreAutoShow(observedAt)) {
+      // It may not override a recent explicit "collapse to bg" when the
+      // activation was daemon-internal, and it may never supersede an explicit
+      // intent that is still being applied.
+      const skip = meta.auto ? deps.supervisor.autoShowSkipReason(observedAt) : null
+      if (skip) {
         transition(deps, {
-          event: 'show-skip', source: meta.source, route, requestId,
-          gen: deps.supervisor.controlGen(), branch: 'internal-activation',
+          event: 'show-skip', origin: meta.origin, source: meta.source, route, requestId,
+          gen: deps.supervisor.controlGen(), branch: skip,
           detail: `observedAt=${Math.round(observedAt)}`,
         })
-        json(res, 200, { ok: true, restored: 0, ignored: 'internal-activation' })
+        json(res, 200, { ok: true, restored: 0, ignored: skip })
         return
       }
       const gen = deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
-      deps.supervisor.noteExplicitIntent('show', { ...meta, gen })
+      const intent = deps.supervisor.noteIntent(meta.origin, 'show', { source: meta.source, route, requestId, gen })
+      // Invariant: only an explicit intent may maximize or foreground. Auto and
+      // unknown requests are downgraded to a plain restore/unhide, and every
+      // downgrade is logged (never silent).
+      const allowForeground = meta.origin === 'explicit'
+      const wantMaximize = payload.maximize === true && allowForeground
+      const wantActivate = payload.activate !== false && allowForeground
+      const downgraded: string[] = []
+      if (payload.maximize === true && !allowForeground) downgraded.push('maximize')
+      if (payload.activate !== false && !allowForeground) downgraded.push('activate')
+      for (const branch of downgraded) {
+        transition(deps, { event: 'policy-downgrade', ...intentFields(intent), branch, detail: 'non-explicit' })
+      }
       deps.supervisor.humanMode = true
-      await deps.capture.setPaused(true)
-      const n = deps.manager.running ? await deps.supervisor.restoreAll(payload.maximize === true, gen) : 0
-      await native.persist(gen, payload.activate !== false, meta)
-      json(res, 200, { ok: true, restored: n })
+      try {
+        await deps.capture.setPaused(true)
+        const n = deps.manager.running ? await deps.supervisor.restoreAll(wantMaximize, gen) : 0
+        await native.persist(gen, wantActivate, meta)
+        deps.supervisor.completeIntent(intent.token, 'applied')
+        json(res, 200, { ok: true, restored: n, ...(downgraded.length ? { downgraded } : {}) })
+      } catch (err) {
+        deps.supervisor.completeIntent(intent.token, 'failed')
+        throw err
+      }
       return
     }
     case 'GET /api/windows': {
@@ -578,26 +734,45 @@ async function handleApi(
     }
     case 'POST /api/extensions/dev': {
       const gen = deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
-      deps.supervisor.noteExplicitIntent('show', { ...meta, gen })
-      const name = String(payload.name ?? '')
-      deps.extensionDev.entry(name)
-      if (!deps.manager.running) {
-        if (!payload.url) return json(res, 400, { error: 'url required to start extension development' })
-        await deps.manager.launch({ url: payload.url, with: [name] })
+      const intent = deps.supervisor.noteIntent(meta.origin, 'show', { source: meta.source, route, requestId, gen })
+      const allowForeground = meta.origin === 'explicit'
+      if (payload.maximize === true && !allowForeground) {
+        transition(deps, { event: 'policy-downgrade', ...intentFields(intent), branch: 'maximize', detail: 'non-explicit' })
       }
-      deps.supervisor.humanMode = true
-      await deps.capture.setPaused(true)
-      const cur = deps.manager.current!
-      let targetId = payload.targetId
-      if (!targetId && payload.url) {
-        targetId = (await deps.manager.listTabs()).find(t => t.type === 'page' && t.url === payload.url)?.targetId
-        if (!targetId) targetId = (await cur.cdp.send('Target.createTarget', { url: payload.url, background: true })).targetId
+      if (payload.activate !== false && !allowForeground) {
+        transition(deps, { event: 'policy-downgrade', ...intentFields(intent), branch: 'activate', detail: 'non-explicit' })
       }
-      if (!targetId) return json(res, 400, { error: 'select a website targetId or url' })
-      await deps.supervisor.restoreAll(payload.maximize === true, gen)
-      await native.persist(gen, payload.activate !== false, meta)
-      const result = await deps.extensionDev.openPanel(name, targetId)
-      json(res, 200, { ok: true, ...result })
+      try {
+        const name = String(payload.name ?? '')
+        deps.extensionDev.entry(name)
+        if (!deps.manager.running) {
+          if (!payload.url) {
+            deps.supervisor.completeIntent(intent.token, 'failed')
+            return json(res, 400, { error: 'url required to start extension development' })
+          }
+          await deps.manager.launch({ url: payload.url, with: [name] })
+        }
+        deps.supervisor.humanMode = true
+        await deps.capture.setPaused(true)
+        const cur = deps.manager.current!
+        let targetId = payload.targetId
+        if (!targetId && payload.url) {
+          targetId = (await deps.manager.listTabs()).find(t => t.type === 'page' && t.url === payload.url)?.targetId
+          if (!targetId) targetId = (await cur.cdp.send('Target.createTarget', { url: payload.url, background: true })).targetId
+        }
+        if (!targetId) {
+          deps.supervisor.completeIntent(intent.token, 'failed')
+          return json(res, 400, { error: 'select a website targetId or url' })
+        }
+        await deps.supervisor.restoreAll(payload.maximize === true && allowForeground, gen)
+        await native.persist(gen, payload.activate !== false && allowForeground, meta)
+        const result = await deps.extensionDev.openPanel(name, targetId)
+        deps.supervisor.completeIntent(intent.token, 'applied')
+        json(res, 200, { ok: true, ...result })
+      } catch (err) {
+        deps.supervisor.completeIntent(intent.token, 'failed')
+        throw err
+      }
       return
     }
     case 'GET /api/targets': {
@@ -610,16 +785,26 @@ async function handleApi(
       const target = (await deps.manager.listTabs()).find(t => t.targetId === payload.targetId)
       if (!target) return json(res, 404, { error: 'target is no longer available; refresh the target list' })
       const gen = deps.supervisor.beginControl() // newer intent invalidates an in-flight bg
-      deps.supervisor.noteExplicitIntent('show', { ...meta, gen })
-      deps.supervisor.humanMode = true
-      await deps.capture.setPaused(true)
-      // Go through our loopback proxy: Chromium rejects the frontend's
-      // devtools:// Origin at its raw remote-debugging socket.
-      const inspectorUrl = `devtools://devtools/bundled/inspector.html?ws=127.0.0.1:${req.socket.localPort}/devtools/page/${target.targetId}`
-      const { targetId } = await cur.cdp.send('Target.createTarget', { url: inspectorUrl, newWindow: true })
-      await deps.supervisor.restoreAll(false, gen)
-      await native.persist(gen, payload.activate !== false, meta)
-      json(res, 200, { ok: true, targetId })
+      const intent = deps.supervisor.noteIntent(meta.origin, 'show', { source: meta.source, route, requestId, gen })
+      const allowForeground = meta.origin === 'explicit'
+      if (payload.activate !== false && !allowForeground) {
+        transition(deps, { event: 'policy-downgrade', ...intentFields(intent), branch: 'activate', detail: 'non-explicit' })
+      }
+      try {
+        deps.supervisor.humanMode = true
+        await deps.capture.setPaused(true)
+        // Go through our loopback proxy: Chromium rejects the frontend's
+        // devtools:// Origin at its raw remote-debugging socket.
+        const inspectorUrl = `devtools://devtools/bundled/inspector.html?ws=127.0.0.1:${req.socket.localPort}/devtools/page/${target.targetId}`
+        const { targetId } = await cur.cdp.send('Target.createTarget', { url: inspectorUrl, newWindow: true })
+        await deps.supervisor.restoreAll(false, gen)
+        await native.persist(gen, payload.activate !== false && allowForeground, meta)
+        deps.supervisor.completeIntent(intent.token, 'applied')
+        json(res, 200, { ok: true, targetId })
+      } catch (err) {
+        deps.supervisor.completeIntent(intent.token, 'failed')
+        throw err
+      }
       return
     }
     case 'POST /api/open': {
@@ -846,16 +1031,16 @@ function dashboardHtml(deps: ServerDeps): string {
       options($('target'), t.targets.filter(x => !x.url.startsWith('devtools:')).map(x => [x.targetId, (x.type === 'service_worker' ? '后台脚本 · ' : x.url.startsWith('chrome-extension:') ? '扩展页面 / 侧栏 · ' : '网页 · ') + (x.title || x.url)]));
     } catch(e) { $('extStatus').textContent = e.message; }
   }
-  action('bLaunch', async () => { await post('/api/launch', { url: location.origin + '/demo' }); return '浏览器已在后台启动'; });
-  action('bBg', async () => { await post('/api/bg'); return '已收起，后台继续运行'; });
-  action('bRestore', async () => { await post('/api/show'); return '已进入人工接管'; });
-  action('bMaximize', async () => { await post('/api/show', { maximize: true }); return '已最大化，人工接管中'; });
-  action('bStop', async () => { await post('/api/stop'); return '浏览器已关闭'; });
-  action('bOpen', async () => { const url = $('url').value.trim(); if (!url) throw new Error('请输入网址'); await post('/api/open', { url }); return '已静默打开网页'; });
-  action('bExtAdd', async () => { await post('/api/extensions/add', { path: $('extPath').value.trim() }); return '扩展已添加'; });
-  action('bExtDev', async () => { if (!$('extName').value) throw new Error('请先添加扩展'); const result = await post('/api/extensions/dev', { name: $('extName').value, url: $('devUrl').value.trim() || location.origin + '/demo' }); await refreshExtensions(); $('target').value = result.panelTargetId; return '真实侧栏已打开，可选择网页、侧栏或后台脚本分别调试'; });
-  action('bExtReload', async () => { if (!$('extName').value) throw new Error('请先选择扩展'); await post('/api/extensions/reload', { name: $('extName').value }); return '扩展已重载；内容脚本更新需刷新目标网页'; });
-  action('bInspect', async () => { if (!$('target').value) throw new Error('请选择调试目标'); await post('/api/inspect', { targetId: $('target').value }); return '调试窗口已打开'; });
+  action('bLaunch', async () => { await post('/api/launch', { url: location.origin + '/demo', source: 'dashboard.launch' }); return '浏览器已在后台启动'; });
+  action('bBg', async () => { await post('/api/bg', { source: 'dashboard.bg' }); return '已收起，后台继续运行'; });
+  action('bRestore', async () => { await post('/api/show', { source: 'dashboard.show' }); return '已进入人工接管'; });
+  action('bMaximize', async () => { await post('/api/show', { maximize: true, source: 'dashboard.show.maximize' }); return '已最大化，人工接管中'; });
+  action('bStop', async () => { await post('/api/stop', { source: 'dashboard.stop' }); return '浏览器已关闭'; });
+  action('bOpen', async () => { const url = $('url').value.trim(); if (!url) throw new Error('请输入网址'); await post('/api/open', { url, source: 'dashboard.open' }); return '已静默打开网页'; });
+  action('bExtAdd', async () => { await post('/api/extensions/add', { path: $('extPath').value.trim(), source: 'dashboard.ext.add' }); return '扩展已添加'; });
+  action('bExtDev', async () => { if (!$('extName').value) throw new Error('请先添加扩展'); const result = await post('/api/extensions/dev', { name: $('extName').value, url: $('devUrl').value.trim() || location.origin + '/demo', source: 'dashboard.ext.dev' }); await refreshExtensions(); $('target').value = result.panelTargetId; return '真实侧栏已打开，可选择网页、侧栏或后台脚本分别调试'; });
+  action('bExtReload', async () => { if (!$('extName').value) throw new Error('请先选择扩展'); await post('/api/extensions/reload', { name: $('extName').value, source: 'dashboard.ext.reload' }); return '扩展已重载；内容脚本更新需刷新目标网页'; });
+  action('bInspect', async () => { if (!$('target').value) throw new Error('请选择调试目标'); await post('/api/inspect', { targetId: $('target').value, source: 'dashboard.inspect' }); return '调试窗口已打开'; });
   const es = new WebSocket(\`ws://\${location.host}/activity\`);
   es.onmessage = (ev) => {
     try {

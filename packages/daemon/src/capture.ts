@@ -245,7 +245,7 @@ export class CaptureKeepAlive {
     const check = () => { if (!allowed()) throw new Error('capture setup aborted') }
     const cur = this.getHealth().find(t => t.targetId === target.targetId)
     if (!cur) return
-    this.transition({ event: 'capture-engage', source: 'capture', branch: visibleAtArm ? 'pre-arm' : 'picked' })
+    this.transition({ event: 'capture-engage', origin: 'internal', source: 'capture', branch: visibleAtArm ? 'pre-arm' : 'picked' })
     let pageSession: string | null = null
     let targetSession: string | undefined
     let titleTouched = false
@@ -282,13 +282,13 @@ export class CaptureKeepAlive {
       this.active = { targetId: target.targetId, visibleAtArm }
       this.failures = 0
       this.transition({
-        event: 'capture-started', source: 'capture', pid: ctx.pid,
+        event: 'capture-started', origin: 'internal', source: 'capture', pid: ctx.pid,
         branch: visibleAtArm ? 'extension-tab-capture-visible' : 'extension-tab-capture-hidden',
       })
       log(`capture keep-alive engaged for ${target.targetId.slice(0, 8)} via hidden extension page (no window activation${visibleAtArm ? ', armed while visible: real frames' : ''})`)
     } catch (err) {
       if (allowed()) {
-        this.transition({ event: 'capture-failed', source: 'capture', pid: ctx.pid, branch: 'setup-error' })
+        this.transition({ event: 'capture-failed', origin: 'internal', source: 'capture', pid: ctx.pid, branch: 'setup-error' })
         this.noteFailure(`capture keep-alive failed: ${(err as Error).message}`)
       }
     } finally {
@@ -336,7 +336,7 @@ export class CaptureKeepAlive {
       if (created) {
         const ready = await this.waitForCaptureReady(cdp, sessionId, () => this.getContext()?.cdp === cdp)
         if (!ready) throw new Error('capture extension page did not load')
-        this.transition({ event: 'capture-page', source: 'capture', branch: 'created' })
+        this.transition({ event: 'capture-page', origin: 'internal', source: 'capture', branch: 'created' })
       }
       return sessionId
     } catch (err) {
@@ -377,7 +377,7 @@ export class CaptureKeepAlive {
   private async release(reason: string): Promise<void> {
     const cdp = this.cdp
     this.active = null
-    this.transition({ event: 'capture-release', source: 'capture', branch: reason })
+    this.transition({ event: 'capture-release', origin: 'internal', source: 'capture', branch: reason })
     debug(`capture keep-alive release (${reason})`)
     const page = this.capturePage
     if (cdp && page && page.cdp === cdp) await this.stopStream(cdp, page.sessionId)

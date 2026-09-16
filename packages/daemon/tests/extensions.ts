@@ -83,7 +83,7 @@ async function main() {
     console.log(`extension registered: ${added.extension.name}`)
 
     // 2. launch with the extension
-    const launched = await post('/api/launch', { url: `http://127.0.0.1:${SITE_PORT}/` })
+    const launched = await post('/api/launch', { url: `http://127.0.0.1:${SITE_PORT}/`, source: 'test.extensions.launch' })
     if (!launched.ok) throw new Error(`launch failed: ${JSON.stringify(launched)} (Chromium download may have failed)`)
     console.log(`browser pid=${launched.pid} binary supports --load-extension`)
 

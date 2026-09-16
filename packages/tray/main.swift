@@ -43,17 +43,6 @@ func requestBody(_ source: String, extra: [String: Any] = [:]) -> String {
   return String(data: data, encoding: .utf8) ?? "{}"
 }
 
-/// True when the daemon's status reports a daemon-internal native activation
-/// around `observedAt` (capture picker). Such an activation is not a user
-/// Dock/launcher request and must not restore a background-collapsed session.
-func internalActivation(_ obj: [String: Any]?, observedAt: Double) -> Bool {
-  guard let info = obj?["internal"] as? [String: Any] else { return false }
-  if info["active"] as? Bool == true { return true }
-  guard let from = info["from"] as? Double else { return false }
-  let to = info["to"] as? Double ?? Date().timeIntervalSince1970 * 1000
-  return observedAt >= from - 250 && observedAt <= to + 250
-}
-
 /// Brand artwork first (matches the app/Dock icon), SF Symbol as fallback if
 /// the managed engine is not installed under this data root.
 func brandImage() -> NSImage? {
@@ -150,9 +139,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let pid = browser["pid"] as? Int else { return }
         if isManagedApp(app, browser: browser) {
           DispatchQueue.main.async {
-            // Capture/daemon-internal activation is not a user request: keep a
-            // recently collapsed background session collapsed.
-            if internalActivation(obj, observedAt: observedAt) { return }
+            // The daemon owns attribution and logs every auto request
+            // (accepted or ignored:internal-activation/explicit-in-flight);
+            // posting unconditionally keeps every OS-observed activation
+            // directly traceable instead of silently dropped here.
             self?.restoringUntil = Date().addingTimeInterval(3)
             let activate = Int(app.processIdentifier) == pid
             apiPost("/api/show", body: requestBody(autoSource, extra: [
@@ -205,9 +195,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               isManagedApp(frontmost, browser: browser) else { return }
         let observedAt = Date().timeIntervalSince1970 * 1000
         if Int(frontmost.processIdentifier) != pid {
-          // Never let this reconciliation override a recent explicit bg when
-          // the activation was daemon-internal (capture picker).
-          if internalActivation(obj, observedAt: observedAt) { return }
+          // Daemon-owned gate: the request is always posted and the daemon
+          // logs whether it applied or was ignored (internal-activation /
+          // explicit-in-flight), so every OS-observed activation is traceable.
           self.restoringUntil = Date().addingTimeInterval(3)
           apiPost("/api/show", body: requestBody("tray.auto.poll", extra: ["observedAt": observedAt]))
           return

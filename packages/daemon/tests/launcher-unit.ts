@@ -396,10 +396,14 @@ function loginHarness() {
     intents: [] as any[],
     beginControl: () => 7,
     controlGen: () => 7,
-    noteExplicitIntent(kind: string, meta: any) { this.intents.push({ kind, ...meta }); return { kind, ...meta } },
+    noteExplicitIntent(kind: string, meta: any) { this.intents.push({ kind, ...meta }); return { kind, origin: 'explicit', token: 'i1', ...meta } },
+    noteIntent(origin: string, kind: string, meta: any) { this.intents.push({ kind, origin, ...meta }); return { kind, origin, token: 'i1', ...meta } },
+    completeIntent() {},
+    intentRef: () => ({ origin: 'explicit', token: 'i1' }),
     lastIntent: () => null,
     internalState: () => null,
     shouldIgnoreAutoShow: () => false,
+    autoShowSkipReason: () => null,
     start() { this.starts++ },
     async restoreAll(maximize: boolean) { state.restores.push(maximize); return 3 },
     isControlCurrent: () => true,
@@ -431,7 +435,7 @@ function loginHarness() {
 
 const harness = loginHarness()
 const baseUrl = await new Promise<string>(r => harness.server.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${(harness.server.address() as any).port}`)))
-const login = () => fetch(`${baseUrl}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).then(async r => ({ status: r.status, body: await r.json() as any }))
+const login = () => fetch(`${baseUrl}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source: 'cli.login' }) }).then(async r => ({ status: r.status, body: await r.json() as any }))
 
 function setSettingsBrowser(value: string) {
   write(path.join(home, 'settings.json'), JSON.stringify({ browser: value }))

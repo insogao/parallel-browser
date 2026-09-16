@@ -51,7 +51,7 @@ async function main() {
   daemon.unref()
   try {
     await waitApi(10_000)
-    const launched = await apiPost('/api/launch', { url: PAGE_HTML('tab1'), keepVisible: true })
+    const launched = await apiPost('/api/launch', { url: PAGE_HTML('tab1'), keepVisible: true, source: 'test.supervisor.launch' })
     if (!launched.ok) throw new Error(`launch failed: ${JSON.stringify(launched)}`)
 
     const version = await fetchVersion(launched.upstreamPort)
@@ -80,7 +80,7 @@ async function main() {
 
     // 1. collapse (native minimize by default) → capture keep-alive engages →
     //    NATIVE full speed while invisible
-    await apiPost('/api/bg', {})
+    await apiPost('/api/bg', { source: 'test.supervisor.bg' })
     const t0 = Date.now()
     let minimized = false
     while (Date.now() - t0 < 5000) {
@@ -117,7 +117,7 @@ async function main() {
     console.log(`minimized screenshot: ${typeof shot === 'string' ? shot : `${(shot as any).data.length} bytes in ${shotMs}ms`}`)
 
     // 2. restore: native un-minimize (same as dock-click)
-    await apiPost('/api/restore', {})
+    await apiPost('/api/restore', { source: 'test.supervisor.restore' })
     await sleep(800)
     const w3 = await apiGet('/api/windows')
     const win3 = (w3.windows ?? []).find((x: any) => x.windowId === windowId)

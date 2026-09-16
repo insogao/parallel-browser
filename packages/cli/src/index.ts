@@ -147,6 +147,7 @@ async function main() {
       if (args.flags.has('bare')) body.bare = true
       if (args.flags.has('focus')) body.focus = true
       if (args.flags.has('keep-visible')) body.keepVisible = true
+      body.source = 'cli.launch'
       const res = await api(info, '/api/launch', { method: 'POST', body: JSON.stringify(body) })
       console.log(`browser launched: pid=${res.pid} upstream=${res.upstreamPort} version=${res.version}`)
       if (!args.flags.has('focus') && !args.flags.has('keep-visible')) {
@@ -269,7 +270,7 @@ async function main() {
       if (sub === 'dev') {
         const name = args._[2], url = args._[3]
         if (!name || !url) throw new Error('usage: backlight ext dev <名称> <url>')
-        const res = await api(info, '/api/extensions/dev', { method: 'POST', body: JSON.stringify({ name, url, maximize: args.flags.has('maximize') }) })
+        const res = await api(info, '/api/extensions/dev', { method: 'POST', body: JSON.stringify({ name, url, maximize: args.flags.has('maximize'), source: 'cli.ext.dev' }) })
         console.log(`网页与侧栏已打开。网页: ${res.targetId}  侧栏: ${res.panelTargetId}`)
         console.log(`调试侧栏: bl inspect ${res.panelTargetId}`)
       } else if (sub === 'reload') {
@@ -314,7 +315,7 @@ async function main() {
       const targetId = args._[1]
       if (!targetId) throw new Error('usage: backlight inspect <targetId> (see bl targets)')
       const info = readDaemonInfo(); if (!info) throw new Error('daemon not running')
-      await api(info, '/api/inspect', { method: 'POST', body: JSON.stringify({ targetId }) })
+      await api(info, '/api/inspect', { method: 'POST', body: JSON.stringify({ targetId, source: 'cli.inspect' }) })
       console.log('DevTools 已打开；原网页和侧栏保持打开。')
       return
     }

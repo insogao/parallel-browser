@@ -17,6 +17,8 @@ test('sanitize keeps only allowlisted keys and drops content-bearing fields', ()
     event: 'window-minimize',
     windowId: 7,
     gen: 3,
+    origin: 'explicit',
+    token: 'i4',
     source: 'capture',
     before: 'normal',
     after: 'minimized',
@@ -27,7 +29,12 @@ test('sanitize keeps only allowlisted keys and drops content-bearing fields', ()
     title: 'Private tab title',
     nested: { profile: '/Users/me/Library' },
   } as any)
-  assert.deepEqual(Object.keys(entry).sort(), ['after', 'at', 'before', 'branch', 'event', 'gen', 'source', 'windowId'].sort())
+  assert.deepEqual(
+    Object.keys(entry).sort(),
+    ['after', 'at', 'before', 'branch', 'event', 'gen', 'origin', 'source', 'token', 'windowId'].sort(),
+  )
+  assert.equal(entry.origin, 'explicit')
+  assert.equal(entry.token, 'i4')
   assert.equal((entry as any).url, undefined)
   assert.equal((entry as any).cookie, undefined)
   assert.equal((entry as any).title, undefined)

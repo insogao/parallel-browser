@@ -81,7 +81,7 @@ async function main() {
     // Visible window: the proxy is under test here, and Page.captureScreenshot
     // needs a compositor frame. Cornered background windows produce no frames,
     // so background capture is covered by spike's capture keep-alive scenario.
-    const launched = await apiPost('/api/launch', { url: PAGE, keepVisible: true })
+    const launched = await apiPost('/api/launch', { url: PAGE, keepVisible: true, source: 'test.agent.launch' })
     if (!launched.ok) throw new Error(`launch failed: ${JSON.stringify(launched)}`)
 
     // ---- the AI tool connects THROUGH THE PROXY ----

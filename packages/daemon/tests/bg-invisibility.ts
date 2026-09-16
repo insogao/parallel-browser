@@ -134,7 +134,7 @@ let samplerRunning = false
 try {
   await waitFor(async () => !!(await api('status')).daemon, 'daemon startup', 15_000)
   await api('settings', { captureKeepAlive: true, backgroundMode: true, collapseMode: 'minimize', pumpFps: 1 })
-  await api('launch', { url: siteUrl, keepVisible: true })
+  await api('launch', { url: siteUrl, keepVisible: true, source: 'probe.bg-invisibility.launch' })
   const status = await api('status')
   const pid = status.browser.pid as number
   assert.ok(pid > 0, 'managed browser pid unavailable')
@@ -211,6 +211,13 @@ try {
   assert.ok(!entries.some(e => e.event === 'internal-native'), 'capture must not trigger native activation intervals')
   assert.ok(entries.some(e => e.event === 'capture-started'), 'capture-started provenance missing')
   assert.ok(!JSON.stringify(entries).includes('http'), 'state log must not contain URLs')
+  // Release-gate audit: the explicit bg's minimize/hide transitions carry their source+token.
+  const bgMinimize = entries.filter(e => e.event === 'window-minimize' && e.source === 'probe.explicit.bg')
+  assert.ok(bgMinimize.length > 0 && bgMinimize.every(e => typeof e.token === 'string'),
+    `explicit bg minimize transitions need source+token: ${JSON.stringify(bgMinimize)}`)
+  const bgHide = entries.filter(e => e.event === 'native-hide' && e.source === 'probe.explicit.bg')
+  assert.ok(bgHide.length > 0 && bgHide.every(e => e.token === bgMinimize[0].token),
+    'native hide must share the bg token')
 
   // ---- an explicit show still works (login/show contract preserved) ---------
   await api('show', { maximize: true, activate: false, source: 'probe.explicit.show' })
@@ -222,6 +229,15 @@ try {
   const restoredRaf = await rafRate(2_000)
   assert.ok(restoredRaf >= MIN_CAPTURE_NATIVE_PER_SEC, `restored native rAF ${restoredRaf}/s < ${MIN_CAPTURE_NATIVE_PER_SEC}`)
   console.log(`explicit show: maximized/on-screen, native rAF=${restoredRaf}/s`)
+
+  // Release-gate audit: the explicit show's restore transition is correlated.
+  const showEntries = (await api('state-log?limit=200')).entries as any[]
+  const showIntent = showEntries.find(e => e.event === 'control-intent' && e.branch === 'show' && e.source === 'probe.explicit.show')
+  assert.ok(showIntent && typeof showIntent.token === 'string', `show control-intent needs source+token: ${JSON.stringify(showIntent)}`)
+  assert.ok(showEntries.some(e => e.event === 'window-restore' && e.branch === 'maximize' && e.after === 'maximized' && e.token === showIntent.token),
+    'applied maximize must share the show token')
+  assert.ok(showEntries.some(e => e.event === 'native-unhide' && e.source === 'probe.explicit.show' && e.token === showIntent.token),
+    'native unhide must share the show token')
 
   console.log('\nPASS bg invisibility probe (isolated Backlight.app, temp home, random port)')
 } catch (err) {

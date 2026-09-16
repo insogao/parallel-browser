@@ -14,18 +14,39 @@ export interface WindowStateInfo {
 
 export interface WorkArea { al: number; at: number; ah: number }
 
+/** Who caused an operation. `explicit` requires a caller-provided source label;
+ * `auto` is an OS/tray reconciliation; `internal` is daemon-internal work;
+ * `unknown` means no evidence was provided — never silently treated as human. */
+export type IntentOrigin = 'explicit' | 'auto' | 'internal' | 'unknown'
+
 /** Explicit user/AI control intent. `bg` means "collapse and stay back" and is
  * the anchor for rejecting tray auto-show requests that are really reactions
  * to internal (capture-picker) native activation. */
 export interface ControlIntent {
   kind: 'bg' | 'show'
-  source: string
-  route: string
+  origin: IntentOrigin
+  /** unique token correlating every transition produced by this intent */
+  token: string
+  /** true until the operation applying the intent finishes (applied/failed) */
+  pending: boolean
+  source?: string
+  route?: string
   requestId?: string
   gen: number
   at: number
   /** internal native-activity sequence at the moment this intent was set */
   internalSeq: number
+}
+
+/** Correlation fields copied onto each transition; empty fields mean the
+ * evidence was absent (origin `unknown`), never an invented source. */
+export interface IntentRef {
+  origin: IntentOrigin
+  token?: string
+  source?: string
+  route?: string
+  requestId?: string
+  gen?: number
 }
 
 interface InternalWindow {
@@ -92,6 +113,9 @@ export class FramePumpSupervisor {
   onTransition: ((entry: TransitionEntry) => void) | null = null
   /** last explicit control intent; auto-show requests may not override 'bg' */
   private intentRecord: ControlIntent | null = null
+  /** every intent (any origin) keyed by its control generation, for correlation */
+  private intents = new Map<number, ControlIntent>()
+  private intentSeq = 0
   private internalSeq = 0
   private internalWindows: InternalWindow[] = []
 
@@ -104,27 +128,101 @@ export class FramePumpSupervisor {
     try { this.onTransition?.({ at: entry.at ?? Date.now(), ...entry }) } catch { /* logging is best effort */ }
   }
 
-  /** Record the latest explicit intent (menu/CLI/dashboard/launcher action). */
-  noteExplicitIntent(kind: 'bg' | 'show', meta: IntentMeta & { gen?: number } = {}): ControlIntent {
+  /** Intent correlation fields for transitions of `gen`; absent evidence stays absent. */
+  private refFields(gen?: number): { origin: string; token?: string; source?: string; route?: string; requestId?: string } {
+    const ref = this.intentRef(gen)
+    return { origin: ref.origin, token: ref.token, source: ref.source, route: ref.route, requestId: ref.requestId }
+  }
+
+  /**
+   * Record an intent with an explicit origin. Only `explicit` intents become
+   * the anchor for the auto-show gate; `auto`/`unknown` operations are logged
+   * but never silently promoted to human intent.
+   */
+  noteIntent(origin: IntentOrigin, kind: 'bg' | 'show', meta: IntentMeta & { gen?: number } = {}): ControlIntent {
+    const gen = meta.gen ?? this.controlGeneration
     const intent: ControlIntent = {
       kind,
-      source: meta.source ?? 'api',
-      route: meta.route ?? '',
+      origin,
+      token: `i${++this.intentSeq}`,
+      pending: true,
+      source: meta.source,
+      route: meta.route,
       requestId: meta.requestId,
-      gen: meta.gen ?? this.controlGeneration,
+      gen,
       at: Date.now(),
       internalSeq: this.internalSeq,
     }
-    this.intentRecord = intent
+    this.intents.set(gen, intent)
+    while (this.intents.size > 32) {
+      const oldest = this.intents.keys().next().value
+      if (oldest === undefined || oldest === gen) break
+      this.intents.delete(oldest)
+    }
+    if (origin === 'explicit') {
+      // Last explicit intent wins: a previous explicit intent that never
+      // completed (e.g. its route threw before completing) must not keep
+      // blocking auto reconciliation forever.
+      const previous = this.intentRecord
+      if (previous && previous.pending && previous.token !== intent.token) {
+        this.completeIntent(previous.token, 'superseded')
+      }
+      this.intentRecord = intent
+    }
     this.transition({
       event: 'control-intent',
       branch: kind,
+      origin,
+      token: intent.token,
       source: intent.source,
       route: intent.route,
       requestId: intent.requestId,
-      gen: intent.gen,
+      gen,
     })
     return intent
+  }
+
+  /** Explicit user/AI action (menu/CLI/dashboard/launcher). */
+  noteExplicitIntent(kind: 'bg' | 'show', meta: IntentMeta & { gen?: number } = {}): ControlIntent {
+    return this.noteIntent('explicit', kind, meta)
+  }
+
+  /** Mark an intent's operation finished so it stops blocking auto-show. */
+  completeIntent(token: string, outcome: 'applied' | 'failed' | 'superseded'): void {
+    for (const intent of this.intents.values()) {
+      if (intent.token !== token) continue
+      intent.pending = false
+      this.transition({
+        event: 'control-intent',
+        branch: 'complete',
+        origin: intent.origin,
+        token,
+        source: intent.source,
+        route: intent.route,
+        requestId: intent.requestId,
+        gen: intent.gen,
+        after: outcome,
+      })
+      return
+    }
+  }
+
+  /** Correlation fields for one generation; missing evidence stays missing. */
+  intentRef(gen?: number): IntentRef {
+    if (gen !== undefined) {
+      const found = this.intents.get(gen)
+      if (found) {
+        return {
+          origin: found.origin,
+          token: found.token,
+          source: found.source,
+          route: found.route,
+          requestId: found.requestId,
+          gen,
+        }
+      }
+    }
+    return { origin: 'unknown', gen }
   }
 
   lastIntent(): ControlIntent | null {
@@ -145,7 +243,7 @@ export class FramePumpSupervisor {
     this.internalSeq++
     this.internalWindows.push({ kind, seq: this.internalSeq, from: Date.now(), to: null })
     if (this.internalWindows.length > 16) this.internalWindows.shift()
-    this.transition({ event: 'internal-native', branch: 'begin', detail: kind, gen: this.controlGeneration })
+    this.transition({ event: 'internal-native', branch: 'begin', origin: 'internal', detail: kind, gen: this.controlGeneration })
     return this.internalSeq
   }
 
@@ -154,7 +252,7 @@ export class FramePumpSupervisor {
       const window = this.internalWindows[i]!
       if (window.kind === kind && window.to === null) {
         window.to = Date.now()
-        this.transition({ event: 'internal-native', branch: 'end', detail: kind, gen: this.controlGeneration })
+        this.transition({ event: 'internal-native', branch: 'end', origin: 'internal', detail: kind, gen: this.controlGeneration })
         return
       }
     }
@@ -180,10 +278,18 @@ export class FramePumpSupervisor {
   }
 
   /** Auto-show from the tray may not override a recent explicit bg when the
-   * activation it reacts to was generated by daemon-internal capture work. */
+   * activation it reacts to was generated by daemon-internal capture work, and
+   * it may never supersede an explicit intent that is still being applied. */
+  autoShowSkipReason(observedAt: number): 'internal-activation' | 'explicit-in-flight' | null {
+    const record = this.intentRecord
+    if (!record) return null
+    if (record.origin === 'explicit' && record.pending) return 'explicit-in-flight'
+    if (record.kind !== 'bg') return null
+    return this.isInternalActivationAt(observedAt) ? 'internal-activation' : null
+  }
+
   shouldIgnoreAutoShow(observedAt: number): boolean {
-    if (this.intentRecord?.kind !== 'bg') return false
-    return this.isInternalActivationAt(observedAt)
+    return this.autoShowSkipReason(observedAt) !== null
   }
 
   start(tickMs = 500) {
@@ -302,9 +408,14 @@ export class FramePumpSupervisor {
       try {
         const ok = mode === 'minimize'
           ? await this.minimizeWindow(ctx.cdp, windowId, appHidden, gen)
-          : await this.cornerWindow(ctx.cdp, windowId)
+          : await this.cornerWindow(ctx.cdp, windowId, gen)
         if (ok) n++
-      } catch { /* gone */ }
+      } catch (err) {
+        this.transition({
+          event: 'window-minimize', windowId, gen, ...this.refFields(gen),
+          after: 'error', branch: 'error', detail: (err as Error).message,
+        })
+      }
     }
     if (!this.isControlCurrent(gen)) {
       debug('collapse superseded by a newer control request')
@@ -329,6 +440,7 @@ export class FramePumpSupervisor {
    * Returns false if the window is gone, superseded, or never minimized.
    */
   async minimizeWindow(cdp: Cdp, windowId: number, settleRepeat = false, gen?: number): Promise<boolean> {
+    const ref = this.refFields(gen)
     const current = () => gen === undefined || this.isControlCurrent(gen)
     const cycles = settleRepeat ? 2 : 1
     let before: string | undefined
@@ -336,11 +448,17 @@ export class FramePumpSupervisor {
       if (!current()) return false
       const initial = await this.windowBounds(cdp, windowId)
       if (initial === null) {
-        this.transition({ event: 'window-minimize', windowId, gen, before, after: 'gone', branch: 'unreadable' })
+        this.transition({ event: 'window-minimize', windowId, gen, ...ref, before, after: 'gone', branch: 'unreadable' })
         return false
       }
       if (before === undefined) before = initial.windowState ?? 'unknown'
       if (!settleRepeat && initial.windowState === 'minimized') return true
+      // Record the requested transition BEFORE any side effect so a maximize /
+      // minimize observed in WindowServer can always be traced to an intent.
+      this.transition({
+        event: 'window-minimize', windowId, gen, ...ref, before,
+        branch: 'requested',
+      })
       // Settling to normal is required both to leave maximized/fullscreen and
       // to repair a falsely reported minimized state on a hidden app.
       if (initial.windowState !== 'normal') {
@@ -368,7 +486,7 @@ export class FramePumpSupervisor {
     if (final?.windowState !== 'minimized') debug(`window ${windowId}: minimize did not stick`)
     const minimized = final?.windowState === 'minimized'
     this.transition({
-      event: 'window-minimize', windowId, gen, before, after: final?.windowState ?? 'unreadable',
+      event: 'window-minimize', windowId, gen, ...ref, before, after: final?.windowState ?? 'unreadable',
       branch: !current() ? 'superseded' : minimized ? (settleRepeat ? 'settle-repeat' : 'single') : 'not-stuck',
     })
     return minimized
@@ -415,23 +533,32 @@ export class FramePumpSupervisor {
   }
 
   /** Move one window to the offscreen corner. Returns true if moved. */
-  async cornerWindow(cdp: Cdp, windowId: number): Promise<boolean> {
+  async cornerWindow(cdp: Cdp, windowId: number, gen?: number): Promise<boolean> {
+    const ref = this.refFields(gen)
     try {
       const { bounds } = await cdp.send<{ bounds: any }>('Browser.getWindowBounds', { windowId })
       if (this.collapsed.has(windowId)) return true
       const wa = await readWorkArea(cdp)
       const width = bounds.width ?? 1200
       const orig = { left: bounds.left ?? wa.al, top: bounds.top ?? wa.at, wasMinimized: (bounds.windowState ?? 'normal') === 'minimized' }
+      this.transition({
+        event: 'window-corner', windowId, gen, ...ref,
+        before: orig.wasMinimized ? 'minimized' : 'normal', branch: 'requested',
+      })
       await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
       await cdp.send('Browser.setWindowBounds', { windowId, bounds: { width, height: bounds.height ?? 800 } })
       const left = wa.al - (width - OFFSCREEN_MARGIN)
       const top = wa.at + wa.ah - OFFSCREEN_MARGIN
       await cdp.send('Browser.setWindowBounds', { windowId, bounds: { left, top } })
       this.collapsed.set(windowId, orig)
-      this.transition({ event: 'window-corner', windowId, before: orig.wasMinimized ? 'minimized' : 'normal', after: 'cornered', branch: 'corner' })
+      this.transition({ event: 'window-corner', windowId, gen, ...ref, before: orig.wasMinimized ? 'minimized' : 'normal', after: 'cornered', branch: 'corner' })
       log(`window ${windowId}: collapsed to corner (left=${left}, top=${top}, page keeps native full-speed)`)
       return true
     } catch (err) {
+      this.transition({
+        event: 'window-corner', windowId, gen, ...ref,
+        after: 'error', branch: 'error', detail: (err as Error).message,
+      })
       debug(`cornerWindow(${windowId}) failed: ${(err as Error).message}`)
       return false
     }
@@ -444,6 +571,7 @@ export class FramePumpSupervisor {
     const ctx = this.getContext()
     if (!ctx) return 0
     this.humanMode = true
+    const ref = this.refFields(gen)
     const wa = await readWorkArea(ctx.cdp)
     let n = 0
     for (const windowId of await this.collectWindowIds()) {
@@ -454,6 +582,9 @@ export class FramePumpSupervisor {
         const offscreen = bounds.left + bounds.width <= wa.al + 40 || bounds.top >= wa.at + wa.ah - 40
         const before = bounds.windowState ?? 'normal'
         if (bounds.windowState === 'minimized' || orig || offscreen || maximize) {
+          // Log the requested restore before any side effect; the applied /
+          // not-restored / superseded entry follows the actual outcome.
+          this.transition({ event: 'window-restore', windowId, gen, ...ref, before, branch: 'requested' })
           await ctx.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
           if (orig || offscreen) {
             const left = orig?.left ?? bounds.left
@@ -468,18 +599,24 @@ export class FramePumpSupervisor {
           // A newer intent may have superseded us during the bounded maximize
           // wait; never count a stale restore.
           if (!this.isControlCurrent(gen)) {
-            this.transition({ event: 'window-restore', windowId, gen, before, after: 'superseded', branch: 'maximize-wait' })
+            this.transition({ event: 'window-restore', windowId, gen, ...ref, before, after: 'superseded', branch: 'maximize-wait' })
             break
           }
           this.collapsed.delete(windowId)
           if (restored) {
             n++
-            this.transition({ event: 'window-restore', windowId, gen, before, after: maximize ? 'maximized' : 'normal', branch: maximize ? 'maximize' : 'unminimize' })
+            this.transition({ event: 'window-restore', windowId, gen, ...ref, before, after: maximize ? 'maximized' : 'normal', branch: maximize ? 'maximize' : 'unminimize' })
           } else {
-            this.transition({ event: 'window-restore', windowId, gen, before, after: 'not-restored', branch: 'maximize' })
+            this.transition({ event: 'window-restore', windowId, gen, ...ref, before, after: 'not-restored', branch: 'maximize' })
           }
         }
-      } catch (err) { debug(`restore window ${windowId}: ${(err as Error).message}`) }
+      } catch (err) {
+        this.transition({
+          event: 'window-restore', windowId, gen, ...ref,
+          after: 'error', branch: 'error', detail: (err as Error).message,
+        })
+        debug(`restore window ${windowId}: ${(err as Error).message}`)
+      }
     }
     log(`restored ${n} window(s)`)
     return n

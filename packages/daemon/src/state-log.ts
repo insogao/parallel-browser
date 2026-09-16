@@ -13,6 +13,10 @@ export interface TransitionEntry {
   at: number
   /** e.g. control-intent, window-minimize, native-hide, capture-cleanup */
   event: string
+  /** who caused the transition: explicit | auto | internal | unknown */
+  origin?: string
+  /** common intent token correlating one intent with all of its transitions */
+  token?: string
   /** e.g. POST /api/bg */
   route?: string
   /** caller label: cli.bg, tray.menu.show, tray.auto.activate, dashboard, capture */
@@ -37,7 +41,7 @@ const MAX_LIMIT = 256
 const STRING_LIMIT = 80
 const DETAIL_LIMIT = 160
 
-const STRING_KEYS = ['event', 'route', 'source', 'requestId', 'before', 'after', 'branch', 'detail'] as const
+const STRING_KEYS = ['event', 'origin', 'token', 'route', 'source', 'requestId', 'before', 'after', 'branch', 'detail'] as const
 const NUMBER_KEYS = ['at', 'gen', 'windowId', 'pid'] as const
 
 /** anything that looks like a locator is replaced before it can be persisted */

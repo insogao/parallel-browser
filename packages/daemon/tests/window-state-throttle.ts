@@ -256,7 +256,7 @@ try {
   await waitFor(async () => !!(await api('status')).daemon, 'daemon startup', 15_000)
   // Production capture keep-alive path; single minimize observation window.
   await api('settings', { captureKeepAlive: true, backgroundMode: true, collapseMode: 'minimize', pumpFps: 10 })
-  await api('launch', { url: siteUrl, keepVisible: true })
+  await api('launch', { url: siteUrl, keepVisible: true, source: 'probe.window-state.launch' })
   const status = await api('status')
   pid = status.browser.pid
   assert.ok(pid > 0, `managed browser pid unavailable: ${JSON.stringify(status.browser)}`)
@@ -269,7 +269,7 @@ try {
   session = await cdp.attach(targetId)
   ;({ windowId } = await cdp.send<{ windowId: number }>('Browser.getWindowForTarget', { targetId }))
   await waitFor(async () => !!(await readCounters().catch(() => null)), 'health injection lands', 15_000)
-  await api('show', { maximize: true, activate: false })
+  await api('show', { maximize: true, activate: false, source: 'probe.window-state.show' })
   await waitFor(async () => (await cdpWindowState()) === 'maximized', 'show --maximize reaches CDP maximized')
 
   T0 = Date.now()
@@ -298,7 +298,7 @@ try {
 
   // ---- minimize once -------------------------------------------------------
   const bgRequestedAt = Date.now() - T0
-  await api('bg', {})
+  await api('bg', { source: 'probe.window-state.bg' })
   // Capture is pre-armed inside /api/bg while the window is still visible (the
   // only state in which Chrome establishes real capture frames); it must be
   // armed for the probe target before the route returns.
@@ -334,6 +334,21 @@ try {
   const stateEntries = (await api('state-log?limit=200')).entries as any[]
   assert.ok(!stateEntries.some(e => e.event === 'capture-window'),
     `capture must not record window mutations: ${JSON.stringify(stateEntries.filter(e => e.event === 'capture-window'))}`)
+  // Release-gate audit: every actual minimize/native-hide transition of the
+  // explicit bg must carry its source, route and correlation token directly.
+  const bgIntent = stateEntries.find(e => e.event === 'control-intent' && e.branch === 'bg')
+  assert.ok(bgIntent && bgIntent.source === 'probe.window-state.bg' && typeof bgIntent.token === 'string',
+    `bg control-intent must carry source+token: ${JSON.stringify(bgIntent)}`)
+  const bgToken = bgIntent.token
+  for (const event of ['capture-prearm', 'window-minimize', 'native-hide']) {
+    const matching = stateEntries.filter(e => e.event === event)
+    assert.ok(matching.length > 0, `${event} provenance missing`)
+    assert.ok(matching.every(e => e.source === 'probe.window-state.bg' && e.token === bgToken),
+      `${event} entries must share the bg source+token: ${JSON.stringify(matching)}`)
+  }
+  assert.ok(stateEntries.some(e => e.event === 'window-minimize' && e.branch === 'requested'),
+    'a pre-side-effect window-minimize request entry is required')
+  assert.ok(!JSON.stringify(stateEntries).includes('http'), 'state log must not contain URLs')
 
   // ---- single minimized observation window ---------------------------------
   await sleep(HIDDEN_OBSERVE_MS)
@@ -363,7 +378,7 @@ try {
 
   // ---- restore/maximize once ----------------------------------------------
   const restoreRequestedAt = Date.now() - T0
-  await api('show', { maximize: true, activate: false })
+  await api('show', { maximize: true, activate: false, source: 'probe.window-state.show' })
   await waitFor(() => {
     const recent = sliceWindow(samples, restoreRequestedAt, Date.now() - T0)
     return recent.some(s => s.cdpWindowState === 'maximized' && s.nativeAppHidden === false
@@ -386,6 +401,17 @@ try {
   assert.ok(recoveryObserved.nativeRate !== null && recoveryObserved.nativeRate >= MIN_VISIBLE_NATIVE_PER_SEC,
     `restored native compositor rAF/s ${fmt(recoveryObserved.nativeRate)} < ${MIN_VISIBLE_NATIVE_PER_SEC}`)
   console.log(`PASS restored/maximized: native compositor rAF recovers to ${fmt(recoveryObserved.nativeRate)}/s`)
+
+  // Release-gate audit: the explicit show's maximize+foreground transitions
+  // must be directly attributable to its source (same token, before+after).
+  const showEntries = (await api('state-log?limit=200')).entries as any[]
+  const showIntent = showEntries.find(e => e.event === 'control-intent' && e.branch === 'show' && e.source === 'probe.window-state.show')
+  assert.ok(showIntent && typeof showIntent.token === 'string', `show control-intent must carry source+token: ${JSON.stringify(showIntent)}`)
+  const requestedRestore = showEntries.find(e => e.event === 'window-restore' && e.branch === 'requested' && e.token === showIntent.token)
+  const appliedMaximize = showEntries.find(e => e.event === 'window-restore' && e.branch === 'maximize' && e.after === 'maximized' && e.token === showIntent.token)
+  assert.ok(requestedRestore, 'pre-side-effect window-restore request entry missing')
+  assert.ok(appliedMaximize, 'applied maximize entry missing or not correlated')
+  assert.ok(requestedRestore.windowId === windowId, 'window-restore entries must carry windowId')
 
   console.log(`\nPASS window-state throttle acceptance (Backlight.app, pid=${pid}, target=${targetId.slice(0, 8)}, window=${windowId})`)
 } catch (err) {

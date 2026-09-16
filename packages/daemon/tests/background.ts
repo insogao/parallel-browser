@@ -47,7 +47,7 @@ async function main() {
   daemon.unref()
   try {
     await waitApi(10_000)
-    const launched = await apiPost('/api/launch', { url: PAGE('bg1') })
+    const launched = await apiPost('/api/launch', { url: PAGE('bg1'), source: 'test.background.launch' })
     if (!launched.ok) throw new Error(`launch failed: ${JSON.stringify(launched)}`)
 
     // wait for auto-collapse: every window must reach the offscreen corner
@@ -83,7 +83,7 @@ async function main() {
     console.log(`after /api/open windows still cornered: ${stillCornered}`)
 
     // show: windows come back
-    await apiPost('/api/show', {})
+    await apiPost('/api/show', { source: 'test.background.show' })
     await sleep(1200)
     const w3 = await apiGet('/api/windows')
     const restored = (w3.windows ?? []).length > 0 && (w3.windows ?? []).every((x: any) => !x.cornered && x.state === 'normal')

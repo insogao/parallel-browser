@@ -84,7 +84,7 @@ async function attachPage(upstreamPort: number) {
 async function runSpike() {
   // no pump interference; we measure shim + corner behaviour directly
   await post('/api/settings', { backgroundMode: false, captureKeepAlive: false })
-  const launched = await post('/api/launch', { url: PAGE_HTML, keepVisible: true })
+  const launched = await post('/api/launch', { url: PAGE_HTML, keepVisible: true, source: 'test.spike.launch' })
   if (!launched.ok) throw new Error(`launch failed: ${JSON.stringify(launched)}`)
   console.log(`browser pid=${launched.pid} (window visible ~2s baseline, then collapsed/minimized)`)
 
@@ -129,10 +129,10 @@ async function runSpike() {
   // The helper extension is loaded at launch; /api/bg pre-arms the capture
   // while the window is visible (the only state that establishes real frames),
   // so restore visibility first, then collapse with capture already active.
-  await post('/api/show', { activate: false })
+  await post('/api/show', { activate: false, source: 'test.spike.show' })
   await sleep(1500)
   await post('/api/settings', { captureKeepAlive: true })
-  await post('/api/bg', {})
+  await post('/api/bg', { source: 'test.spike.bg' })
   const t0 = Date.now()
   let capEngaged = false
   while (Date.now() - t0 < 20000) {
