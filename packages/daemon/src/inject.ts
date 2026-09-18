@@ -1,6 +1,7 @@
 import type { Cdp } from './cdp.ts'
 import { loadSettings } from './store.ts'
 import { debug } from './log.ts'
+import { isWindowlessPage } from './window-open.ts'
 
 /**
  * Injected into every page: health counters (rAF / timer / visibility) and the
@@ -190,7 +191,7 @@ export class HealthMonitor {
     try {
       const { cdp } = ctx
       const { targetInfos } = await cdp.send<{ targetInfos: any[] }>('Target.getTargets')
-      for (const page of targetInfos.filter(t => t.type === 'page' && !/^(chrome|devtools):|^chrome-extension:/.test(t.url))) {
+      for (const page of targetInfos.filter(t => (t.type === 'page' || isWindowlessPage(cdp, t.targetId)) && !/^(chrome|devtools):|^chrome-extension:/.test(t.url))) {
         if (this.sessions.has(page.targetId)) continue
         try {
           const sessionId = await cdp.attach(page.targetId)
@@ -208,6 +209,17 @@ export class HealthMonitor {
     } catch { /* ignore */ } finally {
       this.registering = false
     }
+  }
+
+  /**
+   * Force one registration+sampling pass. Needed right after a fresh real
+   * window is created: capture pre-arm needs the target to be visible in the
+   * health snapshot while the window is still on screen (arming after
+   * minimization grants the rAF exemption but no real frames).
+   */
+  async refresh(): Promise<void> {
+    await this.register()
+    await this.tick()
   }
 
   snapshot(): TargetHealth[] {
@@ -233,7 +245,7 @@ export class HealthMonitor {
       const { targetInfos } = await cdp.send<{ targetInfos: Array<{ targetId: string; type: string; title: string; url: string }> }>(
         'Target.getTargets',
       )
-      const pages = targetInfos.filter(t => t.type === 'page' && !/^(chrome|devtools):|^chrome-extension:/.test(t.url))
+      const pages = targetInfos.filter(t => (t.type === 'page' || isWindowlessPage(cdp, t.targetId)) && !/^(chrome|devtools):|^chrome-extension:/.test(t.url))
       const alive = new Set(pages.map(p => p.targetId))
       for (const id of [...this.sessions.keys()]) {
         if (!alive.has(id)) this.sessions.delete(id)

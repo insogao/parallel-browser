@@ -279,9 +279,19 @@ export class BrowserManager {
       // background mode: open initial url(s) as background targets, then collapse
       // any on-screen window as fast as possible (frame pump keeps pages fast)
       if (backgroundLaunch) {
+        // With --no-startup-window, creating the first target can materialize
+        // an on-screen normal window. Hide the app before that operation;
+        // hiding only after autoCollapse allows a visible flash on macOS.
+        if (this.deps.hideApp) await this.deps.hideApp(realPid)
         if (opts.url) {
-          await cdp.send('Target.createTarget', { url: opts.url, background: true }).catch((e) =>
-            warn(`background target failed: ${e.message}`))
+          // Reuse a restored window (normal background tab, same window).
+          // With zero windows the first real tab creates the managed window;
+          // the product trade-off (2026-09-17) accepts that macOS may show it
+          // once, and autoCollapse+hideApp below put it straight back into the
+          // background. This path is only reached by an explicit manager
+          // restart; user-facing background opens go through the tracked
+          // managed-window route (proxy.ts), which also settles capture.
+          await cdp.send('Target.createTarget', { url: opts.url, background: true })
         }
         await this.autoCollapse(cdp)
         // A background launch must also be natively hidden: macOS may relaunch a
@@ -317,6 +327,11 @@ export class BrowserManager {
       for (const windowId of ids) {
         if (done.has(windowId)) continue
         try {
+          const { bounds } = await cdp.send<{ bounds: { windowState?: string } }>('Browser.getWindowBounds', { windowId })
+          if (bounds.windowState === 'minimized') {
+            done.add(windowId)
+            continue
+          }
           if (this.deps.cornerWindow && await this.deps.cornerWindow(cdp, windowId)) {
             done.add(windowId)
             continue

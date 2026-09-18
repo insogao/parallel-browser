@@ -26,6 +26,8 @@ export interface TransitionEntry {
   gen?: number
   windowId?: number
   pid?: number
+  /** managed browser session id (session.ts); attributes every entry point */
+  session?: string
   /** state before the transition, e.g. minimized / normal / hidden / visible */
   before?: string
   /** state after the transition */
@@ -41,7 +43,7 @@ const MAX_LIMIT = 256
 const STRING_LIMIT = 80
 const DETAIL_LIMIT = 160
 
-const STRING_KEYS = ['event', 'origin', 'token', 'route', 'source', 'requestId', 'before', 'after', 'branch', 'detail'] as const
+const STRING_KEYS = ['event', 'origin', 'token', 'route', 'source', 'requestId', 'session', 'before', 'after', 'branch', 'detail'] as const
 const NUMBER_KEYS = ['at', 'gen', 'windowId', 'pid'] as const
 
 /** anything that looks like a locator is replaced before it can be persisted */

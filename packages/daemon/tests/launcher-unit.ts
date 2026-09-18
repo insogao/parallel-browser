@@ -405,6 +405,7 @@ function loginHarness() {
     shouldIgnoreAutoShow: () => false,
     autoShowSkipReason: () => null,
     start() { this.starts++ },
+    async windowStates() { return [{ windowId: 1, state: 'normal' }] },
     async restoreAll(maximize: boolean) { state.restores.push(maximize); return 3 },
     isControlCurrent: () => true,
   }
@@ -547,6 +548,31 @@ test('a failed launch restores prior control/capture state', async () => {
   } finally {
     harness.manager.launch = originalLaunch
   }
+})
+
+test('login with a live zero-window browser creates one manual tab without relaunch', async () => {
+  setSettingsBrowser(engine.bin)
+  const created: any[] = []
+  const originalStates = harness.supervisor.windowStates
+  harness.state.running = true
+  harness.state.current = { binary: engine.bin, pid: 4321, cdp: {
+    send: async (method: string, params: any) => {
+      created.push({ method, params })
+      if (method === 'Browser.getWindowForTarget') return { windowId: 7 }
+      return { targetId: 'manual' }
+    },
+  } }
+  harness.supervisor.windowStates = async () => []
+  const launches = harness.state.launches.length
+  try {
+    const res = await login()
+    assert.equal(res.status, 200)
+    assert.equal(harness.state.launches.length, launches)
+    assert.deepEqual(created, [
+      { method: 'Target.createTarget', params: { url: 'about:blank', background: false } },
+      { method: 'Browser.getWindowForTarget', params: { targetId: 'manual' } },
+    ])
+  } finally { harness.supervisor.windowStates = originalStates }
 })
 
 test('uninstallLauncher removes only our launcher by default', async () => {

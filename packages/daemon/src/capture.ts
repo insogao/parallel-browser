@@ -1,4 +1,5 @@
 import type { Cdp } from './cdp.ts'
+import { isWindowlessPage } from './window-open.ts'
 import type { TargetHealth } from './inject.ts'
 import { loadSettings } from './store.ts'
 import { debug, log, warn } from './log.ts'
@@ -160,7 +161,11 @@ export class CaptureKeepAlive {
       // grants is exactly what we want, and re-arming is expensive
       if (this.active) {
         const me = this.getHealth().find(t => t.targetId === this.active!.targetId)
-        if (!me) await this.release('target gone')
+        if (!me) { await this.release('target gone'); return }
+        // A closed/crashed capture page silently kills the exemption. Detect it
+        // and release so the next tick re-arms (and re-creates the hidden page)
+        // instead of leaving the captured target throttled forever.
+        if (!(await this.capturePageAlive(ctx.cdp))) await this.release('capture page gone')
         return
       }
 
@@ -190,6 +195,7 @@ export class CaptureKeepAlive {
 
   /** Targets that may consume the single capture slot (never internal pages). */
   private isCapturable(target: TargetHealth, ctx: CaptureKeepAliveContext): boolean {
+    if (isWindowlessPage(ctx.cdp, target.targetId)) return false
     if (this.capturePage && target.targetId === this.capturePage.targetId) return false
     if (ctx.capturePageUrl && target.url.startsWith(ctx.capturePageUrl)) return false
     if (target.url.includes('/controller')) return false
@@ -309,37 +315,75 @@ export class CaptureKeepAlive {
     warn(`${message}; failure #${this.failures}`)
   }
 
-  /** Reuse or create the hidden extension page; never activates it. */
+  /**
+   * Capture-page targets are created with `hidden: true`; Chrome reports them
+   * via `Target.getTargets` as `type: 'other'` (measured on CfT 153), while
+   * older/visible targets are `type: 'page'`. Both are ours.
+   */
+  private isCapturePageTarget(t: { type?: string; url?: string }, pageUrl: string): boolean {
+    return (t.type === 'page' || t.type === 'other')
+      && typeof t.url === 'string' && t.url.startsWith(pageUrl)
+  }
+
+  /** True while the tracked capture page target still exists. A failed probe
+   * never counts as death (no flapping on a transient CDP error). */
+  private async capturePageAlive(cdp: Cdp): Promise<boolean> {
+    const page = this.capturePage
+    if (!page || page.cdp !== cdp) return false
+    try {
+      const { targetInfos } = await this.send<{ targetInfos: any[] }>(cdp, 'Target.getTargets')
+      return targetInfos.some(t => t.targetId === page.targetId && (t.type === 'page' || t.type === 'other'))
+    } catch {
+      return true
+    }
+  }
+
+  /**
+   * Reuse or create the capture extension page; never activates it and never
+   * puts it in the window's tab strip.
+   *
+   * U3 (2026-09-17): `background: true` alone keeps the tab inactive at create
+   * time but still inserts it into the tab strip. When the user/AI later closes
+   * the active tab, Chromium activates the next tab in the strip — measured:
+   * that next tab was `bl-capture` (ACTIVE) and stayed in front of the user.
+   * `hidden: true` creates a target observable via CDP but absent from the tab
+   * UI, so it can never be activated or shown; the capture (tabCapture via a
+   * hidden extension page) still works. If the engine rejects `hidden`, the
+   * keep-alive fails closed: no visible fallback tab is ever created.
+   */
   private async ensureCapturePage(cdp: Cdp, pageUrl: string): Promise<string | null> {
     if (this.capturePage && this.capturePage.cdp === cdp) {
       try {
         const { targetInfos } = await this.send<{ targetInfos: any[] }>(cdp, 'Target.getTargets')
-        const alive = targetInfos.some(t => t.targetId === this.capturePage!.targetId && t.type === 'page')
+        const alive = targetInfos.some(t => t.targetId === this.capturePage!.targetId && (t.type === 'page' || t.type === 'other'))
         if (alive) return this.capturePage.sessionId
       } catch { /* probe failed: recreate below */ }
       this.capturePage = null
     }
+    let createdId: string | null = null
     try {
       const { targetInfos } = await this.send<{ targetInfos: any[] }>(cdp, 'Target.getTargets')
-      const existing = targetInfos.find(t => t.type === 'page' && typeof t.url === 'string' && t.url.startsWith(pageUrl))
-      let targetId = existing?.targetId
-      let created = false
-      if (!targetId) {
-        // background: true — new tab in the managed window, no activation,
-        // no window restore (verified: hidden/minimized stay untouched)
-        const createdTarget = await this.send<{ targetId: string }>(cdp, 'Target.createTarget', { url: pageUrl, background: true })
-        targetId = createdTarget.targetId
-        created = true
+      // A capture page left over from another CDP connection (or from a failed
+      // liveness probe) predates this connection's hidden-target invariant;
+      // close it instead of adopting it.
+      for (const existing of targetInfos.filter(t => this.isCapturePageTarget(t, pageUrl))) {
+        await this.send(cdp, 'Target.closeTarget', { targetId: existing.targetId }).catch(() => {})
       }
+      // hidden: true + background: true — invisible protocol-only target: not
+      // in the tab strip, cannot become the active tab, never reveals the
+      // window (verified against a minimized+hidden window; see U3 probe).
+      const createdTarget = await this.send<{ targetId: string }>(cdp, 'Target.createTarget', { url: pageUrl, background: true, hidden: true })
+      const targetId = createdTarget.targetId
+      createdId = targetId
       const sessionId = await bounded(cdp.attach(targetId))
       this.capturePage = { targetId, sessionId, cdp }
-      if (created) {
-        const ready = await this.waitForCaptureReady(cdp, sessionId, () => this.getContext()?.cdp === cdp)
-        if (!ready) throw new Error('capture extension page did not load')
-        this.transition({ event: 'capture-page', origin: 'internal', source: 'capture', branch: 'created' })
-      }
+      const ready = await this.waitForCaptureReady(cdp, sessionId, () => this.getContext()?.cdp === cdp)
+      if (!ready) throw new Error('capture extension page did not load')
+      this.transition({ event: 'capture-page', origin: 'internal', source: 'capture', branch: 'created' })
       return sessionId
     } catch (err) {
+      if (createdId) await this.send(cdp, 'Target.closeTarget', { targetId: createdId }).catch(() => {})
+      if (this.capturePage?.targetId === createdId) this.capturePage = null
       warn(`capture extension page failed: ${(err as Error).message}`)
       return null
     }

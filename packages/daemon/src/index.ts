@@ -11,6 +11,7 @@ import { createServer } from './proxy.ts'
 import { loadSettings } from './store.ts'
 import { error, initFileLogging, log } from './log.ts'
 import { StateTransitionLog } from './state-log.ts'
+import { browserSessionId } from './session.ts'
 import { FramePumpSupervisor } from './windows.ts'
 import { activateBrowser, browserAppState, hideBrowser, startTray, unhideBrowser } from './native.ts'
 import { acquireFileLock, readLiveDaemon, removeDaemonInfo, writeDaemonInfo } from './single-instance.ts'
@@ -67,7 +68,13 @@ async function main() {
     () => (manager.current ? { cdp: manager.current.cdp } : null),
     () => health.snapshot(),
   )
-  supervisor.onTransition = entry => stateLog.record(entry)
+  // Every transition from every source carries the managed session id, so
+  // Dock/launchpad/menu/API actions share one attribution vocabulary.
+  const record = (entry: Parameters<StateTransitionLog['record']>[0]) => {
+    const cur = manager.current
+    stateLog.record({ ...entry, session: entry.session ?? (cur ? browserSessionId(cur) : undefined) })
+  }
+  supervisor.onTransition = record
   const capture = new CaptureKeepAlive(
     () => (manager.current ? {
       cdp: manager.current.cdp,
@@ -76,7 +83,7 @@ async function main() {
     } : null),
     () => health.snapshot(),
     {
-      onTransition: entry => stateLog.record(entry),
+      onTransition: record,
     },
   )
   const extensionDev = new ExtensionDev(manager, extensions, bus)
@@ -114,6 +121,7 @@ async function main() {
     unhideBrowser,
     activateBrowser,
     stateLog,
+    sessionId: () => (manager.current ? browserSessionId(manager.current) : undefined),
   })
 
   extensions.startWatching((files) => {

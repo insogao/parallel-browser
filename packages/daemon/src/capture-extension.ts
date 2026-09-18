@@ -38,6 +38,12 @@ const CAPTURE_HTML = `<!doctype html>
 <script src="capture.js"></script></body></html>
 `
 
+// A short-lived, hidden extension document may create a minimized browser
+// window atomically through chrome.windows.create(). CDP Target.createTarget
+// with newWindow:true creates a second normal window on macOS when no browser
+// window exists, splitting the first and second AI tabs across windows.
+const WINDOW_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>bl-window-helper</title></head><body></body></html>\n`
+
 const CAPTURE_JS = `// Held by the daemon as a background page; never activated, never visible.
 window.__blCapture = null;
 window.__blCaptureState = { state: 'idle', error: null };
@@ -123,6 +129,7 @@ export function ensureCaptureExtension(): CaptureExtension | null {
     writeIfChanged(path.join(dir, 'manifest.json'), CAPTURE_MANIFEST)
     writeIfChanged(path.join(dir, 'capture.html'), CAPTURE_HTML)
     writeIfChanged(path.join(dir, 'capture.js'), CAPTURE_JS)
+    writeIfChanged(path.join(dir, 'window.html'), WINDOW_HTML)
     const real = fs.realpathSync(dir)
     const id = extensionIdForPath(real)
     return { dir: real, id, pageUrl: `chrome-extension://${id}/capture.html` }

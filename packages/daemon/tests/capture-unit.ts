@@ -13,6 +13,7 @@ function fixture(t: any, options: {
   /** value returned by window.captureLive() */
   live?: boolean
   health?: TargetHealth[]
+  legacyCaptureTargets?: string[]
   onTransition?: (entry: any) => void
 } = {}) {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
@@ -20,6 +21,7 @@ function fixture(t: any, options: {
   const calls: { method: string; params: any; session?: string }[] = []
   let hook: (method: string, params: any, session?: string) => any = () => undefined
   let capturePageExists = false
+  const legacyCaptureTargets = new Set(options.legacyCaptureTargets ?? [])
   let startResult = options.startResult ?? 'ok'
   let live = options.live ?? true
   let health: TargetHealth[] = options.health
@@ -33,14 +35,22 @@ function fixture(t: any, options: {
       if (intercepted !== undefined) return intercepted
       if (method === 'Target.getTargets') {
         return {
-          targetInfos: capturePageExists
-            ? [{ targetId: 'capture-page', type: 'page', url: CAPTURE_PAGE_URL }]
-            : [],
+          // Chrome reports hidden targets as type 'other' (CfT 153): the daemon
+          // must still recognize its own capture page for liveness/reuse.
+          targetInfos: [
+            ...(capturePageExists ? [{ targetId: 'capture-page', type: 'other', url: CAPTURE_PAGE_URL }] : []),
+            ...[...legacyCaptureTargets].map(targetId => ({ targetId, type: 'page', url: CAPTURE_PAGE_URL })),
+          ],
         }
       }
       if (method === 'Target.createTarget') {
         capturePageExists = true
         return { targetId: 'capture-page' }
+      }
+      if (method === 'Target.closeTarget') {
+        capturePageExists = false
+        legacyCaptureTargets.delete(params.targetId)
+        return {}
       }
       if (method === 'Runtime.evaluate') {
         const expression = String(params.expression)
@@ -79,6 +89,7 @@ function fixture(t: any, options: {
     setHook: (h: typeof hook) => { hook = h },
     setStartResult: (v: string) => { startResult = v },
     setHealth: (h: TargetHealth[]) => { health = h },
+    setCapturePageExists: (v: boolean) => { capturePageExists = v },
     restart: () => { cdp = { ...fake } as unknown as Cdp },
     advance: (ms: number) => { t.mock.timers.tick(ms) },
   }
@@ -93,6 +104,10 @@ test('capture engages through a hidden extension page with zero window/app opera
   const created = f.calls.find(c => c.method === 'Target.createTarget')
   assert.ok(created, 'capture page must be created')
   assert.equal(created.params.background, true, 'capture page must be a background target')
+  // U3: background alone still inserts a tab into the strip; when the active
+  // user tab closes, Chromium activates the next strip tab (measured: the
+  // capture page). hidden:true keeps it out of the tab UI entirely.
+  assert.equal(created.params.hidden, true, 'capture page must be a hidden target (never in the tab strip)')
   assert.equal(created.params.url, CAPTURE_PAGE_URL)
   // the manual-bg blocker: no native visibility operation may happen at all
   assert.deepEqual(f.windowOps(), [], 'capture setup must not touch windows, app visibility or tab activation')
@@ -245,4 +260,50 @@ test('prearm is a no-op while no capturable target is visible', async t => {
   await f.settle(f.capture.prearm())
   assert.equal(f.capture.activeTargetId(), null)
   assert.equal(f.calls.filter(c => c.method === 'Target.createTarget').length, 0)
+})
+
+test('a dead capture page is detected and re-created for the still-hidden target', async t => {
+  const transitions: any[] = []
+  const f = fixture(t, { onTransition: entry => transitions.push(entry) })
+  await f.arm()
+  assert.equal(f.capture.activeTargetId(), 'page')
+  const createdBefore = f.calls.filter(c => c.method === 'Target.createTarget').length
+  f.setCapturePageExists(false) // the hidden extension page died out-of-band
+  await f.settle(f.capture.tick())
+  assert.equal(f.capture.activeTargetId(), null, 'a dead capture page must release the stale capture')
+  assert.ok(transitions.some(e => e.event === 'capture-release' && e.branch === 'capture page gone'))
+  await f.settle(f.capture.tick())
+  assert.equal(f.capture.activeTargetId(), 'page', 'the still-hidden target is re-armed')
+  const createdAfter = f.calls.filter(c => c.method === 'Target.createTarget').length
+  assert.equal(createdAfter, createdBefore + 1, 'a fresh capture page is created')
+  assert.deepEqual(f.windowOps(), [], 're-creation must not touch windows or tab activation')
+})
+
+test('a browser that rejects hidden targets fails closed instead of creating a visible tab', async t => {
+  const transitions: any[] = []
+  const f = fixture(t, { onTransition: entry => transitions.push(entry) })
+  f.setHook((method, params) => {
+    if (method === 'Target.createTarget') {
+      assert.equal(params.hidden, true)
+      throw new Error('cdp Invalid parameters: hidden')
+    }
+    return undefined
+  })
+  await f.arm()
+  assert.equal(f.capture.activeTargetId(), null, 'no capture may be reported when the hidden page cannot be created')
+  const creates = f.calls.filter(c => c.method === 'Target.createTarget')
+  assert.ok(creates.length >= 1, 'the hidden create must have been attempted')
+  assert.ok(creates.every(c => c.params.hidden === true), 'no visible fallback tab may ever be created')
+  assert.ok(transitions.some(e => e.event === 'capture-failed'))
+  assert.deepEqual(f.windowOps(), [])
+})
+
+test('migration closes every old capture tab before creating the hidden page', async t => {
+  const f = fixture(t, { legacyCaptureTargets: ['legacy-1', 'legacy-2'] })
+  await f.arm()
+  const closed = f.calls.filter(c => c.method === 'Target.closeTarget').map(c => c.params.targetId)
+  assert.deepEqual(closed, ['legacy-1', 'legacy-2'])
+  const created = f.calls.find(c => c.method === 'Target.createTarget')
+  assert.equal(created?.params.hidden, true)
+  assert.equal(f.capture.activeTargetId(), 'page')
 })

@@ -19,6 +19,14 @@ import type { ControlIntent, FramePumpSupervisor, IntentOrigin, IntentRef } from
 import { TapState, tapFrame } from './tap.ts'
 import { log, debug } from './log.ts'
 import { StateTransitionLog, type TransitionEntry } from './state-log.ts'
+import {
+  closeWindowlessPage, openWindowlessPage, pendingWindowlessPages, windowlessCapability,
+} from './window-open.ts'
+import {
+  clearManagedWindow, firstDisplayUsed, managedWindow, markFirstDisplayUsed,
+  targetWindowId, trackManagedWindow, windowStillOpen,
+} from './managed-window.ts'
+import { browserSessionId } from './session.ts'
 
 /**
  * Known control surfaces that may ask for on-screen state (visible launch,
@@ -57,11 +65,32 @@ export interface ServerDeps {
   activateBrowser: (pid: number) => Promise<void>
   /** bounded privacy-safe transition log (optional; unit tests may omit) */
   stateLog?: StateTransitionLog
+  /** managed session id for log/status attribution (optional in unit tests) */
+  sessionId?: () => string | undefined
 }
 
 /** Best-effort privacy-safe transition logging (never throws into routes). */
 function transition(deps: ServerDeps, entry: Omit<TransitionEntry, 'at'> & { at?: number }): void {
-  try { deps.stateLog?.record({ at: entry.at ?? Date.now(), ...entry }) } catch { /* logging is best effort */ }
+  try {
+    deps.stateLog?.record({ at: entry.at ?? Date.now(), ...entry, session: entry.session ?? deps.sessionId?.() })
+  } catch { /* logging is best effort */ }
+}
+
+/**
+ * One window-materializing operation at a time per daemon/session.
+ *
+ * `managedWindow`/`firstDisplayUsed` are read-then-write state: without this
+ * lock two concurrent `/api/open` (or launch/open) requests could both see
+ * "zero windows, allowance unused" and each create a native window. It also
+ * serializes same-window tab opens with human manual window creation so the
+ * "exactly one managed window" invariant holds under concurrency.
+ */
+const windowLocks = new WeakMap<ServerDeps, Promise<unknown>>()
+function withWindowLock<T>(deps: ServerDeps, work: () => Promise<T>): Promise<T> {
+  const previous = windowLocks.get(deps) ?? Promise.resolve()
+  const run = previous.then(work, work)
+  windowLocks.set(deps, run.catch(() => {}))
+  return run
 }
 
 /**
@@ -244,6 +273,9 @@ export function createServer(deps: ServerDeps): http.Server {
         if (!up || !cur) return json(res, 503, { error: 'browser not running (backlight launch first)' })
         const targetUrl = url.searchParams.get('url') ?? 'about:blank'
         try {
+          if ((await deps.supervisor.windowStates()).length === 0) {
+            return json(res, 409, { error: 'use POST /api/open for windowless background pages' })
+          }
           const { targetId } = await cur.cdp.send<{ targetId: string }>('Target.createTarget', { url: targetUrl, background: true })
           const proxyPort = req.socket.localPort
           transition(deps, {
@@ -437,8 +469,15 @@ async function runLogin(deps: ServerDeps, native: NativeControl, meta?: RequestM
       launched = true
       engine = instance.binary
     }
-    const restored = deps.manager.running ? await deps.supervisor.restoreAll(true, gen) : 0
-    await native.persist(gen, true, meta)
+    // The whole human takeover (manual window + restore + native unhide/
+    // activate) is one critical section: a background open queued behind it
+    // then sees humanMode/new-generation and cannot re-hide the human window.
+    const restored = await withWindowLock(deps, async () => {
+      await ensureManualWindow(deps, gen, meta)
+      const count = deps.manager.running ? await deps.supervisor.restoreAll(true, gen) : 0
+      await native.persist(gen, true, meta)
+      return count
+    })
     deps.supervisor.completeIntent(intent.token, 'applied')
     return { ok: true, launched, restored, engine, note }
   } catch (err) {
@@ -452,6 +491,325 @@ async function runLogin(deps: ServerDeps, native: NativeControl, meta?: RequestM
     deps.supervisor.humanMode = previousHumanMode
     try { await deps.capture.setPaused(previousPaused) } catch { /* keep the original error */ }
     throw err
+  }
+}
+
+/**
+ * A windowless page can never become a real chrome.tabs tab (see
+ * window-open.ts feasibility finding). Every handoff attempt is therefore
+ * recorded as refused and the page keeps running unchanged — it is never
+ * re-created from its URL and never closed to fake a takeover.
+ */
+function noteWindowlessHandoff(deps: ServerDeps, meta: RequestMeta | undefined, trigger: string, count: number): void {
+  const capability = windowlessCapability()
+  transition(deps, {
+    event: 'windowless-handoff', origin: meta?.origin ?? 'internal', source: meta?.source,
+    route: meta?.route, requestId: meta?.requestId, branch: 'refused',
+    detail: `trigger=${trigger} pending=${count} adoption=${capability.adoption} reason=${capability.reason}`,
+  })
+}
+
+/**
+ * Only explicit human-control routes call this; background opens must not.
+ * With zero windows an explicit show may create exactly one empty visible
+ * window (the human asked to see the browser). Pending windowless pages are
+ * never cloned into it: that would reload them and lose page identity. They
+ * keep running and the refusal is logged.
+ */
+async function ensureManualWindow(deps: ServerDeps, gen: number, meta?: RequestMeta): Promise<void> {
+  const cur = deps.manager.current
+  if (!cur) return
+  const windows = (await deps.supervisor.windowStates()).length
+  const pending = await pendingWindowlessPages(cur.cdp).catch(() => [])
+  if (windows > 0) {
+    if (pending.length) noteWindowlessHandoff(deps, meta, 'manual-show-existing-window', pending.length)
+    return
+  }
+  if (!deps.supervisor.isControlCurrent(gen)) return
+  transition(deps, { event: 'manual-window-create', origin: 'explicit', gen,
+    source: meta?.source, route: meta?.route, requestId: meta?.requestId,
+    branch: 'requested', detail: `windowless-pending=${pending.length}` })
+  const { targetId } = await cur.cdp.send<{ targetId: string }>('Target.createTarget', { url: 'about:blank', background: false })
+  const windowId = await targetWindowId(cur.cdp, targetId)
+  if (windowId !== null) {
+    // The human-visible window becomes the single managed window; later
+    // background opens reuse it instead of creating another one.
+    trackManagedWindow(cur.cdp, { windowId, firstTargetId: targetId, createdAt: Date.now(), source: 'explicit' })
+    transition(deps, { event: 'managed-window', origin: 'explicit', gen,
+      source: meta?.source, route: meta?.route, requestId: meta?.requestId, windowId,
+      branch: 'adopt', detail: 'human-explicit-window' })
+  }
+  transition(deps, { event: 'manual-window-create', origin: 'explicit', gen,
+    source: meta?.source, route: meta?.route, requestId: meta?.requestId,
+    branch: 'created-empty', detail: `empty-window windowId=${windowId ?? 'unknown'} windowless-pending=${pending.length}` })
+  if (pending.length) noteWindowlessHandoff(deps, meta, 'manual-window-create', pending.length)
+}
+
+type OpenOutcome =
+  | { kind: 'windowless'; targetId: string }
+  | {
+      kind: 'tab'
+      targetId: string
+      windowId: number
+      reused: boolean
+      firstDisplay: boolean
+      settled: boolean
+      settleReason?: string
+    }
+  | { kind: 'refused'; status: number; body: unknown }
+
+/**
+ * One normal background tab in an already existing window. Never passes
+ * `newWindow`, never activates the tab/window, and closes the tab again if the
+ * engine ignores the background hint and opens a new native window.
+ */
+async function openBackgroundTab(
+  deps: ServerDeps,
+  meta: RequestMeta,
+  route: string,
+  requestId: string,
+  url: string,
+  cur: NonNullable<ServerDeps['manager']['current']>,
+  expectedWindowId: number,
+  reused: boolean,
+): Promise<OpenOutcome> {
+  const cdp = cur.cdp
+  const session = browserSessionId(cur)
+  const ref = { origin: meta.origin, source: meta.source, route, requestId }
+  // Provenance snapshot BEFORE the async createTarget: `wasHidden` alone goes
+  // stale while the create is in flight. A human show (API/Dock) during that
+  // window must win, so the re-hide is gated on this snapshot and on fresh
+  // native evidence (never on the stale hidden flag).
+  const genAtStart = deps.supervisor.controlGen()
+  const humanAtStart = deps.supervisor.humanMode
+  const statesBefore = await deps.supervisor.windowStates()
+  const before = new Set(statesBefore.map(w => w.windowId))
+  // Our background createTarget never restores a minimized window (measured),
+  // so a minimized -> normal transition during the create is human/Dock work.
+  const wasMinimized = statesBefore.find(w => w.windowId === expectedWindowId)?.state === 'minimized'
+  const wasHidden = await deps.appState(cur.pid).then(s => s.hidden).catch(() => false)
+  const { targetId } = await cdp.send<{ targetId: string }>('Target.createTarget', { url, background: true })
+  const placedWindowId = await targetWindowId(cdp, targetId)
+  if (placedWindowId === null || !before.has(placedWindowId) || placedWindowId !== expectedWindowId) {
+    // The one-managed-window invariant: a tab that landed in a different (or
+    // brand-new) window is closed again and the request fails. The daemon
+    // never adopts an unintended window and never leaves a second one behind.
+    await cdp.send('Target.closeTarget', { targetId }).catch(() => {})
+    transition(deps, { event: 'managed-window', ...ref, session, windowId: expectedWindowId,
+      branch: 'rejected-placement',
+      detail: `placed=${placedWindowId ?? 'none'} expected=${expectedWindowId}` })
+    throw new Error(placedWindowId === null
+      ? 'background tab did not land in an existing window; refused (no second window)'
+      : `background tab landed in window ${placedWindowId}, expected managed window ${expectedWindowId}; refused`)
+  }
+  let settled = true
+  let settleReason: string | undefined
+  if (wasHidden) {
+    const fresh = await deps.appState(cur.pid).catch(() => null)
+    const statesAfter = await deps.supervisor.windowStates().catch(() => [])
+    const nowMinimized = statesAfter.find(w => w.windowId === placedWindowId)?.state === 'minimized'
+    const reason = humanAtStart || deps.supervisor.humanMode ? 'human-mode'
+      : deps.supervisor.controlGen() !== genAtStart ? 'newer-control-intent'
+      : fresh === null ? 'state-unknown'
+      : fresh.active ? 'active-app'
+      : wasMinimized && !nowMinimized ? 'restored-window'
+      : null
+    if (reason) {
+      // A human took over (or the state is no longer trustworthy): do not hide
+      // the window the human is looking at. The tab stays, the refusal is
+      // logged, and native visibility is left exactly as the human set it.
+      settled = false
+      settleReason = reason
+      transition(deps, { event: 'native-hide', ...ref, session,
+        branch: 'skipped-human-takeover', after: 'visible',
+        detail: `reason=${reason} (stale wasHidden=true not used)` })
+    } else {
+      try {
+        await deps.hideBrowser(cur.pid)
+        transition(deps, { event: 'native-hide', ...ref, session,
+          branch: 'verified', pid: cur.pid, detail: 'hidden-window-post-create' })
+      } catch (err) {
+        await cdp.send('Target.closeTarget', { targetId }).catch(() => {})
+        throw err
+      }
+    }
+  }
+  transition(deps, { event: 'open', ...ref, session, windowId: placedWindowId,
+    branch: 'background-target',
+    detail: `windowId=${placedWindowId} sameWindow=${reused} firstDisplay=false settled=${settled}` })
+  return { kind: 'tab', targetId, windowId: placedWindowId, reused, firstDisplay: false, settled, settleReason }
+}
+
+/**
+ * Background-first-display settle: the one fresh real window is armed for
+ * capture while it is still visible, then minimized and natively hidden.
+ * Best effort and honest: failures are logged and reported, never hidden.
+ */
+async function settleFirstWindow(
+  deps: ServerDeps,
+  meta: RequestMeta,
+  route: string,
+  requestId: string,
+  cur: NonNullable<ServerDeps['manager']['current']>,
+  windowId: number,
+): Promise<{ settled: boolean; reason?: string; capture: string }> {
+  const ref = { origin: meta.origin, source: meta.source, route, requestId }
+  const session = browserSessionId(cur)
+  const skip = (reason: string) => {
+    transition(deps, { event: 'managed-window', ...ref, session, windowId,
+      branch: 'settle-skipped', detail: `reason=${reason}` })
+    return { settled: false, reason, capture: 'none' }
+  }
+  // A human-visible window (explicit show/login racing this open) must never
+  // be collapsed by background work.
+  if (deps.supervisor.humanMode) return skip('human-mode')
+  transition(deps, { event: 'managed-window', ...ref, session, windowId,
+    branch: 'settle-requested', detail: 'capture-prearm,then-minimize+native-hide' })
+  let capture = 'none'
+  try {
+    await deps.capture.setPaused(false)
+    // The fresh tab must be visible in the health snapshot before arming:
+    // arming while hidden grants the rAF exemption but no real frames.
+    try { await deps.health.refresh?.() } catch { /* best effort */ }
+    const armed = await deps.capture.prearm()
+    capture = armed ? 'armed' : 'none'
+  } catch {
+    capture = 'failed'
+  }
+  if (deps.supervisor.humanMode) return skip('human-mode')
+  // Do not bump the control generation: a background settle never outranks a
+  // human intent. If one arrives mid-settle, collapseAll stops (superseded).
+  const gen = deps.supervisor.controlGen()
+  const appHidden = await deps.appState(cur.pid).then(s => s.hidden).catch(() => false)
+  await deps.supervisor.collapseAll(appHidden, gen)
+  if (!deps.supervisor.isControlCurrent(gen)) return skip('superseded')
+  // Final provenance check before the native hide: a human show may have
+  // arrived (and possibly already unhidden the app) while collapseAll ran.
+  if (deps.supervisor.humanMode) return skip('human-mode')
+  const fresh = await deps.appState(cur.pid).catch(() => null)
+  if (fresh === null) return skip('state-unknown')
+  if (fresh.active) return skip('human-active')
+  if (!deps.supervisor.isControlCurrent(gen)) return skip('superseded')
+  let hidden = false
+  try {
+    await deps.hideBrowser(cur.pid)
+    hidden = true
+  } catch { /* reported below */ }
+  const state = (await deps.supervisor.windowStates().catch(() => []))
+    .find(w => w.windowId === windowId)
+  const backgrounded = hidden && (state?.state === 'minimized' || state?.cornered === true)
+  transition(deps, { event: 'managed-window', ...ref, session, windowId,
+    branch: backgrounded ? 'settled' : 'settle-failed',
+    detail: `capture=${capture} windowState=${state?.state ?? 'unknown'} cornered=${state?.cornered ?? false} appHidden=${hidden}` })
+  return { settled: backgrounded, reason: backgrounded ? undefined : 'not-backgrounded', capture }
+}
+
+/**
+ * Single managed-window path (product trade-off 2026-09-17):
+ *
+ * - managed window alive  → one background tab in that same window
+ * - another window exists → adopt it (deterministic oldest id), background tab
+ * - zero windows          → create EXACTLY ONE real window (macOS may show it
+ *   once), then settle it to the background. The one-time display is per
+ *   browser session; after the window is lost, background opens are refused
+ *   (409) so the daemon can never pop windows repeatedly.
+ * - `windowless: true`    → explicit protocol-only hidden page (no window,
+ *   never take-overable; BrowserPilot cannot see it)
+ */
+async function openManagedPage(
+  deps: ServerDeps,
+  meta: RequestMeta,
+  route: string,
+  requestId: string,
+  payload: any,
+  cur: NonNullable<ServerDeps['manager']['current']>,
+): Promise<OpenOutcome> {
+  const cdp = cur.cdp
+  const session = browserSessionId(cur)
+  const ref = { origin: meta.origin, source: meta.source, route, requestId }
+
+  if (payload.windowless === true) {
+    const beforeWindows = await deps.supervisor.windowStates()
+    const beforeIds = new Set(beforeWindows.map(w => w.windowId))
+    // The native hide is part of the zero-window background contract only. An
+    // existing (possibly user-visible) window must keep its native visibility:
+    // a protocol-only page never justifies hiding what the human is looking at.
+    const zeroWindow = beforeIds.size === 0
+    if (zeroWindow) await deps.hideBrowser(cur.pid)
+    const targetId = await openWindowlessPage(cdp, payload.url)
+    const afterIds = (await deps.supervisor.windowStates()).map(w => w.windowId)
+    if (afterIds.length !== beforeIds.size || afterIds.some(id => !beforeIds.has(id))) {
+      await closeWindowlessPage(cdp, targetId)
+      throw new Error('windowless page creation changed the native window set; refused')
+    }
+    transition(deps, { event: 'open', ...ref, session, branch: 'windowless-target',
+      detail: zeroWindow
+        ? `zero-window-hidden-page adoption=${windowlessCapability().adoption}`
+        : `existing-window-hidden-page native=unchanged adoption=${windowlessCapability().adoption}` })
+    return { kind: 'windowless', targetId }
+  }
+
+  const tracked = managedWindow(cdp)
+  if (tracked && await windowStillOpen(cdp, tracked.windowId)) {
+    transition(deps, { event: 'managed-window', ...ref, session, windowId: tracked.windowId,
+      branch: 'reuse', detail: `same-window windowId=${tracked.windowId} firstDisplay=false` })
+    return openBackgroundTab(deps, meta, route, requestId, payload.url, cur, tracked.windowId, true)
+  }
+  if (tracked) {
+    clearManagedWindow(cdp)
+    transition(deps, { event: 'managed-window', ...ref, session, windowId: tracked.windowId,
+      branch: 'lost', detail: 'window-gone' })
+  }
+
+  const existing = await deps.supervisor.windowStates()
+  if (existing.length > 0) {
+    const windowId = [...existing].sort((a, b) => a.windowId - b.windowId)[0]!.windowId
+    trackManagedWindow(cdp, { windowId, createdAt: Date.now(), source: 'adopted' })
+    transition(deps, { event: 'managed-window', ...ref, session, windowId,
+      branch: 'adopt', detail: `existing-window windows=${existing.length}` })
+    return openBackgroundTab(deps, meta, route, requestId, payload.url, cur, windowId, true)
+  }
+
+  if (firstDisplayUsed(cdp)) {
+    transition(deps, { event: 'managed-window', ...ref, session, branch: 'refused',
+      detail: 'one-time-background-first-display-used' })
+    return {
+      kind: 'refused',
+      status: 409,
+      body: {
+        ok: false,
+        error: 'managed window unavailable',
+        reason: 'the one-time zero-window background window was already created and is now closed; the daemon will not pop another one',
+        hint: 'open a window explicitly (bl show / login), or request the invisible protocol-only mode with {"windowless":true}',
+      },
+    }
+  }
+
+  transition(deps, { event: 'managed-window', ...ref, session, branch: 'create-requested',
+    detail: 'reason=zero-window-cold-start one-time-display=true' })
+  // The attempt is irreversible from here: `Target.createTarget` can already
+  // materialize a native window even when the window lookup afterwards fails.
+  // Consume the one-time allowance BEFORE the side effect so a failed attempt
+  // can never pop a second window (fail closed).
+  markFirstDisplayUsed(cdp)
+  // background:true keeps the new tab inactive if the window does appear once.
+  const { targetId } = await cdp.send<{ targetId: string }>('Target.createTarget', { url: payload.url, background: true })
+  const windowId = await targetWindowId(cdp, targetId)
+  if (windowId === null) {
+    await cdp.send('Target.closeTarget', { targetId }).catch(() => {})
+    transition(deps, { event: 'managed-window', ...ref, session, branch: 'first-display-unresolved',
+      detail: 'attempt=consumed state=unresolved fail-closed=true' })
+    throw new Error('could not resolve the native window of the first tab; the one-time display was consumed (fail closed)')
+  }
+  trackManagedWindow(cdp, { windowId, firstTargetId: targetId, createdAt: Date.now(), source: 'background-first-display' })
+  transition(deps, { event: 'managed-window', ...ref, session, windowId,
+    branch: 'created', detail: 'first-display=once' })
+  const settle = await settleFirstWindow(deps, meta, route, requestId, cur, windowId)
+  transition(deps, { event: 'open', ...ref, session, windowId, branch: 'first-window',
+    detail: `windowId=${windowId} settled=${settle.settled}${settle.reason ? ` reason=${settle.reason}` : ''}` })
+  return {
+    kind: 'tab', targetId, windowId, reused: false, firstDisplay: true,
+    settled: settle.settled, settleReason: settle.reason,
   }
 }
 
@@ -478,6 +836,9 @@ async function handleApi(
     case 'GET /api/status': {
       const settings = loadSettings()
       const cur = deps.manager.current
+      const windowlessPages = cur
+        ? await pendingWindowlessPages(cur.cdp).then(p => p.length).catch(() => 0)
+        : 0
       json(res, 200, {
         daemon: { version: deps.version, pid: process.pid, uptimeSec: Math.round((Date.now() - deps.startedAt) / 1000), port: settings.proxyPort },
         settings,
@@ -487,6 +848,25 @@ async function handleApi(
         // activation interval (capture picker). No page content is exposed.
         intent: deps.supervisor.lastIntent(),
         internal: deps.supervisor.internalState(),
+        // One managed session, shared by Dock/launchpad/menu/API attribution.
+        // `managedWindowId` is the single real window reused by background
+        // opens; `firstDisplayUsed` says whether the one-time zero-window
+        // creation was spent. `takeover` stays honest about protocol-only
+        // windowless pages (window-open.ts / managed-window.ts).
+        session: cur
+          ? {
+              id: browserSessionId(cur),
+              space: cur.space,
+              pid: cur.pid,
+              startedAt: cur.startedAt,
+              managedWindowId: managedWindow(cur.cdp)?.windowId ?? null,
+              firstDisplayUsed: firstDisplayUsed(cur.cdp),
+              windowlessPages,
+              takeover: managedWindow(cur.cdp)
+                ? 'real-window'
+                : windowlessPages > 0 ? 'windowless-limited' : 'none',
+            }
+          : null,
         browser: cur
           ? {
               running: true,
@@ -498,6 +878,7 @@ async function handleApi(
               extensions: deps.extensions.list().filter(e => cur.extensionPaths.includes(e.path)).map(e => e.name),
               startedAt: cur.startedAt,
               captureTargetId: deps.capture.activeTargetId(),
+              windowlessPages,
             }
           : { running: false },
       })
@@ -521,20 +902,60 @@ async function handleApi(
       try {
         await deps.capture.setPaused(foreground)
         deps.supervisor.start()
-        const inst = await deps.manager.launch({
-          url: payload.url,
-          space: payload.space,
-          with: payload.with,
-          bare: payload.bare === true,
-          focus: foreground && (payload.focus === true || payload.background === false),
-          keepVisible: foreground && payload.keepVisible === true,
+        // A launch materializes windows too: serialize it with every other
+        // window-materializing path so launch/open concurrency cannot produce
+        // two first windows (the first-display allowance is read-then-write).
+        const { inst, outcome } = await withWindowLock(deps, async () => {
+          // A background launch never passes the URL to the manager: the first
+          // real tab (and its one-time window display) is created afterwards
+          // through the single managed-window path, so it is tracked and
+          // settled to the background instead of being re-created later.
+          const inst = await deps.manager.launch({
+            url: foreground ? payload.url : undefined,
+            space: payload.space,
+            with: payload.with,
+            bare: payload.bare === true,
+            focus: foreground && (payload.focus === true || payload.background === false),
+            keepVisible: foreground && payload.keepVisible === true,
+          })
+          let outcome: OpenOutcome | null = null
+          if (!foreground && payload.url && deps.manager.current) {
+            outcome = await openManagedPage(deps, meta, route, requestId, payload, deps.manager.current)
+          } else if (foreground && deps.manager.current) {
+            // Remember the human-visible window as the single managed one.
+            const cdp = deps.manager.current.cdp
+            const windows = await deps.supervisor.windowStates().catch(() => [])
+            if (!managedWindow(cdp) && windows.length > 0) {
+              const windowId = [...windows].sort((a, b) => a.windowId - b.windowId)[0]!.windowId
+              trackManagedWindow(cdp, { windowId, createdAt: Date.now(), source: 'explicit' })
+              transition(deps, { event: 'managed-window', ...intentFields(intent), windowId,
+                branch: 'adopt', detail: 'explicit-visible-launch' })
+            }
+          }
+          return { inst, outcome }
         })
+        if (outcome?.kind === 'refused') {
+          deps.supervisor.completeIntent(intent.token, 'applied')
+          json(res, 409, { ok: false, pid: inst.pid, ...(outcome.body as object) })
+          return
+        }
+        const windowless = outcome?.kind === 'windowless'
         transition(deps, {
           event: 'launch', ...intentFields(intent), pid: inst.pid,
           branch: foreground ? 'visible' : 'background',
+          detail: outcome?.kind === 'tab'
+            ? `windowId=${outcome.windowId} firstDisplay=${outcome.firstDisplay} settled=${outcome.settled}`
+            : windowless ? `windowless-page adoption=${windowlessCapability().adoption}` : undefined,
         })
         deps.supervisor.completeIntent(intent.token, 'applied')
-        json(res, 200, { ok: true, pid: inst.pid, upstreamPort: inst.upstreamPort, version: inst.version })
+        json(res, 200, {
+          ok: true, pid: inst.pid, upstreamPort: inst.upstreamPort, version: inst.version,
+          windowless, takeover: !windowless,
+          ...(outcome?.kind === 'tab'
+            ? { windowId: outcome.windowId, firstDisplay: outcome.firstDisplay, settled: outcome.settled,
+                ...(outcome.settleReason ? { settleReason: outcome.settleReason } : {}) }
+            : {}),
+        })
       } catch (err) {
         transition(deps, { event: 'launch', ...intentFields(intent), branch: 'failed', detail: (err as Error).message })
         deps.supervisor.completeIntent(intent.token, 'failed')
@@ -642,6 +1063,12 @@ async function handleApi(
           return
         }
       }
+      // Windowless background pages cannot survive a restart (their process is
+      // replaced and their URLs are never cloned). Report the count instead of
+      // dropping them silently.
+      const windowlessDropped = deps.manager.current
+        ? await pendingWindowlessPages(deps.manager.current.cdp).then(p => p.length).catch(() => 0)
+        : 0
       const gen = deps.supervisor.beginControl() // restart outranks any settling collapse
       const intent = deps.supervisor.noteIntent(meta.origin, foreground ? 'show' : 'bg', { source: meta.source, route, requestId, gen })
       if (requestedForeground && !foreground) {
@@ -673,9 +1100,10 @@ async function handleApi(
           event: 'restart', ...intentFields(intent),
           branch: foreground ? 'visible-request' : 'forced-background',
           after: foreground ? 'visible' : 'background',
+          detail: windowlessDropped > 0 ? `windowless-dropped=${windowlessDropped} adoption=unsupported` : undefined,
         })
         deps.supervisor.completeIntent(intent.token, 'applied')
-        json(res, 200, { ok: true })
+        json(res, 200, { ok: true, windowlessDropped })
       } catch (err) {
         transition(deps, { event: 'restart', ...intentFields(intent), branch: 'failed', detail: (err as Error).message })
         deps.supervisor.completeIntent(intent.token, 'failed')
@@ -771,6 +1199,13 @@ async function handleApi(
             gen: deps.supervisor.controlGen(), branch: reason,
             detail: `observedAt=${Math.round(observedAt)} evidence=${evidence}`,
           })
+          if (evidence === 'active-visible') {
+            // A Dock reopen may make Chrome create its own window; the daemon
+            // must not fill it by cloning windowless pages (URL clone loses
+            // page identity). Record the refusal, change nothing.
+            const pending = cur ? await pendingWindowlessPages(cur.cdp).catch(() => []) : []
+            if (pending.length) noteWindowlessHandoff(deps, meta, 'dock-visible', pending.length)
+          }
           json(res, 200, { ok: true, restored: 0, ignored: reason })
           return
         }
@@ -790,8 +1225,15 @@ async function handleApi(
       deps.supervisor.humanMode = true
       try {
         await deps.capture.setPaused(true)
-        const n = deps.manager.running ? await deps.supervisor.restoreAll(payload.maximize === true, gen) : 0
-        await native.persist(gen, payload.activate !== false, meta)
+        let n = 0
+        // Restore + native unhide/activate are atomic with respect to
+        // background opens: a queued open observes humanMode and never
+        // re-hides the window the human just took over.
+        await withWindowLock(deps, async () => {
+          await ensureManualWindow(deps, gen, meta)
+          n = deps.manager.running ? await deps.supervisor.restoreAll(payload.maximize === true, gen) : 0
+          await native.persist(gen, payload.activate !== false, meta)
+        })
         deps.supervisor.completeIntent(intent.token, 'applied')
         json(res, 200, { ok: true, restored: n })
       } catch (err) {
@@ -895,7 +1337,37 @@ async function handleApi(
       return
     }
     case 'GET /api/targets': {
-      json(res, 200, { targets: (await deps.manager.listTabs()).filter(t => t.type === 'page' || t.type === 'service_worker') })
+      const cur = deps.manager.current
+      const windowless = cur ? await pendingWindowlessPages(cur.cdp) : []
+      json(res, 200, { targets: [
+        ...(await deps.manager.listTabs()).filter(t => t.type === 'page' || t.type === 'service_worker'),
+        ...windowless.map(t => ({ ...t, type: 'other', title: '', attached: false, windowless: true })),
+      ] })
+      return
+    }
+    case 'GET /api/capabilities': {
+      const capability = windowlessCapability()
+      json(res, 200, {
+        windowlessOpen: true,
+        windowless: {
+          supported: capability.create,
+          adoption: capability.adoption,
+          browserPilot: capability.browserPilot,
+          reason: capability.reason,
+        },
+        // Product trade-off 2026-09-17: zero-window cold start creates ONE
+        // real managed window (macOS may show it once), then settles it to the
+        // background. Later human opens restore the same window/tabs, so AI
+        // background work and human inspection are the same document.
+        zeroWindowRealTab: {
+          supported: true,
+          firstDisplay: 'once-per-browser-session',
+          sameWindowReuse: true,
+          windowlessFallback: true,
+          reason: 'zero-window cold start creates one real managed window; it may appear once, then capture is pre-armed and the window is minimized and natively hidden; every later background tab reuses that same window',
+          evidence: 'isolated probe 2026-09-17 (CfT 153, temp profile): first background:true tab materialized one window, on-screen ~1s at the offscreen corner with app active=false; after minimize+hide the same target id and in-memory nonce survived, and a simulated human show restored the same target/document (1 page target). Repeated creation after the window is lost is refused with 409',
+        },
+      })
       return
     }
     case 'POST /api/inspect': {
@@ -934,25 +1406,41 @@ async function handleApi(
     }
     case 'POST /api/open': {
       if (!payload.url) return json(res, 400, { error: 'url required' })
-      if (!deps.manager.running) {
-        // First launch of an open request is always background: a silent AI
-        // open must never inherit settings.launchMode and appear on screen.
-        await deps.manager.launch({ url: payload.url, with: payload.with, focus: false })
-        transition(deps, {
-          event: 'open', origin: meta.origin, source: meta.source, route, requestId,
-          branch: 'launched-background',
-        })
-      } else {
-        // Never move or un-minimize an existing window when creating an AI tab.
+      // Serialized with every other window-materializing request: the
+      // launch + first-display check + create must be one critical section.
+      const opened = await withWindowLock(deps, async () => {
+        let launched = false
+        if (!deps.manager.running) {
+          // Background launch without a URL: the first real tab (and therefore
+          // the one-time window display) is created below through the single
+          // managed-window path, after the verified hide.
+          await deps.manager.launch({ with: payload.with, focus: false })
+          launched = true
+        }
         const cur = deps.manager.current!
-        for (const name of payload.with ?? []) await deps.extensionDev.load(name)
-        await cur.cdp.send('Target.createTarget', { url: payload.url, background: true })
-        transition(deps, {
-          event: 'open', origin: meta.origin, source: meta.source, route, requestId,
-          branch: 'background-target',
-        })
+        if (!launched) for (const name of payload.with ?? []) await deps.extensionDev.load(name)
+        return { cur, outcome: await openManagedPage(deps, meta, route, requestId, payload, cur) }
+      })
+      const { cur, outcome } = opened
+      const session = browserSessionId(cur)
+      if (outcome.kind === 'refused') {
+        json(res, outcome.status, outcome.body)
+        return
       }
-      json(res, 200, { ok: true })
+      if (outcome.kind === 'windowless') {
+        json(res, 200, {
+          ok: true, targetId: outcome.targetId, windowless: true, takeover: false,
+          capability: windowlessCapability(), session,
+        })
+        return
+      }
+      json(res, 200, {
+        ok: true, targetId: outcome.targetId, windowId: outcome.windowId,
+        windowless: false, takeover: true, reusedWindow: outcome.reused,
+        firstDisplay: outcome.firstDisplay, settled: outcome.settled,
+        ...(outcome.settleReason ? { settleReason: outcome.settleReason } : {}),
+        session,
+      })
       return
     }
     case 'GET /api/import/sources': {

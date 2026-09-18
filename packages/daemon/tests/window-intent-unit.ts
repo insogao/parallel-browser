@@ -14,11 +14,15 @@ const { FramePumpSupervisor } = await import('../src/windows.ts')
 const { ActivityBus } = await import('../src/activity.ts')
 const { StateTransitionLog } = await import('../src/state-log.ts')
 const { saveSettings } = await import('../src/store.ts')
+const { browserSessionId } = await import('../src/session.ts')
+
+const SESSION = browserSessionId({ space: 'default', pid: 4242, startedAt: 0 })
 
 interface Track {
   running: boolean
   bounds: any
   hidden: boolean
+  active: boolean
   hideCalls: number
   minimizes: number
   launches: number
@@ -32,6 +36,15 @@ interface Track {
   activatedTabs: string[]
   createdTabs: string[]
   createdOpts: any[]
+  closedTargets: string[]
+  /** Target.createTarget invocations that have started (before any delay) */
+  createStarted: number
+  createWhenHidden: boolean[]
+  windowCreates: Array<{ focused: boolean; state: string; url: string }>
+  hasWindow: boolean
+  windowAlive: boolean
+  /** ordered settle operations: health-refresh, prearm, minimize, hide */
+  ops: string[]
   pausedCalls: boolean[]
   tabs: Array<{ targetId: string; type: string; title: string; url: string; attached: boolean }>
 }
@@ -39,40 +52,91 @@ interface Track {
 interface HarnessOptions {
   running?: boolean
   initial?: string
+  hasWindow?: boolean
+  initialHidden?: boolean
+  initialActive?: boolean
+  /** make Target.createTarget place the new tab in a second native window */
+  createTargetInNewWindow?: boolean
+  /** place new non-hidden tabs in this existing window id (default 1) */
+  createTargetInWindow?: number
+  /** extra existing window ids (each with a page target); default [1] */
+  windowIds?: number[]
+  /** delay every Target.createTarget (forces real overlap without the lock) */
+  createTargetDelayMs?: number
+  /** make Browser.getWindowForTarget always fail (resolution failure path) */
+  failWindowForTarget?: boolean
   setPaused?: (paused: boolean) => Promise<void>
   extensionDev?: any
 }
 
 function harness(opts: HarnessOptions = {}) {
+  const hiddenTargets = new Map<string, string>()
+  const windowIds = opts.windowIds ?? [1]
+  const windowForTarget = new Map<string, number>(windowIds.map(id => [id === 1 ? 'page' : `page-${id}`, id]))
   const track: Track = {
     running: opts.running ?? true,
     bounds: { left: 60, top: 60, width: 1200, height: 800, windowState: opts.initial ?? 'normal' },
-    hidden: false, hideCalls: 0, minimizes: 0, launches: 0, launchOpts: null, launchHistory: [], restarts: [],
+    hidden: opts.initialHidden ?? false, active: opts.initialActive ?? false, hideCalls: 0, minimizes: 0, launches: 0, launchOpts: null, launchHistory: [], restarts: [],
     restartDeferral: null, restartResult: { restarted: true },
-    activatedTabs: [], createdTabs: [], createdOpts: [], pausedCalls: [], tabs: [],
+    activatedTabs: [], createdTabs: [], createdOpts: [], closedTargets: [], createStarted: 0,
+    createWhenHidden: [], windowCreates: [], hasWindow: opts.hasWindow ?? true,
+    windowAlive: true, ops: [], pausedCalls: [], tabs: [],
   }
   const cdp = {
     closed: false,
+    attach: async (targetId: string) => `session-${targetId}`,
     send: async (method: string, params: any = {}) => {
       switch (method) {
-        case 'Target.getTargets': return { targetInfos: [{ targetId: 'page', type: 'page' }] }
-        case 'Browser.getWindowForTarget': return { windowId: 1 }
-        case 'Browser.getWindowBounds': return { bounds: { ...track.bounds } }
+        case 'Target.getTargets': return { targetInfos: [
+          ...(track.hasWindow && track.windowAlive
+            ? windowIds.map(id => ({ targetId: id === 1 ? 'page' : `page-${id}`, type: 'page', url: 'about:blank' }))
+            : []),
+          ...[...hiddenTargets].map(([targetId, url]) => ({ targetId, type: 'other', url })),
+        ] }
+        case 'Browser.getWindowForTarget':
+          if (opts.failWindowForTarget) throw new Error('No window for target')
+          return { windowId: windowForTarget.get(params.targetId) ?? 1 }
+        case 'Browser.getWindowBounds':
+          if (!track.windowAlive) throw new Error('Browser window not found')
+          return { bounds: { ...track.bounds } }
         case 'Browser.setWindowBounds':
-          if (params.bounds.windowState === 'minimized') track.minimizes++
+          if (params.bounds.windowState === 'minimized') { track.minimizes++; track.ops.push('minimize') }
           Object.assign(track.bounds, params.bounds)
           return {}
-        case 'Runtime.evaluate': return { result: { value: JSON.stringify({ al: 0, at: 25, ah: 900 }) } }
+        case 'Runtime.evaluate': {
+          const expression = String(params.expression)
+          if (expression.includes('chrome.windows?.create')) return { result: { value: true } }
+          if (expression.includes('chrome.windows.create')) {
+            const url = expression.match(/url:\s*("[^"]+")/)?.[1]
+            track.windowCreates.push({ focused: false, state: 'minimized', url: url ? JSON.parse(url) : '' })
+            track.hasWindow = true
+            track.bounds.windowState = 'minimized'
+            return { result: { value: { id: 1, state: 'minimized' } } }
+          }
+          return { result: { value: JSON.stringify({ al: 0, at: 25, ah: 900 }) } }
+        }
         case 'Target.activateTarget': track.activatedTabs.push(params.targetId); return {}
-        case 'Target.createTarget':
+        case 'Target.createTarget': {
+          track.createStarted++
+          if (opts.createTargetDelayMs) await new Promise(r => setTimeout(r, opts.createTargetDelayMs))
           track.createdTabs.push(params.url)
           track.createdOpts.push(params)
-          return { targetId: 'created' }
+          track.createWhenHidden.push(track.hidden)
+          const targetId = params.hidden ? `hidden-${track.createdOpts.length}` : 'created'
+          if (params.hidden) hiddenTargets.set(targetId, params.url)
+          else {
+            track.hasWindow = true
+            track.windowAlive = true
+            windowForTarget.set(targetId, opts.createTargetInNewWindow ? 99 : (opts.createTargetInWindow ?? 1))
+          }
+          return { targetId }
+        }
+        case 'Target.closeTarget': track.closedTargets.push(params.targetId); hiddenTargets.delete(params.targetId); return { success: true }
         default: return {}
       }
     },
   }
-  const instance = () => ({ cdp, pid: 4242, upstreamPort: 1, binary: '/x/Backlight', space: 'default', version: 'test', extensionPaths: [], startedAt: 0 })
+  const instance = () => ({ cdp, pid: 4242, upstreamPort: 1, binary: '/x/Backlight', space: 'default', version: 'test', extensionPaths: [], capturePageUrl: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/capture.html', startedAt: 0 })
   const manager: any = {
     current: track.running ? instance() : null,
     get running() { return track.running },
@@ -94,12 +158,14 @@ function harness(opts: HarnessOptions = {}) {
   }
   const supervisor = new FramePumpSupervisor(() => (manager.current ? { cdp } : null) as any, () => [])
   const stateLog = new StateTransitionLog({ sink: () => {} })
-  supervisor.onTransition = entry => stateLog.record(entry)
+  // Mirror the daemon wiring: every transition from every source is attributed
+  // to the one managed session.
+  supervisor.onTransition = entry => stateLog.record({ ...entry, session: entry.session ?? SESSION })
   const nativeCalls: string[] = []
   const deps = {
     manager,
     supervisor,
-    health: {},
+    health: { refresh: async () => { track.ops.push('health-refresh') } },
     extensions: { list: () => [] },
     extensionDev: opts.extensionDev ?? {
       entry: () => ({ name: 'stub', path: '/stub' }),
@@ -113,17 +179,20 @@ function harness(opts: HarnessOptions = {}) {
       isPaused: () => false,
       setPaused: async (paused: boolean) => { track.pausedCalls.push(paused); if (opts.setPaused) await opts.setPaused(paused) },
       activeTargetId: () => null,
-      prearm: async () => null,
+      prearm: async () => { track.ops.push('prearm'); return 'created' },
     },
-    appState: async () => ({ active: false, hidden: track.hidden }),
-    hideBrowser: async () => { nativeCalls.push('hide'); track.hideCalls++; track.hidden = true },
+    appState: async () => ({ active: track.active, hidden: track.hidden }),
+    hideBrowser: async () => { nativeCalls.push('hide'); track.ops.push('hide'); track.hideCalls++; track.hidden = true; track.active = false },
     unhideBrowser: async () => { nativeCalls.push('unhide'); track.hidden = false },
-    activateBrowser: async () => { nativeCalls.push('activate'); track.hidden = false },
+    activateBrowser: async () => { nativeCalls.push('activate'); track.hidden = false; track.active = true },
     stateLog,
+    sessionId: () => SESSION,
   }
   const server = createServer(deps as any)
   return {
     track, server, supervisor, stateLog, nativeCalls, manager,
+    /** Simulate the user closing the managed window (native window gone). */
+    loseWindow: () => { track.windowAlive = false; track.hasWindow = false },
     listen: async () => {
       await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
       return `http://127.0.0.1:${(server.address() as any).port}`
@@ -516,28 +585,473 @@ test('no launch inherits launchMode=visible: plain launches are background, only
   })
 })
 
-test('open first launch is background even with launchMode=visible; running opens stay background targets', { timeout: 20_000 }, async () => {
+test('cold open creates exactly one real managed window and settles it to background', { timeout: 20_000 }, async () => {
   await withLaunchMode('visible', async () => {
-    const h = harness({ running: false })
+    const h = harness({ running: false, hasWindow: false, initialHidden: true })
     const base = await h.listen()
     try {
-      const open = await post(base, '/api/open', { url: 'about:blank' })
-      assert.equal(open.body.ok, true)
+      const open = await post(base, '/api/open', { url: 'https://www.baidu.com/' })
+      assert.equal(open.status, 200, JSON.stringify(open.body))
+      assert.equal(open.body.windowless, false)
+      assert.equal(open.body.takeover, true)
+      assert.equal(open.body.firstDisplay, true)
+      assert.equal(open.body.settled, true)
+      assert.equal(open.body.windowId, 1)
+      assert.equal(open.body.session, SESSION)
       assert.equal(h.track.launches, 1)
-      assert.equal(h.track.launchOpts.focus, false, 'open must never inherit launchMode')
-      assert.equal(h.nativeCalls.length, 0)
-      const launched = h.stateLog.recent(40).find(e => e.event === 'open' && e.branch === 'launched-background')
-      assert.ok(launched)
-      assert.equal(launched.origin, 'unknown')
-
-      await post(base, '/api/open', { url: 'about:blank', source: 'cli.open' })
-      assert.equal(h.track.createdOpts.length, 1)
-      assert.equal(h.track.createdOpts[0].background, true, 'running open creates a background target')
-      assert.equal(h.nativeCalls.length, 0)
+      assert.equal(h.track.launchOpts.focus, false, 'cold open must never inherit launchMode')
+      assert.deepEqual(h.track.createdOpts, [{ url: 'https://www.baidu.com/', background: true }])
+      assert.equal((h.track.createdOpts[0] as any).newWindow, undefined, 'never newWindow')
+      assert.equal((h.track.createdOpts[0] as any).hidden, undefined, 'the default path is a real tab, not hidden')
+      // settle order: health refresh -> capture pre-arm (while visible) ->
+      // minimize -> native hide. No operation activates/foregrounds.
+      const ops = h.track.ops
+      assert.equal(ops[0], 'health-refresh')
+      assert.ok(ops.indexOf('prearm') > 0, JSON.stringify(ops))
+      assert.ok(ops.indexOf('minimize') > ops.indexOf('prearm'), JSON.stringify(ops))
+      assert.ok(ops.lastIndexOf('hide') > ops.lastIndexOf('minimize'), JSON.stringify(ops))
+      assert.equal(h.track.bounds.windowState, 'minimized')
+      assert.equal(h.track.hidden, true)
+      const entries = h.stateLog.recent(50)
+      for (const branch of ['create-requested', 'created', 'settle-requested', 'settled']) {
+        assert.ok(entries.some(e => e.event === 'managed-window' && e.branch === branch), `missing managed-window/${branch}`)
+      }
+      const created = entries.find(e => e.event === 'managed-window' && e.branch === 'created')
+      assert.equal(created?.windowId, 1)
+      assert.equal(created?.session, SESSION)
+      assert.match(String(created?.detail), /first-display=once/)
+      const openEntry = entries.find(e => e.event === 'open' && e.branch === 'first-window')
+      assert.ok(openEntry)
+      assert.match(String(openEntry.detail), /settled=true/)
+      assert.equal(openEntry.session, SESSION)
+      // No foreground/activation may ever be issued for a background open.
+      assert.ok(!h.nativeCalls.includes('activate') && !h.nativeCalls.includes('unhide'))
     } finally {
       h.server.close()
     }
   })
+})
+
+test('repeated background opens reuse the one window without showing or minimizing again', { timeout: 20_000 }, async () => {
+  const h = harness({ hasWindow: false, initialHidden: true })
+  const base = await h.listen()
+  try {
+    const first = await post(base, '/api/open', { url: 'https://www.baidu.com/', source: 'cli.open' })
+    assert.equal(first.body.firstDisplay, true)
+    const opsAfterFirst = h.track.ops.length
+    const second = await post(base, '/api/open', { url: 'https://www.bing.com/', source: 'cli.open' })
+    assert.equal(second.status, 200)
+    assert.equal(second.body.windowId, 1)
+    assert.equal(second.body.reusedWindow, true)
+    assert.equal(second.body.firstDisplay, false)
+    assert.equal(second.body.settled, true)
+    assert.equal(h.track.createdOpts.length, 2, 'one tab per open, still exactly one window')
+    assert.equal(h.track.launches, 0, 'the running session is reused, not relaunched')
+    assert.deepEqual(h.track.createdOpts[1], { url: 'https://www.bing.com/', background: true })
+    const opsAfterSecond = h.track.ops.slice(opsAfterFirst)
+    assert.ok(!opsAfterSecond.includes('minimize'), 'the window is not re-minimized per open')
+    assert.ok(!opsAfterSecond.includes('prearm'), 'capture is not re-armed per open')
+    assert.deepEqual(h.track.closedTargets, [])
+    assert.equal(h.track.bounds.windowState, 'minimized')
+    assert.equal(h.track.hidden, true)
+    const events = h.stateLog.recent(60).filter(e => e.event === 'managed-window')
+    assert.ok(events.some(e => e.branch === 'created'), 'the window was created once')
+    assert.ok(events.some(e => e.branch === 'reuse'), 'later opens reuse the same managed window')
+    assert.ok(events.some(e => e.branch === 'settled'))
+  } finally { h.server.close() }
+})
+
+test('a lost managed window is never popped again by a background open', { timeout: 20_000 }, async () => {
+  const h = harness({ hasWindow: false, initialHidden: true })
+  const base = await h.listen()
+  try {
+    await post(base, '/api/open', { url: 'https://www.baidu.com/' })
+    h.loseWindow()
+    const refused = await post(base, '/api/open', { url: 'https://www.bing.com/' })
+    assert.equal(refused.status, 409, JSON.stringify(refused.body))
+    assert.equal(refused.body.ok, false)
+    assert.match(String(refused.body.reason), /one-time/)
+    assert.match(String(refused.body.hint), /windowless/)
+    assert.equal(h.track.createdOpts.length, 1, 'no second window may be created')
+    const entries = h.stateLog.recent(40)
+    assert.ok(entries.some(e => e.event === 'managed-window' && e.branch === 'lost'))
+    assert.ok(entries.some(e => e.event === 'managed-window' && e.branch === 'refused'))
+
+    // Only an explicit human action may re-create a window; it is tracked again.
+    const show = await post(base, '/api/show', { source: 'tray.menu.show' })
+    assert.equal(show.status, 200)
+    assert.deepEqual(h.track.createdOpts[1], { url: 'about:blank', background: false })
+    const again = await post(base, '/api/open', { url: 'https://www.bing.com/' })
+    assert.equal(again.status, 200)
+    assert.equal(again.body.firstDisplay, false)
+    assert.equal(again.body.reusedWindow, true)
+    assert.equal(h.track.createdOpts.length, 3)
+  } finally { h.server.close() }
+})
+
+test('explicit show creates one empty window and never clones protocol-only pages', { timeout: 20_000 }, async () => {
+  const h = harness({ hasWindow: false, initialHidden: true })
+  const base = await h.listen()
+  try {
+    const hidden = await post(base, '/api/open', { url: 'https://www.baidu.com/', windowless: true })
+    assert.equal(hidden.status, 200)
+    assert.equal(hidden.body.windowless, true)
+    assert.equal(hidden.body.takeover, false)
+    await post(base, '/api/show', { source: 'tray.auto.activate' })
+    assert.equal(h.track.createdOpts.length, 1, 'auto observations never materialize a page')
+    const result = await post(base, '/api/show', { source: 'tray.menu.show' })
+    assert.equal(result.status, 200)
+    assert.deepEqual(h.track.createdOpts[1], { url: 'about:blank', background: false })
+    assert.deepEqual(h.track.closedTargets, [], 'protocol-only pages are never closed to fake a takeover')
+    const entries = h.stateLog.recent(50)
+    assert.ok(entries.some(e => e.event === 'manual-window-create' && e.branch === 'created-empty'))
+    assert.ok(entries.some(e => e.event === 'windowless-handoff' && e.branch === 'refused'
+      && String(e.detail).includes('pending=1') && String(e.detail).includes('adoption=unsupported')))
+    await post(base, '/api/show', { source: 'tray.menu.show' })
+    assert.equal(h.track.createdOpts.length, 2, 'repeated manual show reuses the window')
+  } finally { h.server.close() }
+})
+
+test('Dock activation never clones or closes protocol-only pages', { timeout: 20_000 }, async () => {
+  const h = harness({ hasWindow: false, initialHidden: true })
+  const base = await h.listen()
+  try {
+    await post(base, '/api/open', { url: 'https://www.baidu.com/', windowless: true })
+    await post(base, '/api/open', { url: 'https://www.bing.com/', windowless: true })
+    const created = h.track.createdOpts.length
+    const native = h.nativeCalls.length
+    h.track.hasWindow = true // Chrome opened its own New Tab on Dock click.
+    h.track.hidden = false
+    h.track.active = true
+    const response = await post(base, '/api/show', { source: 'tray.auto.activate' })
+    assert.equal(response.body.restored, 0)
+    await new Promise(r => setTimeout(r, 400))
+    assert.equal(h.track.createdOpts.length, created, 'no URL clone may be created for the user')
+    assert.deepEqual(h.track.closedTargets, [], 'the original protocol-only targets must keep running')
+    assert.equal(h.nativeCalls.length, native, 'no unhide/activate/hide may be issued')
+    const refusal = h.stateLog.recent(40).find(e => e.event === 'windowless-handoff' && e.branch === 'refused')
+    assert.ok(refusal, 'the unprovable handoff must be logged')
+    assert.equal(refusal.origin, 'auto')
+    assert.equal(refusal.source, 'tray.auto.activate')
+    assert.match(String(refusal.detail), /trigger=dock-visible/)
+    assert.match(String(refusal.detail), /pending=2/)
+  } finally { h.server.close() }
+})
+
+test('windowless:false selects the real managed window path (cold and live)', { timeout: 20_000 }, async () => {
+  const cold = harness({ running: false, hasWindow: false, initialHidden: true })
+  const coldBase = await cold.listen()
+  try {
+    const res = await post(coldBase, '/api/open', { url: 'https://example.com/', windowless: false, source: 'cli.open' })
+    assert.equal(res.status, 200, JSON.stringify(res.body))
+    assert.equal(res.body.windowless, false)
+    assert.equal(res.body.firstDisplay, true)
+    assert.equal(cold.track.launches, 1)
+    assert.deepEqual(cold.track.createdOpts, [{ url: 'https://example.com/', background: true }])
+    assert.equal((cold.track.createdOpts[0] as any).hidden, undefined)
+  } finally { cold.server.close() }
+
+  const warm = harness({ hasWindow: true })
+  const warmBase = await warm.listen()
+  try {
+    const res = await post(warmBase, '/api/open', { url: 'https://example.com/', windowless: false })
+    assert.equal(res.status, 200)
+    assert.equal(res.body.windowless, false)
+    assert.equal(res.body.reusedWindow, true)
+    assert.deepEqual(warm.track.closedTargets, [])
+  } finally { warm.server.close() }
+})
+
+test('windowless:true keeps an existing window’s native visibility untouched', { timeout: 20_000 }, async () => {
+  const h = harness({ hasWindow: true, initialHidden: false, initialActive: true })
+  const base = await h.listen()
+  try {
+    const res = await post(base, '/api/open', { url: 'https://example.com/', windowless: true, source: 'cli.open' })
+    assert.equal(res.status, 200, JSON.stringify(res.body))
+    assert.equal(res.body.windowless, true)
+    assert.equal(res.body.takeover, false)
+    assert.equal(h.track.hideCalls, 0, 'a protocol-only page must not hide a visible window')
+    assert.equal(h.track.hidden, false)
+    assert.equal(h.track.active, true)
+    assert.deepEqual(h.nativeCalls, [], 'no native visibility operation at all')
+    assert.equal(h.track.createdOpts[0].hidden, true)
+    assert.equal(h.track.hasWindow, true)
+    const entry = h.stateLog.recent(20).find(e => e.event === 'open' && e.branch === 'windowless-target')
+    assert.ok(entry)
+    assert.match(String(entry.detail), /native=unchanged/)
+  } finally { h.server.close() }
+
+  // The zero-window background contract still hides (there is no window to preserve).
+  const cold = harness({ hasWindow: false, initialHidden: false })
+  const coldBase = await cold.listen()
+  try {
+    const res = await post(coldBase, '/api/open', { url: 'https://example.com/', windowless: true })
+    assert.equal(res.status, 200)
+    assert.equal(cold.track.hideCalls, 1)
+    assert.equal(cold.track.hidden, true)
+    assert.equal(cold.track.hasWindow, false)
+  } finally { cold.server.close() }
+})
+
+test('an open that lands in a second native window is closed and fails', { timeout: 20_000 }, async () => {
+  const h = harness({ hasWindow: true, createTargetInNewWindow: true })
+  const base = await h.listen()
+  try {
+    const res = await post(base, '/api/open', { url: 'https://example.com/', source: 'cli.open' })
+    assert.equal(res.status, 502, JSON.stringify(res.body))
+    assert.deepEqual(h.track.closedTargets, ['created'], 'the stray window tab must be closed, never adopted')
+    assert.ok(!h.stateLog.recent(20).some(e => e.event === 'open' && e.branch === 'background-target'))
+  } finally { h.server.close() }
+})
+
+test('a tab placed in another existing window is closed and fails, never adopted', { timeout: 20_000 }, async () => {
+  const h = harness({ hasWindow: true, windowIds: [1, 2], createTargetInWindow: 2 })
+  const base = await h.listen()
+  try {
+    const res = await post(base, '/api/open', { url: 'https://example.com/', source: 'cli.open' })
+    assert.equal(res.status, 502, JSON.stringify(res.body))
+    assert.deepEqual(h.track.closedTargets, ['created'], 'the wrong-window tab must be closed')
+    const entries = h.stateLog.recent(40)
+    assert.ok(entries.some(e => e.event === 'managed-window' && e.branch === 'rejected-placement'
+      && e.windowId === 1))
+    assert.ok(!entries.some(e => e.event === 'managed-window' && e.branch === 'adopt' && e.windowId === 2),
+      'the unintended window must never become the managed window')
+    assert.ok(!entries.some(e => e.event === 'open' && e.branch === 'background-target'))
+  } finally { h.server.close() }
+})
+
+test('concurrent zero-window opens are serialized: one window, one first display', { timeout: 20_000 }, async () => {
+  // The create delay forces overlap: without the per-session window lock both
+  // requests would pass the first-display check and create two windows.
+  const h = harness({ hasWindow: false, initialHidden: true, createTargetDelayMs: 50 })
+  const base = await h.listen()
+  try {
+    const [a, b] = await Promise.all([
+      post(base, '/api/open', { url: 'https://a.example/', source: 'cli.open' }),
+      post(base, '/api/open', { url: 'https://b.example/', source: 'cli.open' }),
+    ])
+    assert.equal(a.status, 200, JSON.stringify(a.body))
+    assert.equal(b.status, 200, JSON.stringify(b.body))
+    const firsts = [a, b].filter(r => r.body.firstDisplay === true)
+    const reuses = [a, b].filter(r => r.body.reusedWindow === true)
+    assert.equal(firsts.length, 1, 'exactly one request may create the window')
+    assert.equal(reuses.length, 1, 'the other request must reuse it')
+    assert.equal(h.track.createdOpts.filter(o => !o.hidden).length, 2, 'one tab per request')
+    assert.equal(h.track.createdOpts.filter(o => !o.hidden && o.background === true).length, 2)
+    assert.equal(h.track.closedTargets.length, 0)
+    assert.equal(h.track.hasWindow, true)
+    assert.equal(h.stateLog.recent(80).filter(e => e.event === 'managed-window' && e.branch === 'created').length, 1)
+    assert.equal(h.stateLog.recent(80).filter(e => e.event === 'managed-window' && e.branch === 'reuse').length, 1)
+  } finally { h.server.close() }
+})
+
+test('concurrent launch+open share one session lock (one launch, one window)', { timeout: 20_000 }, async () => {
+  const h = harness({ running: false, hasWindow: false, initialHidden: true, createTargetDelayMs: 30 })
+  const base = await h.listen()
+  try {
+    const [launch, open] = await Promise.all([
+      post(base, '/api/launch', { url: 'https://a.example/', source: 'cli.launch' }),
+      post(base, '/api/open', { url: 'https://b.example/', source: 'cli.open' }),
+    ])
+    assert.equal(launch.status, 200, JSON.stringify(launch.body))
+    assert.equal(open.status, 200, JSON.stringify(open.body))
+    assert.equal(h.track.launches, 1, 'the browser must be launched once')
+    assert.equal(h.track.createdOpts.filter(o => !o.hidden).length, 2, 'two tabs in the one window')
+    const firsts = [launch, open].filter(r => r.body.firstDisplay === true)
+    assert.equal(firsts.length, 1, 'one first display')
+    assert.equal(h.stateLog.recent(80).filter(e => e.event === 'managed-window' && e.branch === 'created').length, 1)
+  } finally { h.server.close() }
+})
+
+test('a human show during an in-flight background open is never re-hidden', { timeout: 20_000 }, async () => {
+  // Deterministic race: the reused-window open reads wasHidden=true, then its
+  // createTarget is held open while the human explicitly shows the browser.
+  // The stale hidden flag must not cause a second native hide.
+  const h = harness({ hasWindow: false, initialHidden: true, createTargetDelayMs: 200 })
+  const base = await h.listen()
+  try {
+    const first = await post(base, '/api/open', { url: 'https://a.example/' })
+    assert.equal(first.body.firstDisplay, true)
+    const hidesBefore = h.track.hideCalls
+    const createsBefore = h.track.createStarted
+
+    const bgPromise = post(base, '/api/open', { url: 'https://b.example/', source: 'cli.open' })
+    const deadline = Date.now() + 4000
+    while (h.track.createStarted < createsBefore + 1 && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 5))
+    }
+    assert.equal(h.track.createStarted, createsBefore + 1, 'the background create must be in flight')
+    const showPromise = post(base, '/api/show', { source: 'tray.menu.show' })
+    // Let the show route record its explicit intent + humanMode before the
+    // delayed create resolves.
+    await new Promise(r => setTimeout(r, 50))
+    const [bg, show] = await Promise.all([bgPromise, showPromise])
+
+    assert.equal(bg.status, 200, JSON.stringify(bg.body))
+    assert.equal(bg.body.settled, false, 'a stale wasHidden must not trigger a hide')
+    assert.equal(bg.body.settleReason, 'human-mode')
+    assert.equal(show.status, 200)
+    assert.equal(show.body.restored, 1)
+    assert.equal(h.track.hideCalls, hidesBefore, 'no native hide may run after the human takeover')
+    assert.equal(h.track.hidden, false, 'the human window must stay visible')
+    assert.equal(h.track.bounds.windowState, 'normal')
+    const skipped = h.stateLog.recent(60)
+      .find(e => e.event === 'native-hide' && e.branch === 'skipped-human-takeover')
+    assert.ok(skipped, 'the refused re-hide must be logged')
+    assert.match(String(skipped.detail), /reason=human-mode/)
+    // The background tab itself was still created in the same window.
+    assert.ok(h.track.createdOpts.some(o => o.url === 'https://b.example/'))
+    assert.deepEqual(h.track.closedTargets, [])
+  } finally { h.server.close() }
+})
+
+test('a Dock-style window restore during an in-flight background open is not re-hidden', { timeout: 20_000 }, async () => {
+  // Dock boundary: the OS restores the minimized window without any API intent
+  // (no humanMode, no generation bump, app never becomes active). The stale
+  // wasHidden=true must not hide it again.
+  const h = harness({ hasWindow: false, initialHidden: true })
+  const base = await h.listen()
+  try {
+    const first = await post(base, '/api/open', { url: 'https://a.example/' })
+    assert.equal(first.body.firstDisplay, true)
+    assert.equal(h.track.bounds.windowState, 'minimized')
+    const hidesBefore = h.track.hideCalls
+
+    const originalSend = h.manager.current.cdp.send
+    h.manager.current.cdp.send = async (method: string, params: any = {}) => {
+      const result = await originalSend(method, params)
+      if (method === 'Target.createTarget') h.track.bounds.windowState = 'normal' // Dock restore
+      return result
+    }
+    const bg = await post(base, '/api/open', { url: 'https://b.example/', source: 'cli.open' })
+    assert.equal(bg.status, 200, JSON.stringify(bg.body))
+    assert.equal(bg.body.settled, false)
+    assert.equal(bg.body.settleReason, 'restored-window')
+    assert.equal(h.track.hideCalls, hidesBefore, 'the Dock-restored window must not be hidden')
+    assert.equal(h.track.bounds.windowState, 'normal')
+    const skipped = h.stateLog.recent(60)
+      .find(e => e.event === 'native-hide' && e.branch === 'skipped-human-takeover')
+    assert.ok(skipped)
+    assert.match(String(skipped.detail), /reason=restored-window/)
+  } finally { h.server.close() }
+})
+
+test('a failed first-window resolution consumes the one-time display (no second pop)', { timeout: 20_000 }, async () => {
+  const h = harness({ hasWindow: false, initialHidden: true, failWindowForTarget: true })
+  const base = await h.listen()
+  try {
+    const first = await post(base, '/api/open', { url: 'https://a.example/' })
+    assert.equal(first.status, 502, JSON.stringify(first.body))
+    assert.equal(h.track.createdOpts.length, 1, 'the irreversible create happened exactly once')
+    assert.ok(h.stateLog.recent(30).some(e => e.event === 'managed-window'
+      && e.branch === 'first-display-unresolved'))
+    const second = await post(base, '/api/open', { url: 'https://b.example/' })
+    assert.equal(second.status, 409, JSON.stringify(second.body))
+    assert.equal(h.track.createdOpts.length, 1, 'the consumed allowance must fail closed, never pop again')
+    assert.ok(!h.track.createdOpts.some(o => o.url === 'https://b.example/'))
+  } finally { h.server.close() }
+})
+
+test('existing-window opens reuse the same window as a normal background tab', { timeout: 20_000 }, async () => {
+  const h = harness({ hasWindow: true })
+  const base = await h.listen()
+  try {
+    const res = await post(base, '/api/open', { url: 'https://example.com/', source: 'cli.open' })
+    assert.equal(res.status, 200)
+    assert.equal(res.body.windowless, false)
+    assert.equal(res.body.takeover, true)
+    assert.equal(res.body.windowId, 1)
+    assert.equal(res.body.reusedWindow, true)
+    assert.equal(res.body.firstDisplay, false)
+    assert.deepEqual(h.track.createdOpts[0], { url: 'https://example.com/', background: true })
+    assert.equal((h.track.createdOpts[0] as any).newWindow, undefined, 'no newWindow flag may ever be sent')
+    assert.deepEqual(h.track.closedTargets, [])
+    assert.equal(h.track.hasWindow, true)
+    assert.ok(h.stateLog.recent(20).some(e => e.event === 'managed-window' && e.branch === 'adopt'))
+  } finally { h.server.close() }
+})
+
+test('a background launch with a URL creates the real managed window via the same path', { timeout: 20_000 }, async () => {
+  const h = harness({ running: false, hasWindow: false, initialHidden: true })
+  const base = await h.listen()
+  try {
+    const res = await post(base, '/api/launch', { url: 'https://example.com/', source: 'cli.launch' })
+    assert.equal(res.status, 200, JSON.stringify(res.body))
+    assert.equal(res.body.windowless, false)
+    assert.equal(res.body.firstDisplay, true)
+    assert.equal(res.body.settled, true)
+    assert.equal(res.body.windowId, 1)
+    assert.equal(h.track.launchOpts.url, undefined, 'the URL must not be passed to the manager (no hidden page)')
+    assert.deepEqual(h.track.createdOpts[0], { url: 'https://example.com/', background: true })
+    const entry = h.stateLog.recent(40).find(e => e.event === 'launch' && e.branch === 'background')
+    assert.ok(entry)
+    assert.match(String(entry.detail), /firstDisplay=true/)
+    assert.match(String(entry.detail), /settled=true/)
+
+    // windowless:false is now the default semantics and must not be refused.
+    const explicitReal = await post(base, '/api/launch', { url: 'https://example.com/', windowless: false })
+    assert.equal(explicitReal.status, 200, JSON.stringify(explicitReal.body))
+    assert.equal(explicitReal.body.windowless, false)
+  } finally { h.server.close() }
+})
+
+test('capabilities describe the one-time real-window trade-off and the protocol-only fallback', { timeout: 20_000 }, async () => {
+  const h = harness()
+  const base = await h.listen()
+  try {
+    const body = await (await fetch(`${base}/api/capabilities`)).json() as any
+    assert.equal(body.windowlessOpen, true)
+    assert.equal(body.windowless.adoption, 'unsupported')
+    assert.equal(body.windowless.browserPilot, 'unsupported')
+    assert.equal(body.zeroWindowRealTab.supported, true)
+    assert.equal(body.zeroWindowRealTab.firstDisplay, 'once-per-browser-session')
+    assert.equal(body.zeroWindowRealTab.sameWindowReuse, true)
+    assert.equal(body.zeroWindowRealTab.windowlessFallback, true)
+    assert.ok(String(body.zeroWindowRealTab.evidence).length > 0)
+  } finally { h.server.close() }
+})
+
+test('status and transitions carry one managed session id and window ownership', { timeout: 20_000 }, async () => {
+  const h = harness({ hasWindow: false, initialHidden: true })
+  const base = await h.listen()
+  try {
+    await post(base, '/api/open', { url: 'https://www.baidu.com/', source: 'cli.open' })
+    const status = await (await fetch(`${base}/api/status`)).json() as any
+    assert.equal(status.session.id, SESSION)
+    assert.equal(status.session.managedWindowId, 1)
+    assert.equal(status.session.firstDisplayUsed, true)
+    assert.equal(status.session.windowlessPages, 0)
+    assert.equal(status.session.takeover, 'real-window')
+    const entries = h.stateLog.recent(50)
+    assert.ok(entries.length > 0)
+    assert.ok(entries.every(e => e.session === SESSION), JSON.stringify(entries.filter(e => e.session !== SESSION)))
+    const openEntry = entries.find(e => e.event === 'open')
+    assert.equal(openEntry?.route, 'POST /api/open')
+    assert.equal(openEntry?.source, 'cli.open')
+  } finally { h.server.close() }
+})
+
+test('opening a tab in an existing hidden window re-hides after Chrome unhide', { timeout: 20_000 }, async () => {
+  const h = harness({ initial: 'minimized', initialHidden: true })
+  const base = await h.listen()
+  try {
+    // Simulate Chromium's native unhide side effect during createTarget.
+    const originalSend = h.manager.current.cdp.send
+    h.manager.current.cdp.send = async (method: string, params: any = {}) => {
+      const result = await originalSend(method, params)
+      if (method === 'Target.createTarget') h.track.hidden = false
+      return result
+    }
+    const response = await post(base, '/api/open', { url: 'https://example.com/' })
+    assert.equal(response.status, 200)
+    assert.equal(h.track.hidden, true)
+    assert.equal(h.track.hideCalls, 1)
+    assert.equal(h.track.bounds.windowState, 'minimized')
+    assert.ok(h.stateLog.recent(20).some(e => e.event === 'native-hide' && e.branch === 'verified'
+      && e.detail === 'hidden-window-post-create'))
+  } finally {
+    h.server.close()
+  }
 })
 
 test('restart never inherits launchMode=visible: plain restarts are background, explicit visibility flags required', { timeout: 20_000 }, async () => {
